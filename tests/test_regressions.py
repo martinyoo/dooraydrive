@@ -268,6 +268,53 @@ def test_push_skips_unchanged_and_touches_mtime_only_change():
     assert [i.op for i in plan.items] == ["TOUCH"], "내용이 같으면 재전송하지 않는다"
 
 
+# ---------------------------------------------------------------- 설정 파일 안전
+def test_read_doc_distinguishes_missing_from_unreadable(tmp_path: Path, monkeypatch=None):
+    """os.path.exists는 잠긴 파일에도 False를 준다 — '없음'과 '못 읽음'을 구분해야 한다.
+
+    구분하지 못하면 init이 설정을 새로 만들면서 다른 프로파일을 전부 날린다.
+    """
+    import os as _os
+    from dooray_sync import config as cfg
+
+    cfgdir = tmp_path / "cfgdir"
+    cfgdir.mkdir()
+    _os.environ[cfg.ENV_CONFIG_DIR] = str(cfgdir)
+    try:
+        # 1) 진짜 없을 때는 빈 dict
+        assert cfg._read_doc() == {}
+
+        # 2) 정상 파일은 읽힌다
+        cfg.save_config(cfg.Profile(name="a", drive_id="D1", local_root=str(tmp_path)))
+        cfg.save_config(cfg.Profile(name="b", drive_id="D2", local_root=str(tmp_path)))
+        assert set((cfg._read_doc().get("profile") or {})) == {"a", "b"}
+
+        # 3) 읽기 실패를 '없음'으로 삼키지 않는다
+        real_open = __builtins__["open"] if isinstance(__builtins__, dict) else __builtins__.open
+
+        def locked(path, *a, **kw):
+            if str(path).endswith("config.toml"):
+                raise PermissionError(13, "다른 프로세스가 사용 중")
+            return real_open(path, *a, **kw)
+
+        import builtins
+        builtins.open = locked
+        try:
+            raised = False
+            try:
+                cfg._read_doc()
+            except RuntimeError:
+                raised = True
+            assert raised, "잠긴 설정 파일을 '없음'으로 처리하면 안 된다"
+        finally:
+            builtins.open = real_open
+
+        # 4) 두 프로파일이 여전히 살아 있다
+        assert set((cfg._read_doc().get("profile") or {})) == {"a", "b"}
+    finally:
+        _os.environ.pop(cfg.ENV_CONFIG_DIR, None)
+
+
 def _run_all() -> int:
     """pytest 없이도 돌 수 있게 — tmp_path 인자는 임시 디렉터리로 채운다."""
     import inspect

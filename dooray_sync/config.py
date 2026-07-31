@@ -241,13 +241,26 @@ def _dumps(doc: dict) -> str:
 # --------------------------------------------------------------------------
 
 def _read_doc() -> dict:
-    """설정 파일 전체를 dict로. 없으면 빈 dict. 파싱 실패는 그대로 전파(fail-stop)."""
-    path = config_path()
-    ep = ext_path(path)
-    if not os.path.exists(ep):
-        return {}
-    with open(ep, "rb") as f:          # tomllib은 바이너리 스트림만 받는다
-        return tomllib.load(f)
+    """설정 파일 전체를 dict로. **정말 없을 때만** 빈 dict. 그 외 실패는 전파(fail-stop).
+
+    `os.path.exists()`로 판정하면 안 된다 — 권한 거부나 파일 잠김(백신 스캔 등)일 때도
+    False를 돌려주기 때문이다(파이썬 문서 명시). 그러면 설정이 멀쩡한데 '없음'으로
+    오인하고, 그 상태로 init을 돌리면 save_config가 다른 프로파일까지 날린다.
+    실제로 백신이 잠근 순간에 이 오탐이 관측됐다.
+    """
+    ep = ext_path(config_path())
+    try:
+        with open(ep, "rb") as f:      # tomllib은 바이너리 스트림만 받는다
+            return tomllib.load(f)
+    except FileNotFoundError:
+        return {}                      # 진짜 없는 경우
+    except OSError as exc:
+        raise RuntimeError(
+            f"설정 파일을 읽을 수 없습니다: {config_path()}\n"
+            f"  {type(exc).__name__}: {exc}\n"
+            f"  파일이 다른 프로그램(백신·편집기)에 잠겨 있을 수 있습니다. "
+            f"잠시 후 다시 시도하세요."
+        ) from exc
 
 
 def _profiles(doc: dict) -> dict:
@@ -317,6 +330,22 @@ def save_config(p: Profile) -> None:
     """
     name = _check_profile_name(p.name)
     doc = _read_doc()
+
+    # 방어선: 파일은 있는데 문서가 비어 보이면 쓰지 않는다. 읽기가 어떤 이유로든
+    # 실패했는데 빈 dict가 넘어온 경우 그대로 쓰면 다른 프로파일이 전부 사라진다.
+    dest_probe = ext_path(config_path())
+    if not doc:
+        try:
+            with open(dest_probe, "rb") as f:
+                nonempty = bool(f.read(1))
+        except OSError:
+            nonempty = False
+        if nonempty:
+            raise RuntimeError(
+                f"설정 파일이 존재하는데 내용을 읽지 못했습니다: {config_path()}\n"
+                f"  덮어쓰면 다른 프로파일이 사라지므로 중단합니다. 파일 상태를 확인하세요."
+            )
+
     section = doc.get("profile")
     if not isinstance(section, dict):
         section = {}
