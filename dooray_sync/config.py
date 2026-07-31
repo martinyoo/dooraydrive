@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import re
+import sys
 import tomllib
 import uuid
 from dataclasses import dataclass, field
@@ -263,6 +264,42 @@ def _read_doc() -> dict:
         ) from exc
 
 
+def diagnose_config_lookup() -> str:
+    """설정을 못 찾았을 때 원인을 좁힐 수 있는 사실만 모아 문자열로.
+
+    '파일은 분명히 있는데 프로그램은 없다고 한다'는 상황은 대개 **다른 경로를 보고
+    있기 때문**이다(다른 파이썬, 환경변수 재지정, AppData 리다이렉션). 재현이 어려운
+    문제라 오류 메시지가 스스로 근거를 들고 오게 한다.
+    """
+    lines: list[str] = ["", "  [진단]"]
+    try:
+        cp = config_path()
+        lines.append(f"    설정 경로   : {cp}")
+        try:
+            ep = ext_path(cp)
+            lines.append(f"    확장 경로   : {ep}")
+            lines.append(f"    존재(확장)  : {os.path.exists(ep)}")
+        except Exception as exc:            # noqa: BLE001 — 진단은 절대 실패하면 안 된다
+            lines.append(f"    확장 경로   : 계산 실패 {type(exc).__name__}: {exc}")
+        lines.append(f"    존재(원본)  : {os.path.exists(str(cp))}")
+
+        parent = cp.parent
+        try:
+            names = sorted(os.listdir(ext_path(parent)))
+            lines.append(f"    폴더 내용   : {', '.join(names) if names else '(비어 있음)'}")
+        except OSError as exc:
+            lines.append(f"    폴더 열기   : 실패 {type(exc).__name__}: {exc}")
+
+        lines.append(f"    파이썬      : {sys.executable}")
+        env_dir = os.environ.get(ENV_CONFIG_DIR)
+        lines.append(f"    {ENV_CONFIG_DIR} : {env_dir if env_dir else '(미설정)'}")
+        lines.append(f"    APPDATA     : {os.environ.get('APPDATA') or '(미설정)'}")
+        lines.append("  이 내용을 그대로 알려 주시면 원인을 특정할 수 있습니다.")
+    except Exception as exc:                # noqa: BLE001
+        lines.append(f"    진단 자체 실패: {type(exc).__name__}: {exc}")
+    return "\n".join(lines)
+
+
 def _profiles(doc: dict) -> dict:
     section = doc.get("profile")
     return section if isinstance(section, dict) else {}
@@ -302,7 +339,11 @@ def load_config(profile: str = "default") -> Profile:
     path = config_path()
     doc = _read_doc()
     if not doc:
-        raise FileNotFoundError(f"설정 파일이 없습니다: {path}\n  먼저 'dsync init'을 실행하세요.")
+        raise FileNotFoundError(
+            f"설정 파일이 없습니다: {path}\n"
+            f"  먼저 'dsync init'을 실행하세요.\n"
+            f"{diagnose_config_lookup()}"
+        )
     table = _profiles(doc).get(name)
     if not isinstance(table, dict):
         raise FileNotFoundError(
