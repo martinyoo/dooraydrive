@@ -34,6 +34,25 @@ foreach ($j in $jobs) {
 }
 
 Write-Host ""
+Write-Host "== 2-1) 상태 DB 생성 확인 ==" -ForegroundColor Cyan
+$missing = @()
+foreach ($j in $jobs) {
+  $db = "$env:LOCALAPPDATA\dooray-sync\$($j.p)\state.db"
+  if (Test-Path -LiteralPath $db) {
+    Write-Host ("  [정상] {0}" -f $j.p) -ForegroundColor DarkGray
+  } else {
+    Write-Host ("  [없음] {0}  -> {1}" -f $j.p, $db) -ForegroundColor Red
+    $missing += $j.p
+  }
+}
+if ($missing.Count -gt 0) {
+  Write-Host ""
+  Write-Host "상태 DB가 생성되지 않은 프로파일이 있습니다: $($missing -join ', ')" -ForegroundColor Red
+  Write-Host "이 상태로 push하면 원격에 중복 파일이 생길 수 있으니 중단합니다." -ForegroundColor Red
+  exit 1
+}
+
+Write-Host ""
 Write-Host "== 3) 기준선 대조 (원격에 이미 있는 파일) ==" -ForegroundColor Cyan
 foreach ($p in @('swstat','workenv')) {
   Write-Host ("-- {0}" -f $p)
