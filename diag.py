@@ -81,6 +81,61 @@ try:
 except Exception as exc:  # noqa: BLE001
     line("CLI 경로 계산", f"실패 {type(exc).__name__}: {exc}")
 
+
+# ---------------------------------------------------------------------------
+# 프로파일 인자를 주면 DB 기준선과 로컬 스캔을 대조한다:  python diag.py swstat
+# ---------------------------------------------------------------------------
+if len(sys.argv) > 1:
+    prof = sys.argv[1]
+    print(f"\n[프로파일 '{prof}' 기준선 대조]")
+    try:
+        from dooray_sync.config import db_path, load_config
+        from dooray_sync.core.scanner import LocalScanner
+        from dooray_sync.store.db import Store
+
+        p = load_config(prof)
+        line("drive_id", p.drive_id)
+        line("remote_path", p.remote_path or "(드라이브 전체)")
+        line("local_root", p.local_root)
+        line("DB 경로", db_path(prof))
+        line("DB 존재", os.path.isfile(str(db_path(prof))))
+
+        with Store(db_path(prof)) as store:
+            base = store.all_by_key(p.drive_id)
+            counts = store.count_by_status(p.drive_id)
+        line("base 레코드 수", len(base))
+        line("sync_status 분포", counts)
+        line("local_md5 보유", sum(1 for r in base.values() if r.local_md5))
+        line("file_id 보유", sum(1 for r in base.values() if r.file_id))
+
+        scanner = LocalScanner(p.root_path, p.exclude)
+        entries = scanner.scan()
+        files = {k: e for k, e in entries.items() if not e.is_dir}
+        line("로컬 항목(파일만)", len(files))
+
+        common = set(base) & set(files)
+        line("키 교집합", len(common))
+        targets = [k for k in common
+                   if base[k].file_id and not base[k].is_dir and not base[k].local_md5]
+        line("reconcile 대상", len(targets))
+
+        if base:
+            k = next(iter(base))
+            print(f"    base 예시   : key={k!r}")
+            r = base[k]
+            print(f"                  file_id={r.file_id!r} md5={r.local_md5!r} status={r.sync_status!r}")
+        if files:
+            k = next(iter(files))
+            print(f"    로컬 예시   : key={k!r}")
+        only_base = sorted(set(base) - set(files))[:3]
+        only_local = sorted(set(files) - set(base))[:3]
+        if only_base:
+            print(f"    원격에만    : {only_base}")
+        if only_local:
+            print(f"    로컬에만    : {only_local}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"    실패: {type(exc).__name__}: {exc}")
+
 print("\n" + "=" * 68)
 print("  위 내용을 그대로 복사해 알려 주세요.")
 print("=" * 68)
