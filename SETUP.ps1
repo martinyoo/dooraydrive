@@ -37,17 +37,20 @@ Write-Host ""
 Write-Host "== 2-1) 상태 DB 생성 확인 ==" -ForegroundColor Cyan
 $missing = @()
 foreach ($j in $jobs) {
-  $db = "$env:LOCALAPPDATA\dooray-sync\$($j.p)\state.db"
-  if (Test-Path -LiteralPath $db) {
-    Write-Host ("  [정상] {0}" -f $j.p) -ForegroundColor DarkGray
+  if (-not (Test-Path -LiteralPath $j.local)) { continue }
+  # 파일 존재만으로는 부족하다 — 빈 DB는 다른 명령이 스키마만 만들어 놓은 것일 수 있고,
+  # 그 상태로 push하면 원격에 이미 있는 파일을 신규로 오인해 중복 업로드한다.
+  $n = python -c "import sys;sys.path.insert(0,'.');from dooray_sync.config import db_path,load_config;from dooray_sync.store.db import Store;p=load_config('$($j.p)');s=Store(db_path('$($j.p)'));print(s.count_files(p.drive_id));s.close()" 2>$null
+  if ($LASTEXITCODE -eq 0 -and [int]$n -gt 0) {
+    Write-Host ("  [정상] {0} — 원격 기록 {1}건" -f $j.p, $n) -ForegroundColor DarkGray
   } else {
-    Write-Host ("  [없음] {0}  -> {1}" -f $j.p, $db) -ForegroundColor Red
+    Write-Host ("  [비어있음] {0} — 원격 기록 {1}건" -f $j.p, $n) -ForegroundColor Red
     $missing += $j.p
   }
 }
 if ($missing.Count -gt 0) {
   Write-Host ""
-  Write-Host "상태 DB가 생성되지 않은 프로파일이 있습니다: $($missing -join ', ')" -ForegroundColor Red
+  Write-Host "원격 기록이 비어 있는 프로파일이 있습니다: $($missing -join ', ')" -ForegroundColor Red
   Write-Host "이 상태로 push하면 원격에 중복 파일이 생길 수 있으니 중단합니다." -ForegroundColor Red
   exit 1
 }
