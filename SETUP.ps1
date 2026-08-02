@@ -34,24 +34,26 @@ foreach ($j in $jobs) {
 }
 
 Write-Host ""
-Write-Host "== 2-1) 상태 DB 생성 확인 ==" -ForegroundColor Cyan
+Write-Host "== 2-1) 원격 스캔 완료 확인 ==" -ForegroundColor Cyan
 $missing = @()
 foreach ($j in $jobs) {
   if (-not (Test-Path -LiteralPath $j.local)) { continue }
-  # 파일 존재만으로는 부족하다 — 빈 DB는 다른 명령이 스키마만 만들어 놓은 것일 수 있고,
-  # 그 상태로 push하면 원격에 이미 있는 파일을 신규로 오인해 중복 업로드한다.
-  $n = python -c "import sys;sys.path.insert(0,'.');from dooray_sync.config import db_path,load_config;from dooray_sync.store.db import Store;p=load_config('$($j.p)');s=Store(db_path('$($j.p)'));print(s.count_files(p.drive_id));s.close()" 2>$null
-  if ($LASTEXITCODE -eq 0 -and [int]$n -gt 0) {
-    Write-Host ("  [정상] {0} — 원격 기록 {1}건" -f $j.p, $n) -ForegroundColor DarkGray
+  # 기록 '건수'가 아니라 원격 스캔이 끝났는지를 본다.
+  # 건수로 판정하면 새로 만든 빈 원격 폴더가 정상인데도 막힌다(spri2026 사례).
+  # last_full_scan_at은 init이 원격 스캔을 끝낸 직후에만 기록되므로 이쪽이 정확한 신호다.
+  $out = python -c "import sys;sys.path.insert(0,'.');from dooray_sync.config import db_path,load_config;from dooray_sync.store.db import Store,META_LAST_FULL_SCAN;p=load_config('$($j.p)');s=Store(db_path('$($j.p)'));print((s.get_meta(META_LAST_FULL_SCAN) or '-')+'|'+str(s.count_files(p.drive_id)));s.close()" 2>$null
+  $scan, $n = ($out -split '\|')
+  if ($LASTEXITCODE -eq 0 -and $scan -and $scan -ne '-') {
+    Write-Host ("  [정상] {0} — 원격 기록 {1}건 (스캔 {2})" -f $j.p, $n, $scan) -ForegroundColor DarkGray
   } else {
-    Write-Host ("  [비어있음] {0} — 원격 기록 {1}건" -f $j.p, $n) -ForegroundColor Red
+    Write-Host ("  [스캔 미완료] {0} — init의 원격 스캔이 끝나지 않았습니다" -f $j.p) -ForegroundColor Red
     $missing += $j.p
   }
 }
 if ($missing.Count -gt 0) {
   Write-Host ""
-  Write-Host "원격 기록이 비어 있는 프로파일이 있습니다: $($missing -join ', ')" -ForegroundColor Red
-  Write-Host "이 상태로 push하면 원격에 중복 파일이 생길 수 있으니 중단합니다." -ForegroundColor Red
+  Write-Host "원격 스캔이 끝나지 않은 프로파일이 있습니다: $($missing -join ', ')" -ForegroundColor Red
+  Write-Host "기준선 없이 push하면 원격에 이미 있는 파일을 신규로 오인해 중복 업로드하니 중단합니다." -ForegroundColor Red
   exit 1
 }
 
