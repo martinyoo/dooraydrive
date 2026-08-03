@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from ..util.paths import ext_path, join_remote, server_name_will_differ, to_nfc
+from ..util.paths import ext_path, join_remote, path_key, server_name_will_differ, to_nfc
 from .client import DoorayApiError, DoorayClient
 from .models import ChangeItem, Cursor, RemoteFile
 
@@ -201,15 +201,26 @@ class DriveAPI:
     def find_child_by_name(
         self, drive_id: str, parent_id: str, name: str
     ) -> RemoteFile | None:
-        """NFC 정규화 후 비교. 대소문자는 구분한다(서버는 구분하므로).
+        """NFC 정규화 후 비교. **정확 일치 우선, 없으면 대소문자 무시로 한 번 더 찾는다.**
 
         업로드 직전 D1 분기(신규 POST / 새 버전 PUT)의 판정에 쓴다.
+
+        실측 결함(2026-08-02): 서버의 이름 중복 검사는 대소문자를 무시한다. 로컬 표기
+        'Writing'으로 정확 일치만 찾으면 원격 'WRITING'을 놓치고 새로 만들려 하는데,
+        서버는 중복으로 보고 409 `Duplicate request`로 거부한다. 오류 메시지에 원인이
+        없어 재시도해도 영원히 실패한다. 그래서 폴백으로 casefold 비교를 둔다.
+        정확 일치를 먼저 보므로 대소문자만 다른 항목이 공존하더라도 판정이 흔들리지 않는다.
         """
         target = to_nfc(name)
+        folded = path_key(target)
+        fallback: RemoteFile | None = None
         for child in self.iter_children(drive_id, parent_id):
-            if to_nfc(child.name) == target:
+            cname = to_nfc(child.name)
+            if cname == target:
                 return child
-        return None
+            if fallback is None and folded and path_key(cname) == folded:
+                fallback = child
+        return fallback
 
     # ------------------------------------------------------------------
     # 전송
@@ -223,6 +234,7 @@ class DriveAPI:
         expected_size: int | None = None,
         expected_md5: str | None = None,
         pre_replace_guard: Callable[[], None] | None = None,
+        on_tmp: Callable[[Path], None] | None = None,
     ) -> dict:
         """C1 원자적 다운로드: 같은 볼륨 임시파일 → 검증 → os.replace.
 
@@ -242,6 +254,11 @@ class DriveAPI:
         os.makedirs(ext_path(dest.parent), exist_ok=True)
         os.makedirs(ext_path(tmp_dir), exist_ok=True)
         tmp = tmp_dir / f"{uuid.uuid4().hex}.part"
+        if on_tmp is not None:
+            # 임시파일 경로를 **전송 시작 전에** 호출측에 알린다. 저널에 남겨 두지 않으면
+            # 전송 중 강제 종료 시 복구가 지울 대상을 몰라 .part 찌꺼기가 영구히 남는다
+            # (실계정에서 확인).
+            on_tmp(tmp)
 
         path = f"/drive/v1/drives/{_q(drive_id)}/files/{_q(file_id)}?media=raw"
         try:
@@ -357,7 +374,15 @@ class DriveAPI:
 
     def create_folder_full(self, drive_id: str, parent_folder_id: str,
                            name: str) -> RemoteFile:
-        """폴더 생성 후 **서버 저장명까지** 확정해서 돌려준다.
+        """폴더 생성 후 **서버 저장명까지** 확정해서 돌려준다(M1 시그니처 유지)."""
+        return self.create_folder_ex(drive_id, parent_folder_id, name)[0]
+
+    def create_folder_ex(self, drive_id: str, parent_folder_id: str,
+                         name: str) -> tuple[RemoteFile, bool]:
+        """`(폴더, 새로 만들었는가)`.
+
+        두 번째 값이 False면 **이미 있던 폴더를 찾아 돌려준 것**이다 — 호출측이 "방금
+        만들었으니 비어 있다"고 색인을 비워 두면 안 된다(하위 항목을 통째로 놓친다).
 
         실측(R14): 서버는 이름의 앞뒤 공백을 절삭하고 '"'를 '%22'로 바꾼다.
         create-folder 응답에는 id만 오는 경우가 있어, 이름이 바뀔 것으로 예상되는데
@@ -366,7 +391,28 @@ class DriveAPI:
         """
         wanted = to_nfc(name)
         path = f"/drive/v1/drives/{_q(drive_id)}/files/{_q(parent_folder_id)}/create-folder"
-        body = self.client.api("POST", path, json={"name": wanted})
+        try:
+            body = self.client.api("POST", path, json={"name": wanted})
+        except DoorayApiError as exc:
+            if exc.status != 409:
+                raise
+            # 409 = 같은 이름이 이미 있다. 서버의 중복 검사는 **대소문자를 무시**하므로
+            # (실측 2026-08-02: 로컬 'Writing' vs 원격 'WRITING') 정확 일치로는 못 찾은
+            # 폴더가 실재할 수 있다. 되물어서 있으면 그것을 쓴다 — 폴더 생성은 멱등해야 한다.
+            existing = self.find_child_by_name(drive_id, parent_folder_id, wanted)
+            if existing is not None and existing.is_dir:
+                if to_nfc(existing.name) != wanted:
+                    self.logger.warning(
+                        "원격에 대소문자만 다른 폴더가 있어 그것을 사용합니다: 요청 %r → 실제 %r",
+                        wanted, existing.name,
+                    )
+                return existing, False
+            if existing is not None:
+                raise DoorayApiError(
+                    f"원격에 같은 이름의 파일이 있어 폴더를 만들 수 없습니다: {existing.name!r}",
+                    status=409, path=path,
+                ) from exc
+            raise
         result = body.get("result")
         rf = RemoteFile.from_api(result if isinstance(result, dict) else {},
                                  drive_id=drive_id, parent_id=parent_folder_id)
@@ -377,11 +423,11 @@ class DriveAPI:
             if server_name_will_differ(wanted):
                 # 서버가 이름을 바꿨을 가능성이 있으면 추정하지 말고 되묻는다.
                 try:
-                    return self.get_file_meta(drive_id, rf.id)
+                    return self.get_file_meta(drive_id, rf.id), True
                 except DoorayApiError:
                     pass  # 되묻기 실패 시 아래에서 요청명으로 대체
             rf = dataclasses.replace(rf, name=wanted)
-        return rf
+        return rf, True
 
     def rename(self, drive_id: str, file_id: str, new_name: str) -> None:
         self.client.api(
@@ -461,11 +507,12 @@ class DriveAPI:
                 return  # ← 유일한 정상 종료 (B1)
             for it in items:
                 yield it, Cursor(revision=it.revision, file_id=it.file_id or None)
-            if nxt == cur:
+            if nxt.revision <= cur.revision:
                 # 커서 미전진 = 같은 페이지를 영원히 다시 받는 상태. 무한루프 방지(B2).
+                # **revision만 비교한다** — 질의에 fileId를 싣지 않으므로(models.Cursor)
+                # file_id가 달라도 같은 질의가 되어, 전체 비교로는 전진했다고 오판한다.
                 self.logger.warning(
-                    "changes 커서가 전진하지 않아 중단합니다 (revision=%s file_id=%s)",
-                    cur.revision, cur.file_id,
+                    "changes 커서가 전진하지 않아 중단합니다 (revision=%s)", cur.revision,
                 )
                 return
             cur = nxt

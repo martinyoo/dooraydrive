@@ -14,6 +14,7 @@ M1 범위이므로 삭제 전파는 어느 방향으로도 하지 않는다(구�
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 import sqlite3
 import sys
@@ -50,18 +51,34 @@ from ..config import (
     save_config,
     state_dir,
 )
+from ..core.differ import DiffStats, diff
+from ..core.executor import SyncExecutor
+from ..core.journal import SyncJournal, recover
+from ..core.planner import ACTION_LABEL, BulkDeleteAbort
+from ..core.planner import plan as build_plan
+from ..core.remote import (
+    RemoteCollector,
+    RemoteRootError,
+    iter_known_by_file_id,
+    rel_from_remote,
+    resolve_remote_root,
+)
 from ..core.scanner import LocalScanner
 from ..logging_setup import current_log_path, setup_logging
 from ..store.db import META_LAST_FULL_SCAN, FileRecord, Store, now_iso
+from ..util.hashing import md5_file
 from ..util.lock import AlreadyRunning, SingleInstanceLock
+from ..util.trash import unavailable_reason as trash_unavailable_reason
 from ..util.paths import (
     ext_path,
     local_path,
     name_issue,
     path_key,
+    rel_posix,
     server_name_will_differ,
     to_nfc,
 )
+from ..util.trash import send_to_trash
 
 # ---------------------------------------------------------------------------
 # 상수
@@ -279,62 +296,28 @@ def _instance_lock(profile_name: str) -> Iterator[None]:
 
 
 def _rel_from_remote(full_path: str, remote_prefix: str = "") -> str:
-    """원격 전체 경로('/a/b.txt') → 동기화 루트 기준 상대경로('b.txt').
-
-    remote_prefix가 있으면 그 하위만 동기화 대상이므로 접두를 떼어낸다.
-    접두 밖의 경로는 ''를 돌려줘 호출측이 건너뛰게 한다.
-    """
-    rel = to_nfc(str(full_path or "").replace("\\", "/").lstrip("/"))
-    if not remote_prefix:
-        return rel
-    pref = to_nfc(remote_prefix.replace("\\", "/").strip("/"))
-    if not pref:
-        return rel
-    if path_key(rel) == path_key(pref):
-        return ""                      # 접두 폴더 자신
-    if path_key(rel).startswith(path_key(pref) + "/"):
-        return rel[len(pref) + 1:]
-    return ""
+    """원격 전체 경로 → 동기화 루트 기준 상대경로. 정본은 core.remote."""
+    return rel_from_remote(full_path, remote_prefix)
 
 
 def _resolve_remote_root(drive: DriveAPI, drive_id: str, remote_path: str,
                          *, create: bool = False, log=None) -> tuple[str, str]:
     """동기화 시작 폴더를 정한다. (folder_id, 정규화된 원격 접두) 반환.
 
-    remote_path가 비면 드라이브 루트. 대형 드라이브는 폴더 수에 비례해 순회가
-    오래 걸리므로(실측: 폴더당 약 0.4초) 업무 폴더 하나만 지정하는 쪽이 실용적이다.
-
-    create=True는 init에서만 쓴다 — 없는 폴더를 만들어 준다. 기본값이 False인 이유는
-    경로를 오타 냈을 때 조용히 엉뚱한 폴더를 만들어 버리는 사고를 막기 위해서다.
+    구현은 core.remote.resolve_remote_root에 있다(대소문자 무시 탐색 포함).
+    여기서는 예외를 CLI 종료코드로 옮기는 일만 한다.
     """
-    root_id = drive.find_root_folder(drive_id)
-    pref = to_nfc(str(remote_path or "").replace("\\", "/").strip("/"))
-    if not pref:
-        return root_id, ""
+    def _notify(name: str) -> None:
+        _out(f"  원격 폴더 생성: {name}")
+        if log:
+            log.info("원격 폴더 생성: %s", name)
 
-    cur = root_id
-    for part in pref.split("/"):
-        if not part:
-            continue
-        child = drive.find_child_by_name(drive_id, cur, part)
-        if child is not None and not child.is_dir:
-            _fail(f"원격에 같은 이름의 파일이 있어 폴더로 쓸 수 없습니다: {pref} ({part})",
-                  EXIT_CONFIG)
-        if child is None:
-            if not create:
-                _fail(
-                    f"원격 폴더를 찾을 수 없습니다: {pref}  (막힌 지점: {part})\n"
-                    f"  새로 만들려면 init에 --create-remote 를 붙이세요.",
-                    EXIT_CONFIG,
-                )
-            created = drive.create_folder_full(drive_id, cur, part)
-            _out(f"  원격 폴더 생성: {part}")
-            if log:
-                log.info("원격 폴더 생성: %s (id=%s)", part, created.id)
-            cur = created.id
-            continue
-        cur = child.id
-    return cur, pref
+    try:
+        return resolve_remote_root(drive, drive_id, remote_path, create=create,
+                                   on_create=_notify)
+    except RemoteRootError as exc:
+        _fail(str(exc), EXIT_CONFIG)
+    raise AssertionError("도달 불가")
 
 
 def _stat_or_none(path: Path) -> os.stat_result | None:
@@ -823,6 +806,10 @@ class _PushExecutor:
         self.root_id, _ = _resolve_remote_root(drive, p.drive_id, p.remote_path)
         self.folder_ids: dict[str, str] = {"": self.root_id}
         self._index: dict[str, dict[str, RemoteFile]] = {}
+        # 대소문자 무시 보조 색인. 서버의 이름 중복 검사가 대소문자를 무시하므로
+        # (실측 2026-08-02) 정확 일치만 보면 원격 'WRITING'을 로컬 'Writing'으로 찾지 못하고
+        # 새로 만들려다 409 Duplicate request로 영원히 막힌다.
+        self._folded: dict[str, dict[str, RemoteFile]] = {}
         self.failures: list[tuple[str, str]] = []
         self.done: dict[str, int] = {"FOLDER": 0, "NEW": 0, "UPDATE": 0, "TOUCH": 0}
 
@@ -836,12 +823,39 @@ class _PushExecutor:
         idx = self._index.get(parent_id)
         if idx is None:
             idx = {}
+            folded: dict[str, RemoteFile] = {}
             for child in self.drive.iter_children(self.drive_id, parent_id):
                 if child.sub_type == "trash":
                     continue
-                idx[to_nfc(child.name)] = child
+                name = to_nfc(child.name)
+                idx[name] = child
+                folded.setdefault(path_key(name), child)   # 먼저 본 쪽을 유지
             self._index[parent_id] = idx
+            self._folded[parent_id] = folded
         return idx
+
+    def _idx_find(self, parent_id: str, *names: str) -> RemoteFile | None:
+        """부모 폴더 색인 조회. 주어진 이름들로 정확 일치를 먼저 보고, 없으면 대소문자 무시."""
+        idx = self._dir_index(parent_id)
+        for n in names:
+            if n and n in idx:
+                return idx[n]
+        folded = self._folded.get(parent_id) or {}
+        for n in names:
+            key = path_key(n) if n else ""
+            if key and key in folded:
+                return folded[key]
+        return None
+
+    def _idx_put(self, parent_id: str, rf: RemoteFile) -> None:
+        """새로 만들거나 확인한 항목을 두 색인에 함께 반영한다."""
+        name = to_nfc(rf.name)
+        self._dir_index(parent_id)[name] = rf
+        self._folded.setdefault(parent_id, {})[path_key(name)] = rf
+
+    def _forget_index(self, parent_id: str) -> None:
+        self._index.pop(parent_id, None)
+        self._folded.pop(parent_id, None)
 
     def ensure_folder(self, rel: str) -> str:
         """폴더 상대경로 → 원격 folder id. 상위부터 재귀적으로 확인·생성한다."""
@@ -851,11 +865,10 @@ class _PushExecutor:
 
         parent_rel, _, name = rel.rpartition("/")
         parent_id = self.ensure_folder(parent_rel) if parent_rel else self.root_id
-        idx = self._dir_index(parent_id)
 
         rec = self.base.get(key)
-        lookup = to_nfc(rec.server_name) if (rec and rec.server_name) else to_nfc(name)
-        found = idx.get(lookup) or idx.get(to_nfc(name))
+        lookup = to_nfc(rec.server_name) if (rec and rec.server_name) else ""
+        found = self._idx_find(parent_id, lookup, to_nfc(name))
 
         if found is not None and not found.is_dir:
             raise DoorayApiError(
@@ -867,13 +880,18 @@ class _PushExecutor:
         else:
             # R14: 서버 저장명을 정본으로 받는다. 로컬 이름을 기록하면 다음 push가
             # 같은 폴더를 다시 만들려 하고 파일들이 엉뚱한 부모로 흩어진다.
-            created = self.drive.create_folder_full(self.drive_id, parent_id, name)
+            # create_folder_full은 409(대소문자만 다른 폴더 존재 포함)를 기존 폴더 반환으로
+            # 흡수하므로, 여기서 새로 만든 것인지 찾은 것인지는 id로 구분하지 않는다.
+            created, is_new = self.drive.create_folder_ex(self.drive_id, parent_id, name)
             fid = created.id
             server_name = created.name or to_nfc(name)
-            idx[to_nfc(server_name)] = created
-            # 방금 만든 폴더는 비어 있다 — 목록 조회를 건너뛴다.
-            self._index[fid] = {}
-            self.done["FOLDER"] += 1
+            self._idx_put(parent_id, created)
+            if is_new:
+                # 방금 만든 폴더는 비어 있다 — 목록 조회를 건너뛴다.
+                # 409로 기존 폴더를 받은 경우에는 절대 비었다고 가정하면 안 된다.
+                self._index[fid] = {}
+                self._folded[fid] = {}
+                self.done["FOLDER"] += 1
 
         self.folder_ids[key] = fid
         self.store.upsert_file(FileRecord(
@@ -895,9 +913,10 @@ class _PushExecutor:
         # 디스크 원본 표기로 연다 — rel은 NFC 정규화본이라 NFD 이름은 열리지 않는다.
         src = Path(item.disk_path) if item.disk_path else local_path(self.root, rel)
 
-        idx = self._dir_index(parent_id)
-        lookup = to_nfc(rec.server_name) if (rec and rec.server_name) else to_nfc(name)
-        found = idx.get(lookup) or idx.get(to_nfc(name))
+        lookup = to_nfc(rec.server_name) if (rec and rec.server_name) else ""
+        # 대소문자만 다른 동명 항목도 서버에는 '같은 이름'이다(실측) — 정확 일치가 없으면
+        # 대소문자 무시로 한 번 더 본다. 못 찾고 POST하면 409로 막힌다.
+        found = self._idx_find(parent_id, lookup, to_nfc(name))
 
         op = "UPDATE" if (found is not None and not found.is_dir) else "NEW"
         if found is not None and found.is_dir:
@@ -915,8 +934,10 @@ class _PushExecutor:
                 if exc.status != 409:
                     raise
                 # D1: 409 = 순수 이름 충돌(경쟁 상태). 색인을 버리고 재조회 후 재판정.
+                # find_child_by_name은 대소문자 무시 폴백을 포함하므로, 서버가 같은 이름으로
+                # 보는 항목을 여기서 반드시 찾아낸다(못 찾으면 원인 없는 409가 반복된다).
                 self.log.warning("409 이름 충돌 → 재조회 후 새 버전으로 전환: %s", rel)
-                self._index.pop(parent_id, None)
+                self._forget_index(parent_id)
                 existing = self.drive.find_child_by_name(self.drive_id, parent_id, name)
                 if existing is None or existing.is_dir:
                     raise
@@ -924,13 +945,13 @@ class _PushExecutor:
                 file_id = str(res.get("id") or existing.id)
                 version = res.get("version")
                 server_name = existing.name
-                self._dir_index(parent_id)[to_nfc(server_name)] = existing
+                self._idx_put(parent_id, existing)
                 self._commit(rel, file_id, parent_id, server_name, version, item)
                 return "UPDATE"
             file_id = rf.id
             version = rf.version
             server_name = rf.name or to_nfc(name)   # R14: 업로드 응답의 저장명이 정본
-            idx[to_nfc(server_name)] = rf
+            self._idx_put(parent_id, dataclasses.replace(rf, name=server_name))
 
         self._commit(rel, file_id, parent_id, server_name, version, item)
         return op
@@ -1558,6 +1579,477 @@ def reconcile(
             raise typer.Exit(EXIT_FAIL if failed else EXIT_OK)
 
 
+# ---------------------------------------------------------------------------
+# sync — 양방향 (M2)
+# ---------------------------------------------------------------------------
+
+
+META_LAST_SYNC_AT = "last_sync_at"
+
+# 되돌리기 어려운 동작을 사용자가 표에서 바로 알아보게 한다.
+_KIND_EFFECT = {
+    "DOWNLOAD_UPDATE": "로컬 파일을 원격본으로 교체",
+    "UPLOAD_VERSION": "원격 파일을 로컬본으로 교체",
+    "CONFLICT": "로컬 원본을 충돌 사본으로 개명 후 원격본 수신",
+    "LOCAL_TRASH": "로컬을 휴지통으로",
+    "REMOTE_TRASH": "원격을 휴지통으로",
+    "LOCAL_MOVE": "로컬 파일 이동",
+    "REMOTE_MOVE": "원격 파일 이동",
+}
+
+
+def _print_sync_plan(pl, stats: DiffStats, view) -> None:
+    _section("계획")
+    if not pl.actions:
+        _out("  변경 없음")
+    else:
+        rows = [
+            [ACTION_LABEL.get(a.kind, a.kind), a.rel_path,
+             "-" if a.is_dir else _human_size(a.size), a.note]
+            for a in pl.actions[:_MAX_PLAN_ROWS]
+        ]
+        _table(["동작", "경로", "크기", "비고"], rows)
+        if len(pl.actions) > _MAX_PLAN_ROWS:
+            _out(f"  ... 외 {len(pl.actions) - _MAX_PLAN_ROWS}건")
+
+    # 표가 잘려도 무엇이 얼마나 일어나는지는 반드시 보이게 한다. 특히 '덮어쓰기'
+    # 계열(갱신받기 / 새버전업로드)과 '충돌 사본 생성', '휴지통'은 되돌리기 어렵다.
+    if pl.counts:
+        _out("")
+        _out("  동작별 건수")
+        _table(["동작", "건수", "설명"], [
+            [ACTION_LABEL.get(k, k), f"{pl.counts[k]}건", _KIND_EFFECT.get(k, "")]
+            for k in sorted(pl.counts, key=lambda x: -pl.counts[x])
+        ])
+
+    delete_line = f"{pl.delete_count}건"
+    if pl.delete_actions and pl.delete_count != pl.delete_actions:
+        delete_line += f" (삭제 동작 {pl.delete_actions}건 — 폴더는 하위 전체가 함께 사라짐)"
+    _out("")
+    _kv([
+        ("올릴 용량", _human_size(pl.bytes_up)),
+        ("받을 용량", _human_size(pl.bytes_down)),
+        ("실제로 사라질 항목", delete_line),
+        ("변경 없음", f"{stats.unchanged}건"),
+        ("원격 미확인(판단 보류)", f"{stats.skipped_unobserved}건"),
+        ("로컬 미확인(판단 보류)", f"{stats.skipped_local_unobserved}건"),
+        ("보고만", f"{len(pl.reports)}건"),
+        ("보호", f"{len(pl.protected)}건"),
+        ("unsyncable", f"{len(pl.unsyncable)}건"),
+        ("다음 실행으로 미룸", f"{len(pl.deferred)}건"),
+    ])
+    if stats.md5_probe_skipped:
+        _err(f"  주의: 원격 내용 대조 예산을 넘겨 {stats.md5_probe_skipped}건을 확인하지 못했습니다"
+             " — 그 항목은 충돌로 처리됩니다(--md5-probes 로 늘릴 수 있습니다).")
+    if stats.hash_failures:
+        _err(f"  읽기 실패 {len(stats.hash_failures)}건:")
+        _list_reasons("읽기 실패", stats.hash_failures)
+    if view is not None and view.truncated:
+        _err("  주의: 원격 변경 목록이 잘렸습니다 — 이번 실행은 부분 처리이며 다음 실행에서 이어집니다.")
+    if view is not None and view.probe_skipped:
+        _err(f"  주의: 미완료 레코드 {view.probe_skipped}건의 원격 상태를 확인하지 못했습니다"
+             " — 'dsync sync --full' 로 한 번 전체 재조정하는 것을 권합니다.")
+    _list_reasons("보고", pl.reports)
+    _list_reasons("보호", pl.protected)
+    _list_reasons("unsyncable", pl.unsyncable)
+    _list_reasons("미룸", pl.deferred)
+
+
+@app.command()
+def sync(
+    profile: str = typer.Option("default", "--profile", "-p", help="프로파일 이름"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="계획만 출력하고 아무것도 바꾸지 않음"),
+    full: bool = typer.Option(False, "--full", help="원격 전체 재조정(목록 API 전체 순회)"),
+    propagate_deletes: bool = typer.Option(
+        False, "--propagate-deletes",
+        help="이번 실행에 한해 삭제를 반대쪽에 전파(설정은 바꾸지 않음)"),
+    allow_bulk_delete: bool = typer.Option(
+        False, "--allow-bulk-delete", help="대량 삭제 임계를 넘겨 진행"),
+    md5_probes: int = typer.Option(
+        200, "--md5-probes", help="내용 대조를 위해 원격을 받아 볼 최대 건수"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="상세 로그"),
+) -> None:
+    """양방향 동기화 1회. 충돌은 양쪽을 모두 보존하고, 삭제는 어떤 충돌에서도 이기지 않습니다."""
+    log = setup_logging(profile, verbose=verbose)
+    with _error_boundary(log):
+        p = _load_profile(profile)
+        _require_ready(p)
+        do_delete = bool(propagate_deletes or p.propagate_deletes)
+
+        with _instance_lock(p.name):
+            mode = "전체" if full else "델타"
+            _section(f"sync (profile={p.name}, {mode}{', dry-run' if dry_run else ''})")
+            root = p.root_path
+            if not os.path.isdir(ext_path(root)):
+                _fail(f"로컬 루트가 없습니다: {root}", EXIT_CONFIG)
+
+            with Store(db_path(p.name)) as store:
+                # 1) 크래시 복구 — 반드시 잠금 안에서, 다른 무엇보다 먼저
+                incomplete = list(store.iter_incomplete())
+                # 저널이 비어 있어도 임시파일 찌꺼기는 남을 수 있다(기록 직전에 죽은 경우).
+                # 그래서 실제 실행에서는 복구를 **항상** 부른다 — 할 일이 없으면 값이 싸다.
+                if incomplete or not dry_run:
+                    if dry_run:
+                        _section("중단된 작업 복구")
+                        _out(f"  미완료 저널 {len(incomplete)}건 — 실제 실행 시 복구합니다(지금은 건드리지 않음)")
+                    else:
+                        rep = recover(store, p.drive_id, root, logger=log)
+                        if rep.scanned or rep.tmp_removed:
+                            _section("중단된 작업 복구")
+                            _kv([
+                                ("복구 표시", f"{rep.scanned}건"),
+                                ("임시파일 정리", f"{rep.tmp_removed}건"),
+                                ("보존한 충돌 사본", f"{len(rep.conflicts_kept)}건"),
+                            ])
+                            for rel, status in rep.marked[:10]:
+                                _out(f"    재검사 대상: {rel} ({status})")
+
+                # 2) 로컬 스캔
+                scanner = LocalScanner(root, p.exclude, logger=log)
+                _out("")
+                _out("  로컬 스캔 중...")
+                entries = scanner.scan()
+                base = store.all_by_key(p.drive_id)
+                _kv([
+                    ("로컬 항목", f"{len(entries)}건"),
+                    ("base 레코드", f"{len(base)}건"),
+                    ("스캔 제외", f"{len(scanner.skipped)}건"),
+                ])
+                for s in scanner.skipped[:10]:
+                    _err(f"  건너뜀: {s.rel_path} — {s.reason}")
+
+                with _drive_api(p, log) as drive:
+                    root_id, prefix = _resolve_remote_root(drive, p.drive_id, p.remote_path)
+                    collector = RemoteCollector(drive, p.drive_id, prefix, root_id,
+                                                exclude=p.exclude, logger=log)
+                    cursor = store.get_cursor()
+                    scanned_before = store.get_meta(META_LAST_FULL_SCAN)
+                    use_full = bool(full or cursor.revision <= 0 or not scanned_before)
+
+                    _section("원격 상태 " + ("전체 순회" if use_full else "변경 수집"))
+                    progress = _Progress("원격 항목", every=100)
+                    if use_full:
+                        # 순회 중에 일어난 변경을 건너뛰지 않도록 커서를 **먼저** 확보한다.
+                        tip = drive.advance_to_tip(p.drive_id, cursor)
+                        view = collector.full(on_item=lambda _rel: progress.tick())
+                        next_cursor = tip
+                    else:
+                        view = collector.delta(
+                            cursor,
+                            known_by_file_id=iter_known_by_file_id(base.values()),
+                            dirty_file_ids=store.dirty_file_ids(p.drive_id),
+                            on_item=lambda _rel: progress.tick(),
+                        )
+                        next_cursor = view.cursor
+                    progress.done()
+                    _kv([
+                        ("관측 항목", f"{len(view.entries)}건"),
+                        ("원격 삭제", f"{len(view.deleted_keys)}건"),
+                        ("범위 밖 이동", f"{len(view.moved_out_keys)}건"),
+                        ("changes 항목", f"{view.changes_seen}건"),
+                        ("하위 재열람", f"{view.subtrees_relisted}건"),
+                        ("커서", f"revision={next_cursor.revision}"),
+                    ])
+                    for c in view.collisions[:10]:
+                        _err(f"  경고: 경로키 충돌로 제외 — {c}")
+
+                    # 3) 3-way diff
+                    verify_dir = state_dir(p.name) / "verify"
+
+                    def _probe(r) -> str | None:
+                        return drive.remote_md5(p.drive_id, r.file_id, verify_dir) or None
+
+                    decisions, stats = diff(
+                        base=base, local=entries, remote=view,
+                        propagate_deletes=do_delete,
+                        hash_local=scanner.fill_md5,
+                        md5_probe=_probe, md5_probe_budget=max(0, md5_probes),
+                        # 스캔이 못 읽은 경로는 '없음'이 아니라 '모름'이다 — 삭제 판정 금지.
+                        local_unobserved=[s.rel_path for s in scanner.skipped],
+                    )
+
+                    # 4) 계획 + 안전 게이트
+                    trash_why = trash_unavailable_reason()
+                    try:
+                        pl = build_plan(decisions, base_count=len(base), p=p,
+                                        allow_bulk_delete=allow_bulk_delete,
+                                        trash_ok=trash_why is None,
+                                        trash_reason=trash_why or "",
+                                        # 폴더 삭제가 실제로 몇 건을 지우는지 환산하는 근거
+                                        base_keys=tuple(base.keys()))
+                    except BulkDeleteAbort as exc:
+                        _fail(str(exc), EXIT_FAIL)
+                        raise AssertionError("도달 불가")
+                    _print_sync_plan(pl, stats, view)
+
+                    if dry_run:
+                        _out("")
+                        _out("dry-run — 아무것도 변경하지 않았습니다.")
+                        raise typer.Exit(EXIT_OK)
+
+                    for rel, reason in stats.hash_failures:
+                        _record_error(store, p.drive_id, rel, False, reason)
+                    _mark_unsyncable_rows(store, p.drive_id, pl.unsyncable)
+
+                    if not pl.actions:
+                        store.set_meta(META_LAST_SYNC_AT, now_iso())
+                        _save_cursor(store, next_cursor, use_full)
+                        _out("")
+                        _out("변경 없음.")
+                        raise typer.Exit(EXIT_FAIL if stats.hash_failures else EXIT_OK)
+
+                    # 5) 실행
+                    _section("실행")
+                    journal = SyncJournal(store)
+                    ex = SyncExecutor(drive, store, p, base, journal,
+                                      root_id=root_id, remote_prefix=prefix, logger=log,
+                                      # 폴더 삭제 직전 하위 전체를 스캔 시점과 대조하는 근거
+                                      local_snapshot=entries,
+                                      # 스캔이 못 읽은 경로는 실행 단계에서도 삭제 금지
+                                      local_unobserved=[s.rel_path for s in scanner.skipped])
+                    run_progress = _Progress("처리", every=20)
+                    report = ex.run(pl, on_progress=lambda _a: run_progress.tick())
+                    run_progress.done()
+
+                    store.set_meta(META_LAST_SYNC_AT, now_iso())
+                    # 이번에 원격 상태를 확인한 미완료 레코드에 확인 시각을 남긴다 —
+                    # 다음 실행의 dirty 회전이 그 뒤부터 시작한다(앞부분만 반복 확인 방지).
+                    if view.probed_ids:
+                        store.touch_seen(p.drive_id, sorted(view.probed_ids))
+                    # 커서는 실행이 끝난 뒤에만 전진시킨다. 실패한 항목은 sync_status가
+                    # 'synced'가 아니므로 다음 실행의 dirty 조회가 반드시 다시 확인한다.
+                    _save_cursor(store, next_cursor, use_full)
+                    _sync_summary(report, pl)
+
+                    if report.failures or stats.hash_failures:
+                        raise typer.Exit(EXIT_FAIL)
+
+
+def _save_cursor(store: Store, cursor, was_full: bool) -> None:
+    store.set_cursor(cursor)
+    if was_full:
+        store.set_meta(META_LAST_FULL_SCAN, now_iso())
+
+
+def _mark_unsyncable_rows(store: Store, drive_id: str, rows: list[tuple[str, str]]) -> None:
+    for rel, reason in rows:
+        rec = store.get_by_path(drive_id, rel) or FileRecord(drive_id=drive_id, rel_path=rel)
+        rec.sync_status = "unsyncable"
+        rec.error_msg = reason[:500]
+        store.upsert_file(rec)
+
+
+def _sync_summary(report, pl) -> None:
+    _section("결과")
+    rows = [(ACTION_LABEL.get(k, k), f"{v}건") for k, v in sorted(report.done.items())]
+    _kv(rows or [("수행", "0건")])
+    _out("")
+    _kv([
+        ("올림", _human_size(report.bytes_up)),
+        ("받음", _human_size(report.bytes_down)),
+        ("충돌 사본", f"{len(report.conflicts)}건"),
+        ("보호로 건너뜀", f"{len(report.protected)}건"),
+        ("실패", f"{len(report.failures)}건"),
+    ])
+    for rel, copy in report.conflicts[:20]:
+        _err(f"  충돌: {rel} — 로컬 사본 보존: {copy}")
+    if report.conflicts:
+        _err("        'dsync resolve' 로 어느 쪽을 살릴지 정할 수 있습니다.")
+    for old, new in report.renamed_by_server[:10]:
+        _err(f"  알림: 서버 저장명이 다릅니다 — 로컬 '{old}' → 서버 '{new}' (R14)")
+    _list_reasons("보호", report.protected)
+    if report.failures:
+        _out("")
+        _table(["경로", "사유"], [[r, s[:120]] for r, s in report.failures[:_MAX_PLAN_ROWS]])
+        if len(report.failures) > _MAX_PLAN_ROWS:
+            _out(f"  ... 외 {len(report.failures) - _MAX_PLAN_ROWS}건")
+
+
+# ---------------------------------------------------------------------------
+# resolve — 충돌 해결 (M2)
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def resolve(
+    profile: str = typer.Option("default", "--profile", "-p", help="프로파일 이름"),
+    list_only: bool = typer.Option(False, "--list", help="목록만 출력"),
+    conflict_id: int = typer.Option(0, "--id", help="해결할 충돌 id(0이면 전체 대화식)"),
+    keep: str = typer.Option("", "--keep", help="local | remote | both"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="무엇을 할지만 출력"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="상세 로그"),
+) -> None:
+    """미해결 충돌을 확인하고 어느 쪽을 살릴지 정합니다.
+
+    충돌이 생기면 로컬 원본은 '이름 (충돌 날짜 시각).확장자'로 보존되고 원격본이 원래
+    경로에 놓입니다. **어느 선택지도 파일을 영구 삭제하지 않습니다**(로컬은 휴지통).
+    """
+    log = setup_logging(profile, verbose=verbose)
+    with _error_boundary(log):
+        p = _load_profile(profile)
+        _section(f"resolve (profile={p.name}{', dry-run' if dry_run else ''})")
+
+        with _instance_lock(p.name), Store(db_path(p.name)) as store:
+            rows = list(store.iter_unresolved())
+            if not rows:
+                _out("  미해결 충돌이 없습니다.")
+                raise typer.Exit(EXIT_OK)
+
+            _table(
+                ["id", "경로", "종류", "보존된 로컬 사본", "시각"],
+                [[r["id"], r["rel_path"], r["kind"], r["local_copy_path"] or "-", r["ts"]]
+                 for r in rows],
+            )
+            if list_only:
+                _out("")
+                _out("  해결: dsync resolve --id <id> --keep local|remote|both")
+                raise typer.Exit(EXIT_OK)
+
+            targets = [r for r in rows if not conflict_id or int(r["id"]) == conflict_id]
+            if conflict_id and not targets:
+                _fail(f"충돌 id {conflict_id} 를 찾을 수 없습니다.", EXIT_FAIL)
+
+            choice = (keep or "").strip().lower()
+            if choice and choice not in ("local", "remote", "both"):
+                _fail("--keep 은 local, remote, both 중 하나여야 합니다.", EXIT_CONFIG)
+            if not choice and not sys.stdin.isatty():
+                _fail("대화형 입력이 불가능한 환경입니다. --keep 을 지정하거나 --list 를 쓰세요.",
+                      EXIT_CONFIG)
+
+            # local/remote 선택은 원격 사본까지 정리해야 수렴한다 — 그때만 연결한다.
+            need_remote = choice in ("local", "remote") or not choice
+            drive_cm = _drive_api(p, log) if (need_remote and p.drive_id) else None
+            drive = None
+            if drive_cm is not None:
+                try:
+                    drive = drive_cm.__enter__()
+                except Exception as exc:  # noqa: BLE001 — 연결 실패해도 로컬 처리는 진행
+                    _err(f"  경고: 원격에 연결하지 못해 원격 사본은 그대로 둡니다 — {exc}")
+                    drive_cm = None
+
+            done = 0
+            for row in targets:
+                pick = choice
+                if not pick:
+                    _out("")
+                    _out(f"  충돌 #{row['id']}: {row['rel_path']}")
+                    _out(f"    원래 경로  : 원격본 (지금 이 자리에 있음)")
+                    _out(f"    로컬 사본  : {row['local_copy_path'] or '-'}")
+                    pick = typer.prompt(
+                        "    어느 쪽을 살릴까요? [both=둘 다 유지 / local=내 사본을 원래 자리로 / remote=사본 버림]",
+                        default="both").strip().lower()
+                    if pick not in ("local", "remote", "both"):
+                        _err("    건너뜁니다(입력이 올바르지 않음).")
+                        continue
+                if _resolve_one(store, p, row, pick, dry_run, log, drive=drive):
+                    done += 1
+
+            if drive_cm is not None:
+                drive_cm.__exit__(None, None, None)
+
+            _out("")
+            _out(f"{'(dry-run) ' if dry_run else ''}처리한 충돌: {done}건")
+
+
+def _drop_remote_copy(store: Store, p: Profile, copy_rel: str, drive, dry_run: bool) -> None:
+    """충돌 사본의 **원격본**까지 휴지통으로 보낸다(휴지통이므로 복구 가능).
+
+    사본은 기본 설정에서 원격에도 올라간다(`upload_conflict_copy`). 로컬만 정리하고
+    원격을 남기면 **다음 sync가 그 사본을 다시 받아와** 사용자가 방금 해결한 상태로
+    되돌아간다(실계정에서 확인). 'local'/'remote' 선택은 "이 사본은 더 필요 없다"는
+    뜻이므로 양쪽에서 정리해야 해결이 수렴한다. 'both'는 아무것도 지우지 않는다.
+    """
+    if not copy_rel:
+        return
+    rec = store.get_by_path(p.drive_id, copy_rel)
+    if rec is None:
+        return
+    if rec.file_id and drive is not None:
+        _out(f"    → 원격 사본도 휴지통으로 보냅니다: {copy_rel}")
+        if not dry_run:
+            try:
+                drive.move_to_trash(p.drive_id, rec.file_id)
+            except DoorayApiError as exc:
+                if exc.result_code != NO_ACCESS_AUTHORITY:
+                    _err(f"    경고: 원격 사본 정리 실패(로컬은 처리됨) — {exc}")
+    elif rec.file_id:
+        _err(f"    알림: 원격 사본이 남아 있습니다 — 다음 sync가 다시 받아옵니다: {copy_rel}")
+    if not dry_run:
+        store.delete_by_key(p.drive_id, path_key(copy_rel))
+
+
+def _resolve_one(store: Store, p: Profile, row: dict, pick: str, dry_run: bool, log,
+                 drive=None) -> bool:
+    """충돌 1건 처리. 어떤 선택지에서도 파일을 영구 삭제하지 않는다(휴지통만)."""
+    rel = str(row["rel_path"])
+    copy_path = row["local_copy_path"]
+    cid = int(row["id"])
+
+    if pick == "both":
+        _out(f"    → 둘 다 유지하고 해결 처리합니다: {rel}")
+        if not dry_run:
+            store.resolve_conflict(cid)
+        return True
+
+    if not copy_path or not os.path.exists(ext_path(copy_path)):
+        _err(f"    사본을 찾을 수 없어 '둘 다 유지'로 처리합니다: {copy_path or '-'}")
+        if not dry_run:
+            store.resolve_conflict(cid)
+        return True
+
+    copy_rel = _rel_of(p, copy_path)
+
+    if pick == "remote":
+        _out(f"    → 로컬 사본을 휴지통으로 보냅니다: {copy_path}")
+        _drop_remote_copy(store, p, copy_rel, drive, dry_run)
+        if not dry_run:
+            send_to_trash(copy_path)
+            store.resolve_conflict(cid)
+        return True
+
+    # local: 사본을 원래 자리로 되돌리고, 원래 자리에 있던 원격본은 휴지통으로 보낸다.
+    dest = local_path(p.root_path, rel)
+    _out(f"    → 사본을 원래 경로로 되돌립니다: {copy_path} → {dest}")
+    # 사본을 원래 경로로 되돌리므로 그 내용은 원래 경로에서 이어진다 — 사본 자체는
+    # 더 이상 필요 없다. 원격에 남겨 두면 다음 sync가 다시 받아와 해결이 되돌아간다.
+    _drop_remote_copy(store, p, copy_rel, drive, dry_run)
+    if dry_run:
+        return True
+    if os.path.exists(ext_path(dest)):
+        send_to_trash(dest)          # 원격본도 지우지 않고 휴지통으로
+    os.replace(ext_path(copy_path), ext_path(dest))
+    rec = store.get_by_path(p.drive_id, rel) or FileRecord(drive_id=p.drive_id, rel_path=rel)
+    # 기준선(local_md5)은 '마지막으로 원격과 일치했던 내용'의 해시다 — 지금 원래 자리에
+    # 있던 **원격본**의 해시이며, download()가 넣어 둔 값이다. 이것을 복원한 사본의
+    # 해시로 덮어쓰면 다음 diff가 '로컬 = base'로 보아 **아무 일도 하지 않는다.**
+    # (기준선을 NULL로 지우면 영구 PROTECT, 새 내용으로 덮으면 영구 무동작 — 둘 다 틀렸다.)
+    # 기준선은 그대로 두고 (mtime, size)만 비워 다음 diff가 반드시 해시를 다시 계산하게 한다.
+    baseline = rec.local_md5 or rec.remote_md5 or None
+    rec.local_mtime_ns = None
+    rec.local_size = None
+    rec.local_md5 = baseline
+    rec.sync_status = "pending_upload"
+    rec.error_msg = "충돌 해결(로컬 우선) — 다음 sync에서 업로드"
+    if not baseline:
+        # 기준선을 모르면 어느 쪽이 최신인지 판단할 수 없다. 조용히 넘어가지 말고
+        # 다음 sync가 '보호'로 드러내게 둔다(무성 실패보다 눈에 보이는 편이 낫다).
+        rec.sync_status = "error"
+        rec.error_msg = "충돌 해결(로컬 우선) — 기준선 없음, 다음 sync가 보류합니다"
+        _err("    경고: 기준선이 없어 다음 sync가 이 파일을 보류합니다"
+             " — 'dsync reconcile'로 대조하세요.")
+    store.upsert_file(rec)
+    store.resolve_conflict(cid)          # 사본 레코드는 _drop_remote_copy가 이미 정리했다
+    return True
+
+
+def _rel_of(p: Profile, abs_path: str) -> str:
+    """동기화 루트 기준 상대경로. 루트 밖이면 빈 문자열."""
+    try:
+        return rel_posix(p.root_path, Path(abs_path))
+    except ValueError:
+        return ""
+
+
 def _print_pull_plan(plan: _PullPlan) -> None:
     _section("계획")
     if not plan.items:
@@ -1747,6 +2239,18 @@ def doctor(
         _out("5. 상태 DB")
         db_ok, db_msg = _doctor_db(db_path(profile))
         ok &= _check(db_ok, str(db_path(profile)), db_msg)
+
+        # 6) 휴지통 — 삭제 전파(M2)의 전제. 없으면 삭제는 '보고'로만 처리된다.
+        #    '실패'가 아니라 '경고'다: push/pull은 삭제를 하지 않으므로 이것 없이도 동작한다.
+        _out("")
+        _out("6. 휴지통(send2trash)")
+        trash_why = trash_unavailable_reason()
+        _check(
+            True if trash_why is None else None,
+            "로컬 삭제 → 휴지통",
+            "사용 가능" if trash_why is None
+            else f"{trash_why} — 'pip install send2trash' 전까지 삭제 전파는 보고만 합니다",
+        )
 
         _out("")
         if config_problem:
