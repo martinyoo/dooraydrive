@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dooray Drive 동기화(dsync) 다른 PC 설치 안내</title>
+</head>
+<body style="margin:0; padding:0; background:#f4f6fa; font-family:'Malgun Gothic','맑은 고딕',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; color:#1f2937; line-height:1.6;">
+<table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background:#f4f6fa; padding:24px 12px;">
+  <tr>
+    <td align="center">
+      <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="640" style="max-width:640px; background:#ffffff; border-radius:8px; box-shadow:0 1px 3px rgba(0,0,0,0.08); overflow:hidden;">
+
+        <!-- Header -->
+        <tr>
+          <td style="background:linear-gradient(135deg,#2563eb,#1e40af); padding:24px 28px; color:#ffffff;">
+            <div style="font-size:13px; opacity:0.85; letter-spacing:0.5px; margin-bottom:4px;">DOORAY DRIVE 동기화 (dsync)</div>
+            <div style="font-size:22px; font-weight:700;">다른 PC 설치 안내</div>
+            <div style="font-size:13px; opacity:0.85; margin-top:6px;">설정 약 15분 · 첫 내려받기 약 11GB (밤새 두면 끝) · Windows 전용</div>
+          </td>
+        </tr>
+
+        <!-- Greeting -->
+        <tr>
+          <td style="padding:24px 28px 8px 28px; font-size:15px;">
+            안녕하세요,<br><br>
+            Dooray Drive의 업무 폴더를 이 PC와 자동으로 맞춰 주는 동기화 도구(<strong>dsync</strong>)의
+            설치 절차를 안내드립니다. 명령을 그대로 복사해 붙여 넣으면 되도록 정리했습니다.
+          </td>
+        </tr>
+
+        <!-- 준비물 -->
+        <tr>
+          <td style="padding:20px 28px 0 28px;">
+            <h2 style="margin:0 0 12px 0; font-size:16px; color:#1e40af; border-left:4px solid #2563eb; padding-left:10px;">준비물</h2>
+            <ul style="margin:0; padding-left:22px; font-size:14px; color:#374151;">
+              <li>Windows PC (이 도구는 Windows 전용입니다)</li>
+              <li>본인 Dooray 계정 (공공 클라우드 — 웹으로 로그인되는 그 계정)</li>
+              <li>디스크 여유 공간 <strong>12GB 이상</strong></li>
+            </ul>
+          </td>
+        </tr>
+
+        <!-- 설치 절차 -->
+        <tr>
+          <td style="padding:24px 28px 0 28px;">
+            <h2 style="margin:0 0 16px 0; font-size:16px; color:#1e40af; border-left:4px solid #2563eb; padding-left:10px;">설치 절차</h2>
+
+            <!-- Step 1 -->
+            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin-bottom:14px;">
+              <tr>
+                <td width="36" valign="top" style="font-size:18px; font-weight:700; color:#2563eb;">1</td>
+                <td style="font-size:14px;">
+                  <div style="font-weight:600; margin-bottom:4px;">Python 확인 (이미 있으면 넘어가기)</div>
+                  <div style="color:#4b5563;">
+                    시작 메뉴에서 <strong>PowerShell</strong>을 열고:
+                    <pre style="background:#1f2937; color:#e5e7eb; padding:10px 14px; border-radius:5px; font-family:Consolas,monospace; font-size:13px; margin:8px 0; overflow-x:auto;">python --version</pre>
+                    <code style="background:#f3f4f6; padding:1px 6px; border-radius:3px; font-family:Consolas,monospace;">3.11</code> 이상이 나오면 통과.
+                    없으면 <a href="https://www.python.org/downloads/" style="color:#2563eb;">python.org</a>에서 설치하되,
+                    설치 첫 화면의 <strong>"Add python.exe to PATH" 체크</strong>를 잊지 마세요.
+                  </div>
+                </td>
+              </tr>
+            </table>
+
+            <!-- Step 2 -->
+            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin-bottom:14px;">
+              <tr>
+                <td width="36" valign="top" style="font-size:18px; font-weight:700; color:#2563eb;">2</td>
+                <td style="font-size:14px;">
+                  <div style="font-weight:600; margin-bottom:4px;">프로그램 내려받기</div>
+                  <div style="color:#4b5563;">
+                    GitHub 공개 저장소에서 받습니다 (가입 불필요). Git이 있으면:
+                    <pre style="background:#1f2937; color:#e5e7eb; padding:10px 14px; border-radius:5px; font-family:Consolas,monospace; font-size:13px; margin:8px 0; overflow-x:auto;">git clone https://github.com/martinyoo/dooraydrive.git C:\dooraydrive</pre>
+                    Git이 없으면 <a href="https://github.com/martinyoo/dooraydrive" style="color:#2563eb;">저장소 페이지</a>의
+                    초록색 <strong>Code → Download ZIP</strong> → 압축을 풀어 <code style="background:#f3f4f6; padding:1px 6px; border-radius:3px; font-family:Consolas,monospace;">C:\dooraydrive</code>로 이동.
+                  </div>
+                </td>
+              </tr>
+            </table>
+
+            <!-- Step 3 -->
+            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin-bottom:14px;">
+              <tr>
+                <td width="36" valign="top" style="font-size:18px; font-weight:700; color:#2563eb;">3</td>
+                <td style="font-size:14px;">
+                  <div style="font-weight:600; margin-bottom:4px;">의존성 설치</div>
+                  <div style="color:#4b5563;">
+                    <pre style="background:#1f2937; color:#e5e7eb; padding:10px 14px; border-radius:5px; font-family:Consolas,monospace; font-size:13px; margin:8px 0; overflow-x:auto;">cd C:\dooraydrive
+pip install -r requirements.txt</pre>
+                  </div>
+                </td>
+              </tr>
+            </table>
+
+            <!-- Step 4 -->
+            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin-bottom:14px;">
+              <tr>
+                <td width="36" valign="top" style="font-size:18px; font-weight:700; color:#2563eb;">4</td>
+                <td style="font-size:14px;">
+                  <div style="font-weight:600; margin-bottom:4px;">API 토큰 발급·등록 (PC마다 따로)</div>
+                  <div style="color:#4b5563;">
+                    ① Dooray <strong>웹</strong> 접속 → 우측 상단 프로필 → <strong>개인설정 → API → 개인 인증 토큰</strong> → 토큰 생성 → 복사<br>
+                    ② PowerShell에서 등록 (따옴표 그대로, 토큰만 바꿔서):
+                    <pre style="background:#1f2937; color:#e5e7eb; padding:10px 14px; border-radius:5px; font-family:Consolas,monospace; font-size:13px; margin:8px 0; overflow-x:auto;">python -c "import keyring; keyring.set_password('dooray-sync','api-token','여기에_토큰_붙여넣기')"</pre>
+                    토큰은 설정 파일이 아니라 <strong>Windows 자격 증명 관리자</strong>에 저장됩니다.
+                    <span style="color:#b91c1c;">토큰은 계정과 같은 권한을 가지므로 메일·메신저로 보내지 마세요.</span>
+                  </div>
+                </td>
+              </tr>
+            </table>
+
+            <!-- Step 5 -->
+            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin-bottom:14px;">
+              <tr>
+                <td width="36" valign="top" style="font-size:18px; font-weight:700; color:#2563eb;">5</td>
+                <td style="font-size:14px;">
+                  <div style="font-weight:600; margin-bottom:4px;">연결 확인</div>
+                  <div style="color:#4b5563;">
+                    <pre style="background:#1f2937; color:#e5e7eb; padding:10px 14px; border-radius:5px; font-family:Consolas,monospace; font-size:13px; margin:8px 0; overflow-x:auto;">cd C:\dooraydrive
+.\dsync doctor</pre>
+                    토큰·연결·긴 경로가 <strong style="color:#059669;">[정상]</strong>이면 통과.
+                    ("설정 없음" 경고는 아직 정상입니다 — 다음 단계에서 만듭니다.)
+                  </div>
+                </td>
+              </tr>
+            </table>
+
+            <!-- Step 6 -->
+            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin-bottom:14px;">
+              <tr>
+                <td width="36" valign="top" style="font-size:18px; font-weight:700; color:#2563eb;">6</td>
+                <td style="font-size:14px;">
+                  <div style="font-weight:600; margin-bottom:4px;">동기화 폴더 자동 설정</div>
+                  <div style="color:#4b5563;">
+                    운용 중인 4개 폴더(드라이브 id·원격 경로 포함)가 스크립트에 이미 들어 있습니다:
+                    <pre style="background:#1f2937; color:#e5e7eb; padding:10px 14px; border-radius:5px; font-family:Consolas,monospace; font-size:13px; margin:8px 0; overflow-x:auto;">.\SETUP-2ND-PC.ps1 -LocalBase "D:\Dooray"</pre>
+                    <code style="background:#f3f4f6; padding:1px 6px; border-radius:3px; font-family:Consolas,monospace;">-LocalBase</code>는 이 PC에서 파일을 둘 최상위 폴더입니다(생략 시 <code style="background:#f3f4f6; padding:1px 6px; border-radius:3px; font-family:Consolas,monospace;">C:\Dooray</code>).
+                    스크립트는 디스크 여유(11.5GB)를 확인하고 프로파일 4개를 만들며, <strong>파일은 아직 받지 않습니다.</strong>
+                    <br><span style="color:#9ca3af; font-size:13px;">"스크립트 실행이 차단됨"이 뜨면:
+                    <code style="background:#f3f4f6; padding:1px 6px; border-radius:3px; font-family:Consolas,monospace;">powershell -ExecutionPolicy Bypass -File .\SETUP-2ND-PC.ps1 -LocalBase "D:\Dooray"</code></span>
+                  </div>
+                </td>
+              </tr>
+            </table>
+
+            <!-- Step 7 -->
+            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin-bottom:8px;">
+              <tr>
+                <td width="36" valign="top" style="font-size:18px; font-weight:700; color:#10b981;">7</td>
+                <td style="font-size:14px;">
+                  <div style="font-weight:600; margin-bottom:4px;">파일 받기 — 작은 폴더부터</div>
+                  <div style="color:#4b5563;">
+                    문제가 있으면 13개 파일에서 드러나는 게 낫습니다. 순서대로:
+                    <pre style="background:#1f2937; color:#e5e7eb; padding:10px 14px; border-radius:5px; font-family:Consolas,monospace; font-size:13px; margin:8px 0; overflow-x:auto;">.\dsync pull -p swstat --dry-run   # 계획만 확인 (아무것도 안 바꿈)
+.\dsync pull -p swstat             # 13파일 / 0.35GB — 여기서 정상 확인
+.\dsync pull -p spri2026           # 621파일 / 2.23GB
+.\dsync pull -p spri2025           # 700파일 / 4.13GB
+.\dsync pull -p workenv            # 440파일 / 4.53GB</pre>
+                    <strong>중간에 끊겨도 안전합니다</strong> — 다시 실행하면 받은 것은 건너뛰고 이어받습니다.
+                    받는 중에는 임시파일에 쓰고 검증 후 바꿔 넣으므로 반쪽짜리 파일이 남지 않습니다.
+                  </div>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+
+        <!-- 평소 사용법 -->
+        <tr>
+          <td style="padding:20px 28px 0 28px;">
+            <h2 style="margin:0 0 12px 0; font-size:16px; color:#1e40af; border-left:4px solid #2563eb; padding-left:10px;">평소 사용법 — 이 순서만 기억하세요</h2>
+            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background:#eff6ff; border-left:4px solid #2563eb; border-radius:4px; margin-bottom:12px;">
+              <tr>
+                <td style="padding:14px 16px; font-size:14px; color:#1f2937;">
+                  <strong>① 일 시작 전</strong> <code style="background:#fff; padding:2px 8px; border-radius:3px; font-family:Consolas,monospace;">.\SYNC.ps1 -Pull</code> — 다른 PC에서 올린 최신본 받기<br>
+                  <strong>② 파일 작업</strong> (평소처럼)<br>
+                  <strong>③ 일 끝난 뒤</strong> <code style="background:#fff; padding:2px 8px; border-radius:3px; font-family:Consolas,monospace;">.\SYNC.ps1</code> — 고친 것 올리기
+                </td>
+              </tr>
+            </table>
+            <div style="font-size:13px; color:#4b5563;">
+              두 명령 모두 <strong>계획을 먼저 보여주고 확인받은 뒤</strong> 실행합니다.
+              순서를 어겨도 <strong>파일이 사라지지는 않습니다</strong> — 받기는 내가 고친 파일을 절대 덮지 않고
+              "보호"로 건너뛰며, 올리기는 원격을 지우지 않습니다. 어느 쪽을 살릴지만 직접 정하면 됩니다.
+            </div>
+          </td>
+        </tr>
+
+        <!-- 자주 만나는 상황 -->
+        <tr>
+          <td style="padding:20px 28px 0 28px;">
+            <h2 style="margin:0 0 12px 0; font-size:16px; color:#1e40af; border-left:4px solid #2563eb; padding-left:10px;">자주 만나는 메시지</h2>
+            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="font-size:13px; color:#374151;">
+              <tr>
+                <td style="padding:6px 0; border-bottom:1px solid #f3f4f6;"><strong>"보류/보호 — 기준선 없음"</strong><br>
+                로컬과 원격에 같은 파일이 있는데 이 PC에서 동기화한 적이 없다는 뜻.
+                <code style="background:#f3f4f6; padding:1px 6px; border-radius:3px; font-family:Consolas,monospace;">.\dsync reconcile -p 프로파일</code> 실행 —
+                내용을 대조해 같으면 기록만 하고(전송 없음), 다르면 알려줍니다. 로컬 파일은 건드리지 않습니다.</td>
+              </tr>
+              <tr>
+                <td style="padding:6px 0; border-bottom:1px solid #f3f4f6;"><strong>"보호(로컬 우선) — 덮어쓰지 않습니다"</strong><br>
+                이 PC에서 고친 파일이라는 뜻이며 정상 동작입니다. 내 것을 올리려면 push, 원격 것을 받으려면 로컬 파일을 다른 이름으로 옮긴 뒤 pull.</td>
+              </tr>
+              <tr>
+                <td style="padding:6px 0; border-bottom:1px solid #f3f4f6;"><strong>"unsyncable"</strong><br>
+                Windows에 저장할 수 없는 이름(끝의 점, CON 같은 예약어 등)이라 받지 않은 파일. Dooray 웹에서 이름을 바꾸면 다음에 받아집니다.</td>
+              </tr>
+              <tr>
+                <td style="padding:6px 0;"><strong>"실패 N건"</strong><br>
+                파일 단위로 격리되므로 나머지는 정상 처리됩니다. 다시 실행하면 실패한 것만 재시도합니다.
+                계속 실패하면 <code style="background:#f3f4f6; padding:1px 6px; border-radius:3px; font-family:Consolas,monospace;">.\dsync doctor -p 프로파일</code>.</td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+
+        <!-- 업데이트 -->
+        <tr>
+          <td style="padding:20px 28px 0 28px;">
+            <h2 style="margin:0 0 12px 0; font-size:16px; color:#1e40af; border-left:4px solid #2563eb; padding-left:10px;">프로그램 업데이트</h2>
+            <div style="font-size:14px; color:#374151;">
+              새 버전 알림을 받으면:
+              <pre style="background:#1f2937; color:#e5e7eb; padding:10px 14px; border-radius:5px; font-family:Consolas,monospace; font-size:13px; margin:8px 0; overflow-x:auto;">cd C:\dooraydrive
+git pull
+pip install -r requirements.txt</pre>
+              설정과 동기화 기록은 프로그램 폴더 밖에 있어 업데이트해도 그대로 유지됩니다.
+            </div>
+          </td>
+        </tr>
+
+        <!-- 알아둘 제약 -->
+        <tr>
+          <td style="padding:20px 28px 0 28px;">
+            <h2 style="margin:0 0 12px 0; font-size:16px; color:#1e40af; border-left:4px solid #2563eb; padding-left:10px;">알아둘 것</h2>
+            <ul style="margin:0; padding-left:22px; font-size:13px; color:#374151;">
+              <li><strong>삭제는 전파되지 않습니다.</strong> 어느 쪽에서 지워도 반대편은 그대로이며 보고만 됩니다(안전 정책).</li>
+              <li>같은 프로파일을 두 창에서 동시에 실행할 수 없습니다(자동으로 막힙니다).</li>
+              <li>실행 전 <code style="background:#f3f4f6; padding:1px 6px; border-radius:3px; font-family:Consolas,monospace;">--dry-run</code>을 붙이면 계획만 보고 아무것도 바꾸지 않습니다. 습관을 들이면 좋습니다.</li>
+              <li>양방향 자동 동기화(sync)와 충돌 자동 보존은 검증이 끝나는 대로 안내드립니다.</li>
+            </ul>
+          </td>
+        </tr>
+
+        <!-- 보안 -->
+        <tr>
+          <td style="padding:20px 28px 24px 28px;">
+            <h2 style="margin:16px 0 12px 0; font-size:16px; color:#b91c1c; border-left:4px solid #dc2626; padding-left:10px;">보안 안내</h2>
+            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background:#fef2f2; border:1px solid #fecaca; border-radius:6px;">
+              <tr>
+                <td style="padding:14px 16px; font-size:13px; color:#7f1d1d;">
+                  <ul style="margin:0; padding-left:20px;">
+                    <li style="margin-bottom:6px;"><strong>API 토큰은 계정 전체 권한입니다.</strong> 메일·메신저·메모장 파일로 옮기지 말고, 발급 → 즉시 등록 → 복사본 삭제.</li>
+                    <li style="margin-bottom:6px;">토큰 등록 명령을 파일로 저장해 두지 마세요(토큰이 평문으로 남습니다).</li>
+                    <li>유출이 의심되면 Dooray 웹 <strong>개인설정 → API</strong>에서 해당 토큰을 폐기하고 새로 발급해 다시 등록하면 됩니다.</li>
+                  </ul>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+
+        <!-- Footer -->
+        <tr>
+          <td style="background:#f8fafc; padding:18px 28px; border-top:1px solid #e5e7eb; font-size:13px; color:#6b7280;">
+            더 자세한 절차·문제 해결: <code style="background:#fff; padding:1px 5px; border-radius:3px; font-family:Consolas,monospace;">C:\dooraydrive\docs\설치안내.md</code><br>
+            문의: <span style="color:#374151;">&lt;관리자 연락처&gt;</span>
+            <span style="font-size:12px; color:#9ca3af;"><br>감사합니다.</span>
+          </td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+</table>
+</body>
+</html>
