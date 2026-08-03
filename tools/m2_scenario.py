@@ -37,7 +37,7 @@ from dooray_sync.api.client import DoorayApiError, DoorayClient   # noqa: E402
 from dooray_sync.api.drive import NO_ACCESS_AUTHORITY, DriveAPI   # noqa: E402
 from dooray_sync.auth import get_token                   # noqa: E402
 from dooray_sync.config import db_path, load_config      # noqa: E402
-from dooray_sync.core.remote import resolve_remote_root  # noqa: E402
+from dooray_sync.core.remote import RemoteRootError, resolve_remote_root  # noqa: E402
 from dooray_sync.store.db import Store                   # noqa: E402
 from dooray_sync.util.paths import ext_path              # noqa: E402
 
@@ -334,7 +334,15 @@ def step10(pa, pb) -> None:
 # ---------------------------------------------------------------- 11단계
 def cleanup(pa, drive: DriveAPI) -> None:
     section("11단계. 정리 — 원격 시험 폴더를 휴지통으로")
-    fid, pref = resolve_remote_root(drive, pa.drive_id, pa.remote_path)
+    try:
+        fid, pref = resolve_remote_root(drive, pa.drive_id, pa.remote_path)
+    except RemoteRootError:
+        # 이미 휴지통에 들어갔거나 애초에 없다 — 정리 목적은 달성된 상태다.
+        # 재실행에서 오류로 죽지 않게 무동작으로 끝낸다.
+        check(True, f"원격 '{pa.remote_path}' 가 이미 정리되어 있음(루트에 없음)")
+        print("   ※ 휴지통에 있다면 Dooray 웹에서 복원할 수 있습니다.")
+        print("   로컬 .dbg\\m2 폴더와 PowerShell 창은 직접 정리하세요.")
+        return
     if pref.strip("/").lower() != "_m2_test":
         die(f"정리 대상이 _m2_test 가 아닙니다: {pref!r}")
     if not fid:
