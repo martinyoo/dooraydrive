@@ -88,11 +88,17 @@ Md5Probe = Callable[[RemoteEntry], "str | None"]
 
 
 def conflict_copy_name(rel_path: str, when: _dt.datetime) -> str:
-    """'a/문서.docx' → 'a/문서 (충돌 2026-08-02 1530).docx' (구현계획서 §3.3 6번)."""
+    """'a/문서.docx' → 'a/문서 (충돌 2026-08-02 1530).docx' (구현계획서 §3.3 6번).
+
+    stem이 비는 이름(점으로 시작하는 '.gitignore' 류)은 태그를 **끝에** 붙인다.
+    점 앞에 끼우면 ' (충돌 …).gitignore'처럼 앞공백 이름이 되는데, 서버가 앞공백을
+    절삭해(R14) 저장명이 로컬과 어긋나고 다음 sync가 개명 왕복을 한 번 더 돈다 —
+    2026-08-04 사용자 테스트 UT-10에서 실측. 원본 정체도 이름에서 사라진다.
+    """
     head, _, name = str(rel_path).rpartition("/")
     stem, dot, ext = name.rpartition(".")
     tag = f" (충돌 {when.strftime('%Y-%m-%d %H%M')})"
-    new_name = (stem + tag + dot + ext) if dot else (name + tag)
+    new_name = (stem + tag + dot + ext) if (dot and stem) else (name + tag)
     return f"{head}/{new_name}" if head else new_name
 
 
@@ -238,6 +244,14 @@ def diff(*, base: dict[str, FileRecord], local: dict[str, LocalEntry], remote: R
             continue
         r = remote_by_id.get(rec.file_id)
         if r is not None and r.rel_path_key != key:
+            new_rec = base.get(r.rel_path_key)
+            if new_rec is not None and new_rec.file_id == rec.file_id:
+                # 이동은 이미 새 키에 실현됐다(이전 패스가 새 경로를 수신·기록).
+                # C13 보호로 옛 레코드가 남은 것뿐인데, 이를 다시 이동으로 처리하면
+                # 새 경로를 매 패스 재수신하는 무한 반복이 된다(UT-12 실측,
+                # 2026-08-04). 옛 키는 일반 판정에 맡긴다 — 남은 로컬 편집본은
+                # 결정표 10(보존 승리)이 별도 파일로 올린다.
+                continue
             moved_remote[key] = r
 
     # 원격 이동의 목적지 키는 '원격 신규'가 아니다 — 아래 본 루프에서 건너뛴다.
@@ -263,7 +277,9 @@ def diff(*, base: dict[str, FileRecord], local: dict[str, LocalEntry], remote: R
 
         # --- 이동 먼저 (결정표 11·12·13: "이동을 먼저 반영한 뒤 나머지를 재적용")
         if key in moved_remote:
-            out.extend(_remote_move(key, rec, entry, moved_remote[key], ctx, stats))
+            mv = moved_remote[key]
+            out.extend(_remote_move(key, rec, entry, mv, ctx, stats,
+                                    new_entry=local.get(mv.rel_path_key)))
             continue
         if key in moved_local:
             new_key, new_entry = moved_local[key]
@@ -318,11 +334,18 @@ def diff(*, base: dict[str, FileRecord], local: dict[str, LocalEntry], remote: R
 
 
 def _remote_move(key: str, rec: FileRecord | None, entry: LocalEntry | None,
-                 r: RemoteEntry, ctx: _Ctx, stats: DiffStats) -> list[Decision]:
+                 r: RemoteEntry, ctx: _Ctx, stats: DiffStats,
+                 new_entry: LocalEntry | None = None) -> list[Decision]:
     """결정표 12: 원격에서 이동/개명됨 → 로컬도 옮긴다.
 
-    로컬이 그 사이에 수정됐으면 옮기지 않는다 — 옮긴 뒤 원격 내용으로 덮으면 편집이
-    사라진다. 그 경우 로컬은 그대로 두고(PROTECT) 새 경로는 신규 수신으로 처리한다.
+    로컬 수정이 끼어 있으면 원격 내용이 함께 바뀌었는지로 갈린다(UT-12, 2026-08-04):
+    - 원격이 **자리만** 옮겼다(내용 불변) → 편집본을 새 경로로 함께 옮긴다. 편집은
+      파일에 그대로 있고 base는 옛 기준선을 유지하므로 다음 패스 결정표 4가 올린다.
+    - 원격 내용까지 바뀌었다(3중 발산) → 옮긴 뒤 덮으면 편집이 사라진다. 로컬은
+      그대로 두고(PROTECT) 새 경로는 신규 수신한다.
+
+    `new_entry`는 이동 목적지 키의 로컬 상태다. 목적지에 이미 로컬 파일이 있으면
+    신규 수신으로 덮지 않고 보고만 한다.
     """
     rel = rec.rel_path if rec else key
     if entry is None:
@@ -340,6 +363,17 @@ def _remote_move(key: str, rec: FileRecord | None, entry: LocalEntry | None,
                                 reason=f"원격에서 {r.rel_path}로 이동됨 — 옛 경로 기록 정리"))
         return out
 
+    def _fetch_new_path() -> Decision:
+        """새 경로 처리: 비어 있으면 신규 수신, 로컬 파일이 이미 있으면 덮지 않는다."""
+        if new_entry is None:
+            return Decision(case=2, kind=KIND_DOWNLOAD_NEW, rel_path=r.rel_path,
+                            key=r.rel_path_key, remote=r,
+                            reason=f"원격 이동본을 새 경로로 받습니다({rel} → {r.rel_path})")
+        return Decision(case=0, kind=KIND_REPORT, rel_path=r.rel_path,
+                        key=r.rel_path_key, remote=r, local=new_entry,
+                        reason=f"이동 목적지에 이미 로컬 파일이 있습니다 — "
+                               f"덮지 않습니다({rel} → {r.rel_path})")
+
     # 기준선이 없으면 로컬이 수정됐는지 알 수 없다 — 옮긴 뒤 원격본으로 덮으면 편집이
     # 사본도 없이 사라진다. 이동이 끼었을 뿐 "어느 쪽이 최신인지 모른다"는 사실은 같으므로
     # _decide_one의 '기준선 없음 → PROTECT'와 같은 판단이어야 한다.
@@ -349,21 +383,19 @@ def _remote_move(key: str, rec: FileRecord | None, entry: LocalEntry | None,
                      base=rec, remote=r,
                      reason="원격은 이동, 로컬 기준선 없음 — 로컬을 그대로 두고 "
                             "'dsync reconcile'로 대조하세요"),
-            Decision(case=2, kind=KIND_DOWNLOAD_NEW, rel_path=r.rel_path,
-                     key=r.rel_path_key, remote=r,
-                     reason=f"원격 이동본을 새 경로로 받습니다({rel} → {r.rel_path})"),
+            _fetch_new_path(),
         ]
 
     if rec is not None and not rec.is_dir and _has_baseline(rec) and not _meta_same(rec, entry):
         lm = ctx.local_md5(entry)
-        if lm and lm.lower() != (rec.local_md5 or "").lower():
+        if lm and lm.lower() != (rec.local_md5 or "").lower() and _remote_changed(rec, r):
+            # 3중 발산(이동 + 원격 내용 수정 + 로컬 수정)만 보호한다. 원격이 자리만
+            # 옮긴 경우는 아래 공통 LOCAL_MOVE로 떨어져 편집본이 함께 이동한다.
             return [
                 Decision(case=13, kind=KIND_PROTECT, rel_path=rel, key=key, local=entry,
                          base=rec, remote=r,
-                         reason="원격은 이동, 로컬은 수정 — 로컬을 그대로 두고 보고만 합니다"),
-                Decision(case=2, kind=KIND_DOWNLOAD_NEW, rel_path=r.rel_path,
-                         key=r.rel_path_key, remote=r,
-                         reason=f"원격 이동본을 새 경로로 받습니다({rel} → {r.rel_path})"),
+                         reason="원격은 이동+수정, 로컬도 수정 — 로컬을 그대로 두고 보고만 합니다"),
+                _fetch_new_path(),
             ]
 
     stats.moves_local += 1

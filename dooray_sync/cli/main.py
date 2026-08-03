@@ -1494,17 +1494,28 @@ def reconcile(
             base = store.all_by_key(p.drive_id)
 
             targets = []
+            # DB 레코드가 없는(또는 file_id를 모르는) 로컬 파일. init 이후 원격에
+            # 새로 생긴 파일은 DB에 기록이 없어, 원격을 직접 걸어야 상대를 찾는다.
+            # (pull이 '기준선 없음 — reconcile로 대조하세요'라고 안내하는 상태가
+            #  정확히 이것인데, 예전에는 DB만 봐서 대조 대상 0건으로 끝났다 —
+            #  2026-08-04 사용자 테스트 UT-04에서 발견)
+            orphans: dict[str, object] = {}
             for key, entry in entries.items():
                 if entry.is_dir:
                     continue
                 rec = base.get(key)
                 # 대상: 원격에도 있고(file_id) 기준선이 없는(local_md5 없음) 파일
-                if rec is None or not rec.file_id or rec.is_dir or rec.local_md5:
+                if rec is not None and rec.file_id and not rec.is_dir and not rec.local_md5:
+                    targets.append((key, entry, rec))
                     continue
-                targets.append((key, entry, rec))
+                if rec is None or (not rec.local_md5 and not rec.file_id
+                                   and not rec.is_dir):
+                    orphans[key] = entry
 
-            _kv([("로컬 항목", f"{len(entries)}건"), ("대조 대상", f"{len(targets)}건")])
-            if not targets:
+            _kv([("로컬 항목", f"{len(entries)}건"),
+                 ("대조 대상(DB 기록)", f"{len(targets)}건"),
+                 ("DB에 없는 로컬 파일", f"{len(orphans)}건 — 원격에서 상대를 찾습니다")])
+            if not targets and not orphans:
                 _out("")
                 _out("해소할 항목이 없습니다.")
                 raise typer.Exit(EXIT_OK)
@@ -1517,6 +1528,40 @@ def reconcile(
             _section("대조" + (" (크기만)" if trust_size else " (원격 내용 확인)"))
             progress = _Progress("대조", every=10)
             with _drive_api(p, log) as drive:
+                if orphans:
+                    # 원격 walk로 같은 경로키의 파일을 찾는다. 경로키 충돌(대소문자·
+                    # 정규화만 다른 이름)은 pull과 같은 규칙 — 먼저 본 것이 정본이고
+                    # 뒤에 온 것은 무시한다.
+                    root_id, prefix = _resolve_remote_root(
+                        drive, p.drive_id, p.remote_path)
+                    seen_rkeys: set[str] = set()
+                    matched = 0
+                    for rf, full in drive.walk(
+                            p.drive_id, root_id,
+                            base_path=("/" + prefix) if prefix else ""):
+                        rel_r = _rel_from_remote(full, prefix)
+                        if not rel_r or rf.is_dir or not rf.id:
+                            continue
+                        rkey = path_key(rel_r)
+                        if rkey in seen_rkeys:
+                            continue
+                        seen_rkeys.add(rkey)
+                        ent = orphans.pop(rkey, None)
+                        if ent is None:
+                            continue
+                        targets.append((rkey, ent, FileRecord(
+                            drive_id=p.drive_id, rel_path=ent.rel_path,
+                            file_id=rf.id, parent_id=rf.parent_id or "",
+                            server_name=rf.name, is_dir=False,
+                            remote_size=rf.size, remote_version=rf.version,
+                            remote_revision=rf.revision)))
+                        matched += 1
+                    _kv([("원격에서 상대 확인", f"{matched}건"),
+                         ("원격에 없음(push 대상)", f"{len(orphans)}건")])
+                    if not targets:
+                        _out("")
+                        _out("해소할 항목이 없습니다. (원격에 상대가 없는 로컬 파일은 push가 올립니다)")
+                        raise typer.Exit(EXIT_OK)
                 for key, entry, rec in targets:
                     rel = entry.rel_path
                     try:

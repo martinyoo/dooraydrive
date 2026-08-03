@@ -590,6 +590,15 @@ class SyncExecutor:
         # 새 경로에서 결정표 5로 다시 잡게 한다.
         content_pending = bool(rec is not None and not r.is_dir and _remote_changed(rec, r))
 
+        # base는 '마지막 동기화 시점의 로컬 내용'이어야 한다(I4). 편집된 파일을
+        # 이동시킨 경우(원격이 자리만 옮긴 결정표 13) 이동 후 실측 stat과 옛 해시를
+        # 섞어 기록하면 meta 게이트가 '변경 없음'으로 오판해 그 편집이 영원히
+        # 올라가지 않는다(UT-12 실측, 2026-08-04). 옛 기준선이 온전하면 세 값을
+        # 그대로 옮기고, 다음 스캔의 meta 불일치 → 해시 재계산 → 결정표 4에 맡긴다.
+        keep_old_baseline = bool(
+            rec is not None and not r.is_dir and rec.local_md5
+            and rec.local_mtime_ns is not None and rec.local_size is not None)
+
         def _apply() -> None:
             if r.is_dir:
                 # 폴더는 하위 레코드 경로까지 같은 트랜잭션에서 옮긴다 — 남겨 두면
@@ -604,8 +613,10 @@ class SyncExecutor:
                 drive_id=self.drive_id, rel_path=r.rel_path, file_id=r.file_id or None,
                 parent_id=r.parent_id or None, server_name=r.server_name or None,
                 is_dir=r.is_dir,
-                local_mtime_ns=fresh.st_mtime_ns if fresh else None,
-                local_size=fresh.st_size if fresh else None,
+                local_mtime_ns=(rec.local_mtime_ns if keep_old_baseline
+                                else (fresh.st_mtime_ns if fresh else None)),
+                local_size=(rec.local_size if keep_old_baseline
+                            else (fresh.st_size if fresh else None)),
                 local_md5=(rec.local_md5 if rec else None) or entry_local.md5,
                 # 순수 이동이면 전진, 내용까지 바뀌었으면 옛 값 유지(위 주석 참조)
                 remote_revision=(rec.remote_revision if content_pending else r.revision),

@@ -11,6 +11,8 @@ import os
 import sys
 from pathlib import Path
 
+import typer
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dooray_sync.api.client import DoorayApiError  # noqa: E402
@@ -172,13 +174,49 @@ def test_local_move_not_promoted_when_ambiguous():
 
 
 def test_case_13_move_plus_modify_protects_local():
-    """원격은 이동, 로컬은 수정 — 옮기고 덮으면 편집이 사라진다. 둘 다 남긴다."""
+    """원격은 이동+내용 수정, 로컬도 수정(3중 발산) — 옮기고 덮으면 편집이 사라진다.
+    둘 다 남긴다."""
     old, new = path_key("a.txt"), path_key("sub/a.txt")
     d, _ = diff(base={old: B("a.txt")}, local={old: L("a.txt", "cc", mtime=222)},
                 remote=RemoteView(is_complete=False, entries={new: R("sub/a.txt", "bb", ver=2)}))
     got = {x.kind for x in d}
     assert "PROTECT" in got and KIND_DOWNLOAD_NEW in got
     assert KIND_LOCAL_MOVE not in got
+
+
+def test_case_13_pure_move_carries_local_edit_along():
+    """UT-12(2026-08-04): 원격이 **자리만** 옮기고(내용 불변) 로컬이 수정된 경우 —
+    보호로 세워 두지 않고 편집본을 새 경로로 함께 옮긴다. base는 옛 기준선을
+    유지하므로 다음 패스 결정표 4가 편집을 업로드한다."""
+    old, new = path_key("a.txt"), path_key("sub/a.txt")
+    d, _ = diff(base={old: B("a.txt")}, local={old: L("a.txt", "cc", mtime=222)},
+                remote=RemoteView(is_complete=False,
+                                  entries={new: R("sub/a.txt", "aa", ver=1)}))
+    got = {x.kind for x in d}
+    assert KIND_LOCAL_MOVE in got, got
+    assert "PROTECT" not in got and KIND_DOWNLOAD_NEW not in got
+
+
+def test_remote_move_already_applied_is_not_reprocessed():
+    """UT-12(2026-08-04): C13 보호 후 옛 레코드가 남은 상태(새 키에 같은 file_id의
+    레코드가 이미 있음)를 다시 '이동'으로 처리하면 새 경로를 매 패스 재수신하는
+    무한 반복이 된다. 이동은 실현된 것으로 보고, 옛 키의 로컬 편집본은 결정표
+    10(보존 승리)으로 올린다."""
+    old, new = path_key("a.txt"), path_key("sub/a.txt")
+    base = {old: B("a.txt"), new: B("sub/a.txt", md5="bb", ver=2)}
+    local = {old: L("a.txt", "cc", mtime=222), new: L("sub/a.txt", "bb", mtime=333)}
+    # 완전 뷰: 원격에는 새 경로만 있다
+    d, _ = diff(base=base, local=local,
+                remote=RemoteView(is_complete=True,
+                                  entries={new: R("sub/a.txt", "bb", ver=2)}))
+    by_key = {}
+    for x in d:
+        by_key.setdefault(x.key, []).append(x.kind)
+    # 새 경로: 이미 동기화됨 — 재수신 없음
+    assert KIND_DOWNLOAD_NEW not in by_key.get(new, []), by_key
+    assert KIND_LOCAL_MOVE not in by_key.get(old, []), by_key
+    # 옛 경로의 편집본: 보존 승리로 다시 올라간다(결정표 10)
+    assert KIND_UPLOAD_NEW in by_key.get(old, []), by_key
 
 
 def test_forget_when_gone_from_both_sides():
@@ -301,6 +339,15 @@ def test_conflict_copy_name_format():
     when = _dt.datetime(2026, 8, 2, 15, 30)
     assert conflict_copy_name("a/문서.docx", when) == "a/문서 (충돌 2026-08-02 1530).docx"
     assert conflict_copy_name("README", when) == "README (충돌 2026-08-02 1530)"
+    # UT-10(2026-08-04): 점으로 시작하는 이름은 태그를 끝에 붙인다. 점 앞에 끼우면
+    # ' (충돌 …).gitignore'처럼 앞공백 이름이 되어 서버가 절삭(R14) — 저장명이
+    # 로컬과 어긋나 다음 sync가 개명 왕복을 한 번 더 돈다.
+    assert conflict_copy_name(".gitignore", when) == ".gitignore (충돌 2026-08-02 1530)"
+    from dooray_sync.util.paths import name_issue, server_name_will_differ
+    for src in ("a/문서.docx", "README", ".gitignore", "b/.env"):
+        copy_name = conflict_copy_name(src, when).rpartition("/")[2]
+        assert name_issue(copy_name) is None, copy_name
+        assert not server_name_will_differ(copy_name), copy_name
 
 
 # =========================================================== B4: 폴더 개명 하위 재열람
@@ -789,6 +836,60 @@ def test_cli_sync_end_to_end(tmp_path: Path):
     assert drive.nodes[same.id]["version"] == 1, "내용이 같은데 재업로드했다"
 
 
+def test_reconcile_finds_remote_counterpart_missing_from_db(tmp_path: Path):
+    """UT-04(2026-08-04 사용자 테스트): init 이후 원격에 생긴 파일은 DB에 기록이 없어
+    reconcile이 '대조 대상 0건'으로 끝났다 — pull이 '기준선 없음 → reconcile로
+    대조하세요'라고 안내한 바로 그 상태를 reconcile이 못 봤다(영구 루프).
+    이제 DB에 없는 로컬 파일은 원격 walk로 상대를 찾아 대조한다."""
+    import contextlib
+
+    from dooray_sync import config as cfg
+    from dooray_sync.cli import main as cli
+
+    os.environ[cfg.ENV_CONFIG_DIR] = str(tmp_path / "cfg")
+    os.environ[cfg.ENV_STATE_DIR] = str(tmp_path / "state")
+    os.environ["DOORAY_API_TOKEN"] = "테스트토큰" + "x" * 30
+    root = tmp_path / "local"
+    os.makedirs(ext_path(root), exist_ok=True)
+
+    drive = _FakeDrive()
+    same_id = drive.put("둘다같음.txt", "root", b"SAME")
+    drive.put("둘다다름.txt", "root", b"REMOTE")
+    _write(root, "둘다같음.txt", b"SAME")
+    _write(root, "둘다다름.txt", b"LOCAL")
+    _write(root, "로컬만.txt", b"ONLY-LOCAL")
+
+    @contextlib.contextmanager
+    def fake_api(p, log):
+        yield drive
+
+    real_api = cli._drive_api
+    cli._drive_api = fake_api
+    try:
+        cfg.save_config(cfg.Profile(name="rec", drive_id="d", local_root=str(root)))
+        try:
+            cli.reconcile(profile="rec", dry_run=False, trust_size=False, verbose=False)
+        except (SystemExit, typer.Exit) as exc:
+            code = getattr(exc, "code", 0) or getattr(exc, "exit_code", 0)
+            assert code in (0, None), f"reconcile 실패(exit={code})"
+        with Store(cli.db_path("rec")) as store:
+            base = store.all_by_key("d")
+    finally:
+        cli._drive_api = real_api
+        for k in (cfg.ENV_CONFIG_DIR, cfg.ENV_STATE_DIR, "DOORAY_API_TOKEN"):
+            os.environ.pop(k, None)
+
+    # 내용이 같은 쌍: 전송 없이 기준선이 기록됐다
+    rec_same = base.get(path_key("둘다같음.txt"))
+    assert rec_same is not None and rec_same.local_md5, "원격 상대를 찾아 기준선을 기록해야 한다"
+    assert rec_same.file_id == same_id
+    # 내용이 다른 쌍: 기준선을 기록하지 않는다(사용자 판단)
+    rec_diff = base.get(path_key("둘다다름.txt"))
+    assert rec_diff is None or not rec_diff.local_md5, "내용이 다른데 기준선을 기록했다"
+    # 원격에 상대가 없는 로컬 신규는 reconcile 대상이 아니다(push 몫)
+    assert base.get(path_key("로컬만.txt")) is None
+
+
 # =========================================================== 적대 검증에서 나온 결함 회귀
 def test_diff_writes_computed_md5_back_into_entry():
     """fill_md5는 **새 객체**를 돌려준다. 반환값만 쓰고 원본에 되쓰지 않으면
@@ -1207,6 +1308,46 @@ def test_local_move_does_not_commit_unreceived_remote_version(tmp_path: Path):
                     remote=RemoteView(is_complete=False, entries={new: r}))
     assert KIND_DOWNLOAD_UPDATE in [d.kind for d in again], (
         f"재시도가 나오지 않는다: {[(d.case, d.kind) for d in again]}")
+    store.close()
+
+
+def test_local_move_of_edited_file_keeps_old_baseline(tmp_path: Path):
+    """UT-12(2026-08-04): 편집된 파일을 이동시킨 뒤 base에 '이동 후 실측 stat + 옛 해시'를
+    섞어 기록하면 meta 게이트가 '변경 없음'으로 오판해 편집이 영원히 올라가지 않는다.
+    기준선 세 값(mtime/size/md5)은 옛 값 그대로 옮겨야 다음 패스 결정표 4가 잡는다."""
+    root, store, p = _setup(tmp_path)
+    drive = _FakeDrive()
+    fid = drive.put("sub/a.txt", "root", b"OLD")       # 원격: 자리만 옮김(내용 불변)
+    entry = _write(root, "a.txt", b"LOCAL-EDIT")       # 로컬: 편집된 상태
+
+    old, new = path_key("a.txt"), path_key("sub/a.txt")
+    rec = B("a.txt", md5=_md5(b"OLD"), ver=1, size=3, mtime=111, fid=fid)
+    store.upsert_file(rec)
+    base = {old: store.get_by_path("d", "a.txt")}
+
+    scanner = LocalScanner(root, [])
+    r = R("sub/a.txt", _md5(b"OLD"), ver=1, size=3, fid=fid)
+    decisions, _ = diff(base=base, local={old: entry},
+                        remote=RemoteView(is_complete=True, entries={new: r}),
+                        hash_local=scanner.fill_md5)
+    assert KIND_LOCAL_MOVE in [d.kind for d in decisions], kinds(decisions)
+
+    ex = SyncExecutor(drive, store, p, dict(base), SyncJournal(store), root_id="root")
+    ex.run(build_plan(decisions, p=p))
+
+    moved = store.get_by_path("d", "sub/a.txt")
+    assert moved is not None
+    assert moved.local_md5 == _md5(b"OLD")
+    assert moved.local_mtime_ns == 111 and moved.local_size == 3, (
+        "이동 후 실측 stat을 기준선에 기록했다 — 편집이 메타 게이트에 걸려 영원히 안 올라간다")
+
+    # 다음 패스: 편집이 결정표 4(UPLOAD_VERSION)로 잡혀야 한다
+    fresh = LocalScanner(root, [])
+    entries = fresh.scan()
+    again, _ = diff(base={new: moved}, local={new: entries[new]},
+                    remote=RemoteView(is_complete=True, entries={new: r}),
+                    hash_local=fresh.fill_md5)
+    assert KIND_UPLOAD_VERSION in [d.kind for d in again], kinds(again)
     store.close()
 
 
