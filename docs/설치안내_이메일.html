@@ -25,7 +25,22 @@
           <td style="padding:24px 28px 8px 28px; font-size:15px;">
             안녕하세요,<br><br>
             Dooray Drive의 업무 폴더를 이 PC와 자동으로 맞춰 주는 동기화 도구(<strong>dsync</strong>)의 설치 안내입니다.
-            <strong>설치 프로그램을 더블클릭하면 나머지는 자동</strong>으로 진행되고, 중간에 두 가지만 물어봅니다.
+            <strong>첨부파일을 더블클릭하면 나머지는 전부 자동</strong>으로 진행되고, 중간에 두 가지만 물어봅니다.
+          </td>
+        </tr>
+
+        <!-- 첨부파일 -->
+        <tr>
+          <td style="padding:20px 28px 0 28px;">
+            <h2 style="margin:0 0 12px 0; font-size:16px; color:#1e40af; border-left:4px solid #2563eb; padding-left:10px;">첨부파일 (1개)</h2>
+            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background:#f8fafc; border:1px solid #e5e7eb; border-radius:6px;">
+              <tr>
+                <td style="padding:14px 16px; font-size:14px;">
+                  <div style="font-family:Consolas,'Courier New',monospace; font-size:14px; font-weight:700; color:#0f172a;">설치.zip</div>
+                  <div style="font-size:13px; color:#4b5563; margin-top:4px;">안에 <code style="background:#fff; padding:1px 5px; border-radius:3px; font-family:Consolas,monospace;">설치.bat</code> 파일 하나만 들어 있습니다 (약 4KB).</div>
+                </td>
+              </tr>
+            </table>
           </td>
         </tr>
 
@@ -44,50 +59,30 @@
         <!-- 설치 절차 -->
         <tr>
           <td style="padding:24px 28px 0 28px;">
-            <h2 style="margin:0 0 16px 0; font-size:16px; color:#1e40af; border-left:4px solid #2563eb; padding-left:10px;">설치 절차 — 3단계</h2>
+            <h2 style="margin:0 0 16px 0; font-size:16px; color:#1e40af; border-left:4px solid #2563eb; padding-left:10px;">설치 절차 — 2단계</h2>
 
             <!-- Step 1 -->
             <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin-bottom:16px;">
               <tr>
                 <td width="36" valign="top" style="font-size:18px; font-weight:700; color:#2563eb;">1</td>
                 <td style="font-size:14px;">
-                  <div style="font-weight:600; margin-bottom:4px;">Python 설치 <span style="font-weight:400; color:#6b7280;">(이미 있으면 건너뛰기)</span></div>
+                  <div style="font-weight:600; margin-bottom:4px;">첨부된 <code style="background:#f3f4f6; padding:1px 6px; border-radius:3px; font-family:Consolas,monospace;">설치.zip</code> 압축 풀기</div>
                   <div style="color:#4b5563;">
-                    <a href="https://www.python.org/downloads/" style="color:#2563eb;">python.org</a> 에서 내려받아 설치하시면 됩니다.
-                    <div style="background:#fef3c7; border-left:4px solid #f59e0b; border-radius:4px; padding:10px 14px; margin:8px 0;">
-                      설치 프로그램 <strong>첫 화면의 "Add python.exe to PATH" 를 반드시 체크</strong>하세요.
-                      이것만 놓치지 않으시면 됩니다.
-                    </div>
-                    <span style="color:#9ca3af; font-size:13px;">이 단계만 사람이 하고, 나머지는 설치 프로그램이 알아서 합니다.</span>
+                    바탕화면 등 편한 곳에 저장한 뒤 <strong>우클릭 → 압축 풀기</strong>.
+                    안에 <code style="background:#f3f4f6; padding:1px 6px; border-radius:3px; font-family:Consolas,monospace;">설치.bat</code> 파일 하나만 들어 있습니다.
+                    <br><span style="color:#9ca3af; font-size:13px;">Python도, 프로그램 본체도 미리 받으실 필요 없습니다 — 설치 프로그램이 알아서 받아옵니다.</span>
                   </div>
                 </td>
               </tr>
             </table>
 
             <!-- Step 2 -->
-            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin-bottom:16px;">
-              <tr>
-                <td width="36" valign="top" style="font-size:18px; font-weight:700; color:#2563eb;">2</td>
-                <td style="font-size:14px;">
-                  <div style="font-weight:600; margin-bottom:4px;">프로그램 내려받기</div>
-                  <div style="color:#4b5563;">
-                    <a href="https://github.com/martinyoo/dooraydrive" style="color:#2563eb;">github.com/martinyoo/dooraydrive</a> 접속 →
-                    초록색 <strong>Code</strong> 버튼 → <strong>Download ZIP</strong> →
-                    압축을 풀어 <code style="background:#f3f4f6; padding:1px 6px; border-radius:3px; font-family:Consolas,monospace;">C:\dooraydrive</code> 로 옮깁니다.
-                    <br><span style="color:#9ca3af; font-size:13px;">GitHub 가입은 필요 없습니다(공개 저장소). 폴더 경로에 한글이 없는 편이 안전합니다.</span>
-                  </div>
-                </td>
-              </tr>
-            </table>
-
-            <!-- Step 3 -->
             <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin-bottom:8px;">
               <tr>
-                <td width="36" valign="top" style="font-size:18px; font-weight:700; color:#10b981;">3</td>
+                <td width="36" valign="top" style="font-size:18px; font-weight:700; color:#10b981;">2</td>
                 <td style="font-size:14px;">
                   <div style="font-weight:600; margin-bottom:4px;">설치.bat 더블클릭</div>
                   <div style="color:#4b5563;">
-                    <code style="background:#f3f4f6; padding:1px 6px; border-radius:3px; font-family:Consolas,monospace;">C:\dooraydrive\설치.bat</code> 을 더블클릭하면
                     검은 창이 열리고 자동으로 진행됩니다. <strong>중간에 두 번만 물어봅니다.</strong>
 
                     <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background:#eff6ff; border-left:4px solid #2563eb; border-radius:4px; margin:10px 0;">
@@ -110,9 +105,6 @@
                       </tr>
                     </table>
 
-                    이후 구성요소 설치 → 동기화 폴더 설정 → 파일 내려받기가 차례로 진행됩니다.
-                    작은 폴더(13개 파일)를 먼저 받아 정상인지 확인한 뒤 나머지를 받을지 물어봅니다.
-                    <br><br>
                     <strong style="color:#059669;">"설치 완료"</strong> 가 뜨면 끝입니다.
                     <br><span style="color:#9ca3af; font-size:13px;">중간에 끊겨도 안전합니다 — 다시 더블클릭하면 이미 끝난 단계는 건너뛰고 이어서 진행합니다.</span>
                   </div>
@@ -120,10 +112,19 @@
               </tr>
             </table>
 
-            <div style="font-size:13px; color:#6b7280; background:#f8fafc; border:1px solid #e5e7eb; border-radius:6px; padding:12px 14px; margin-top:12px;">
-              <strong>설치 전에 미리 확인만 해보고 싶다면</strong> — PowerShell에서
-              <code style="background:#fff; padding:1px 5px; border-radius:3px; font-family:Consolas,monospace;">.\INSTALL.ps1 -Check</code> 를 실행하면
-              이 PC가 준비됐는지 점검만 하고 <strong>아무것도 바꾸지 않습니다.</strong>
+            <div style="background:#f8fafc; border:1px solid #e5e7eb; border-radius:6px; padding:14px 16px; margin-top:14px;">
+              <div style="font-size:14px; font-weight:600; color:#1f2937; margin-bottom:8px;">설치 프로그램이 알아서 하는 일</div>
+              <ol style="margin:0; padding-left:20px; font-size:13px; color:#4b5563;">
+                <li style="margin-bottom:4px;">Python 확인 — 없으면 python.org에서 내려받아 자동 설치</li>
+                <li style="margin-bottom:4px;">프로그램 본체를 <code style="background:#fff; padding:1px 5px; border-radius:3px; font-family:Consolas,monospace;">C:\dooraydrive</code> 에 내려받기</li>
+                <li style="margin-bottom:4px;">필요한 구성요소 설치 · 토큰 등록 · 동기화 폴더 4개 설정</li>
+                <li>파일 내려받기 — <strong>작은 폴더(13개 파일)를 먼저</strong> 받아 정상인지 확인한 뒤 나머지를 받을지 물어봅니다</li>
+              </ol>
+              <div style="font-size:13px; color:#6b7280; margin-top:10px; padding-top:10px; border-top:1px solid #e5e7eb;">
+                <strong>설치 전에 확인만 해보고 싶다면</strong> — 설치가 끝난 폴더에서
+                <code style="background:#fff; padding:1px 5px; border-radius:3px; font-family:Consolas,monospace;">.\INSTALL.ps1 -Check</code> 를 실행하면
+                점검만 하고 <strong>아무것도 바꾸지 않습니다.</strong>
+              </div>
             </div>
           </td>
         </tr>
@@ -186,10 +187,10 @@
           <td style="padding:20px 28px 0 28px;">
             <h2 style="margin:0 0 12px 0; font-size:16px; color:#1e40af; border-left:4px solid #2563eb; padding-left:10px;">프로그램 업데이트</h2>
             <div style="font-size:14px; color:#374151;">
-              새 버전 알림을 받으면 새 ZIP을 받아 같은 폴더에 덮어쓰고
-              <code style="background:#f3f4f6; padding:1px 6px; border-radius:3px; font-family:Consolas,monospace;">설치.bat</code> 을 다시 더블클릭하시면 됩니다.
-              이미 끝난 단계(토큰·폴더 설정)는 건너뛰고 바뀐 부분만 반영합니다.
-              <br><span style="color:#9ca3af; font-size:13px;">설정과 동기화 기록은 프로그램 폴더 밖에 있어 덮어써도 그대로 유지됩니다.</span>
+              새 버전 알림을 받으시면 <code style="background:#f3f4f6; padding:1px 6px; border-radius:3px; font-family:Consolas,monospace;">C:\dooraydrive</code> 폴더를 통째로 지우고
+              <code style="background:#f3f4f6; padding:1px 6px; border-radius:3px; font-family:Consolas,monospace;">설치.bat</code> 을 다시 더블클릭하시면 됩니다. 최신본을 새로 받아옵니다.
+              <br><span style="color:#9ca3af; font-size:13px;"><strong>동기화한 파일과 설정·기록은 그 폴더 밖에 있어 그대로 유지됩니다.</strong>
+              토큰도 다시 입력하실 필요 없습니다(Windows 자격 증명 관리자에 남아 있습니다).</span>
             </div>
           </td>
         </tr>
