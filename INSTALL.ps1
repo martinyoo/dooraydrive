@@ -43,26 +43,73 @@ Write-Host "  설치 폴더: $PSScriptRoot" -ForegroundColor DarkGray
 
 # --------------------------------------------------------------------- 1) Python
 Head "1/6  Python 확인"
-$pyCmd = Get-Command python -ErrorAction SilentlyContinue
-if (-not $pyCmd) {
-  Die "Python이 설치되어 있지 않습니다 (또는 PATH에 없습니다)." @"
-1) https://www.python.org/downloads/ 에서 Python을 내려받으세요.
-2) 설치 프로그램 첫 화면의 'Add python.exe to PATH'를 반드시 체크하세요.
-3) 설치가 끝나면 이 창을 닫고 '설치.bat'을 다시 더블클릭하세요.
+
+function Get-WorkingPython {
+  <# 쓸 수 있는 python이면 {Version, Path}, 아니면 $null.
+     Microsoft Store의 'python' 껍데기는 실행하면 실패하므로 --version까지 확인한다. #>
+  $c = Get-Command python -ErrorAction SilentlyContinue
+  if (-not $c) { return $null }
+  $raw = (python --version) 2>$null
+  if ($LASTEXITCODE -ne 0 -or $raw -notmatch 'Python\s+(\d+\.\d+)') { return $null }
+  return [pscustomobject]@{ Version = [version]$Matches[1]; Path = $c.Source }
+}
+
+function Update-SessionPath {
+  # 방금 설치한 Python을 이 창에서 바로 쓰려면 PATH를 다시 읽어야 한다.
+  $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+  if ($userPath) { $env:PATH = "$userPath;$env:PATH" }
+  $h = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python311'
+  if (Test-Path (Join-Path $h 'python.exe')) { $env:PATH = "$h;$h\Scripts;$env:PATH" }
+}
+
+$py = Get-WorkingPython
+if (-not $py) {
+  if ($Check) {
+    Warn "Python이 없습니다 — 설치 시 python.org에서 자동으로 받아 설치합니다"
+  } else {
+    $pyVer = '3.11.9'
+    $url = "https://www.python.org/ftp/python/$pyVer/python-$pyVer-amd64.exe"
+    $exe = Join-Path $env:TEMP "python-$pyVer-amd64.exe"
+    Info "Python이 없습니다. python.org에서 $pyVer 을 자동으로 설치합니다 (약 25MB)."
+    try {
+      [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+      $ProgressPreference = 'SilentlyContinue'
+      Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
+    } catch {
+      Die "Python 내려받기에 실패했습니다: $($_.Exception.Message)" @"
+인터넷 연결(사내 프록시 포함)을 확인하세요. 직접 설치하셔도 됩니다:
+  https://www.python.org/downloads/  ('Add python.exe to PATH' 체크)
 "@
-}
-$verRaw = (python --version) 2>$null
-if ($LASTEXITCODE -ne 0 -or $verRaw -notmatch 'Python\s+(\d+\.\d+)') {
-  Die "python 명령은 있지만 실행되지 않습니다: $verRaw" @"
-Microsoft Store의 'python' 껍데기가 잡혔을 수 있습니다.
-python.org에서 정식 Python을 설치하고 'Add python.exe to PATH'를 체크하세요.
+    }
+    # 프록시 로그인 페이지가 대신 내려오면 파일이 아주 작다
+    if ((Get-Item $exe).Length -lt 1MB) {
+      Remove-Item $exe -ErrorAction SilentlyContinue
+      Die "내려받은 설치 파일이 너무 작습니다." "프록시 로그인 페이지일 수 있습니다. 브라우저로 사내망에 먼저 로그인한 뒤 다시 실행하세요."
+    }
+    Info "설치하는 중입니다. 1~2분 걸립니다..."
+    $proc = Start-Process $exe -Wait -PassThru -ArgumentList @(
+      '/quiet', 'InstallAllUsers=0', 'PrependPath=1', 'Include_launcher=1', 'Include_pip=1')
+    Remove-Item $exe -ErrorAction SilentlyContinue
+    if ($proc.ExitCode -ne 0) {
+      Die "Python 설치에 실패했습니다 (종료 코드 $($proc.ExitCode))." @"
+python.org에서 직접 설치한 뒤 '설치.bat'을 다시 더블클릭해 주세요.
+설치 첫 화면의 'Add python.exe to PATH'를 반드시 체크하세요.
 "@
+    }
+    Update-SessionPath
+    $py = Get-WorkingPython
+    if (-not $py) {
+      Die "Python은 설치됐지만 이 창에서 찾지 못합니다." "이 창을 닫고 '설치.bat'을 다시 더블클릭하면 됩니다."
+    }
+    Ok "Python $($py.Version) 설치 완료"
+  }
 }
-$ver = [version]$Matches[1]
-if ($ver -lt $MIN_PY) {
-  Die "Python $ver — 이 도구는 $MIN_PY 이상이 필요합니다." "python.org에서 최신 버전을 설치하세요."
+if ($py) {
+  if ($py.Version -lt $MIN_PY) {
+    Die "Python $($py.Version) — 이 도구는 $MIN_PY 이상이 필요합니다." "python.org에서 최신 버전을 설치한 뒤 다시 실행하세요."
+  }
+  Ok "Python $($py.Version) — $($py.Path)"
 }
-Ok "Python $ver — $($pyCmd.Source)"
 
 # --------------------------------------------------------------------- 2) 차단 해제
 # zip으로 받아 탐색기로 풀면 파일에 '인터넷에서 받음' 표시(MOTW)가 붙고, 기본
@@ -84,8 +131,11 @@ if ($Check) {
 
 # --------------------------------------------------------------------- 3) 의존성
 Head "3/6  필요한 구성요소 설치"
-python -c "import httpx, keyring, typer, send2trash" 2>$null
-if ($LASTEXITCODE -eq 0) {
+# Python이 없는 채로 여기 오는 것은 점검 모드뿐이다. 그대로 `python`을 부르면
+# 명령을 찾지 못해 ErrorActionPreference='Stop'에 걸려 스크립트가 죽는다.
+if (-not $py) {
+  Warn "Python이 없어 확인을 건너뜁니다 — 설치할 때 함께 처리됩니다"
+} elseif ($(python -c "import httpx, keyring, typer, send2trash" 2>$null; $LASTEXITCODE) -eq 0) {
   Ok "이미 설치되어 있습니다"
 } elseif ($Check) {
   Warn "구성요소가 없습니다 — 설치 시 자동으로 받습니다 (인터넷 필요)"
@@ -106,11 +156,12 @@ if ($LASTEXITCODE -eq 0) {
 # --------------------------------------------------------------------- 4) 토큰
 Head "4/6  Dooray API 토큰"
 $tokenState = 'N'
-python -c "import keyring" 2>$null
-if ($LASTEXITCODE -eq 0) {
+if ($py -and $(python -c "import keyring" 2>$null; $LASTEXITCODE) -eq 0) {
   $tokenState = (python -c "import keyring;t=keyring.get_password('dooray-sync','api-token');print('Y' if t else 'N')") 2>$null
 }
-if ($tokenState -eq 'Y') {
+if (-not $py) {
+  Warn "Python이 없어 확인을 건너뜁니다 — 설치할 때 입력받습니다"
+} elseif ($tokenState -eq 'Y') {
   Ok "이미 등록되어 있습니다 (다시 입력하지 않아도 됩니다)"
 } elseif ($Check) {
   Warn "토큰이 등록되지 않았습니다 — 설치 중에 입력받습니다"
