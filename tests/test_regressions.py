@@ -89,8 +89,22 @@ def test_cursor_uses_latest_revision_param():
     """실측: 실제 필터 파라미터는 latestRevision (revision= 은 무시됨)."""
     params = Cursor(revision=17514, file_id="abc").as_params()
     assert params.get("latestRevision") == 17514
-    assert params.get("fileId") == "abc"
     assert "revision" not in params
+
+
+def test_cursor_never_sends_file_id():
+    """**2026-08-03 정정.** 초판 규약은 (revision, fileId) 복합 커서가 필수라고 했으나,
+    실계정 대조 실험에서 fileId를 실으면 넣지 않았을 때 반환되는 항목이 누락됐다:
+
+        latestRevision=23776 + fileId=<a.txt>   → 0건
+        latestRevision=23776                    → 1건 (rev=23778 원격.txt)
+
+    커서에 fileId가 박히는 순간 이후 원격 변경을 영구히 놓친다. M1은 changes를
+    소비하지 않아 드러나지 않았고 M2 델타 모드에서 처음 터졌다.
+    """
+    params = Cursor(revision=23776, file_id="4390769620640107440").as_params()
+    assert "fileId" not in params, "fileId를 실으면 원격 변경을 영구 누락한다"
+    assert params == {"latestRevision": 23776}
 
 
 def test_remote_file_ignores_unknown_fields():
@@ -130,6 +144,80 @@ def test_iter_changes_terminates_only_on_empty_page():
     drive = DriveAPI(_FakeChangesClient(total=250, chunk=40))   # size=200 요청, 40건씩 반환
     got = [ci for ci, _ in drive.iter_changes("d1", Cursor(), size=200)]
     assert len(got) == 250, f"부분 페이지에서 조기 종료됨: {len(got)}건만 수집"
+
+
+# ------------------------------------------------- 이름 대소문자 (2026-08-02 실측 결함)
+class _FakeDriveClient:
+    """목록·폴더생성만 흉내 내는 최소 클라이언트.
+
+    서버 실측 특성 재현: 이름 중복 검사는 **대소문자를 무시**한다 →
+    'Writing'을 만들려 해도 'WRITING'이 있으면 409 Duplicate request.
+    """
+
+    def __init__(self, children):
+        import logging
+        self.children = list(children)
+        self.logger = logging.getLogger("fake")
+        self.created = []
+
+    def api(self, method, path, **kw):
+        if path.endswith("/create-folder"):
+            name = (kw.get("json") or {}).get("name", "")
+            from dooray_sync.api.client import DoorayApiError
+            if any(c["name"].casefold() == name.casefold() for c in self.children):
+                raise DoorayApiError("Duplicate request", status=409, path=path)
+            self.created.append(name)
+            item = {"id": f"new-{name}", "name": name, "type": "folder"}
+            self.children.append(item)
+            return {"header": {"isSuccessful": True, "resultCode": 0}, "result": item}
+        page = int((kw.get("params") or {}).get("page") or 0)
+        size = int((kw.get("params") or {}).get("size") or 100)
+        chunk = self.children[page * size:(page + 1) * size]
+        return {"header": {"isSuccessful": True, "resultCode": 0},
+                "result": chunk, "totalCount": len(self.children)}
+
+
+def test_find_child_by_name_falls_back_to_case_insensitive():
+    """서버의 중복 검사는 대소문자를 무시한다 — 정확 일치만 보면 원격 폴더를 못 찾고
+    새로 만들려다 409 Duplicate request로 영원히 막힌다(2026-08-02 실측)."""
+    from dooray_sync.api.drive import DriveAPI
+
+    drive = DriveAPI(_FakeDriveClient([
+        {"id": "1", "name": "WRITING", "type": "folder"},
+        {"id": "2", "name": "Report.txt", "type": "file"},
+    ]))
+    assert drive.find_child_by_name("d", "p", "Writing").id == "1"
+    assert drive.find_child_by_name("d", "p", "report.TXT").id == "2"
+    assert drive.find_child_by_name("d", "p", "없는이름") is None
+
+
+def test_find_child_by_name_prefers_exact_match():
+    """대소문자만 다른 항목이 공존해도 정확 일치가 우선이어야 판정이 흔들리지 않는다."""
+    from dooray_sync.api.drive import DriveAPI
+
+    drive = DriveAPI(_FakeDriveClient([
+        {"id": "lower", "name": "data.txt", "type": "file"},
+        {"id": "upper", "name": "DATA.TXT", "type": "file"},
+    ]))
+    assert drive.find_child_by_name("d", "p", "DATA.TXT").id == "upper"
+    assert drive.find_child_by_name("d", "p", "data.txt").id == "lower"
+
+
+def test_create_folder_absorbs_409_as_existing_folder():
+    """폴더 생성은 멱등해야 한다. 409를 그대로 올리면 init --create-remote가
+    원인 없는 오류로 계속 실패한다. 새로 만든 것인지 여부도 알려 줘야 한다 —
+    기존 폴더를 '방금 만들어 비어 있다'고 오인하면 하위를 통째로 놓친다."""
+    from dooray_sync.api.drive import DriveAPI
+
+    client = _FakeDriveClient([{"id": "1", "name": "WRITING", "type": "folder"}])
+    drive = DriveAPI(client)
+
+    found, is_new = drive.create_folder_ex("d", "p", "Writing")
+    assert found.id == "1" and is_new is False
+    assert client.created == [], "이미 있는 폴더를 다시 만들면 안 된다"
+
+    made, is_new = drive.create_folder_ex("d", "p", "새폴더")
+    assert is_new is True and made.name == "새폴더"
 
 
 # ---------------------------------------------------------------- 스캐너

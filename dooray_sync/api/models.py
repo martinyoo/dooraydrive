@@ -230,8 +230,10 @@ class ChangeItem:
 
 @dataclass(frozen=True)
 class Cursor:
-    """changes 페이징 커서. 실측: 동일 revision에 복수 항목이 공존하므로
-    (revision, file_id) 복합 커서가 필수."""
+    """changes 페이징 커서.
+
+    `file_id`는 **진단·기록용으로만** 보관한다. 질의에는 넣지 않는다 — 아래 참조.
+    """
 
     revision: int = 0
     file_id: str | None = None
@@ -239,8 +241,24 @@ class Cursor:
     def as_params(self) -> dict:
         """실측: 필터가 실제로 먹는 파라미터명은 latestRevision이다
         (05_changes.working_param — revision=은 무시되고 전체가 돌아온다).
-        커서는 배타적(cursor_inclusive=false)이라 이 revision '다음'부터 받는다."""
-        params: dict = {"latestRevision": self.revision}
-        if self.file_id:
-            params["fileId"] = self.file_id
-        return params
+        커서는 배타적(cursor_inclusive=false)이라 이 revision '다음'부터 받는다.
+
+        **fileId를 함께 보내지 않는다 (2026-08-03 실계정 대조 실험으로 정정).**
+        초판 규약은 "동일 revision에 복수 항목이 공존하므로 (revision, fileId) 복합
+        커서가 필수"라고 적었으나, 실제로 fileId를 실어 보내면 **넣지 않았을 때 반환되는
+        항목이 누락된다**:
+
+            latestRevision=23776 + fileId=<a.txt>  → 0건
+            latestRevision=23776                   → 1건 (rev=23778 원격.txt)
+            latestRevision=23771 + fileId=<원격.txt> → 3건
+            latestRevision=23771                   → 5건
+
+        누락되는 항목이 그 fileId의 것만도 아니어서 서버 의미론은 규명되지 않았다.
+        확실한 것은 하나뿐이다 — **fileId를 커서에 실으면 원격 변경을 영구히 놓친다.**
+        M1은 changes를 소비하지 않아(push/pull은 목록 API 사용) 이 전제가 한 번도
+        실행되지 않았고, M2 델타 모드에서 처음 드러났다.
+
+        같은 revision에 항목이 여럿인 경우의 누락은 커서를 '완전히 소비한 마지막
+        revision'까지만 물리는 방식으로 막는다(core/remote.py delta의 절단 처리).
+        """
+        return {"latestRevision": self.revision}

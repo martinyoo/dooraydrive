@@ -14,7 +14,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 from ..api.models import Cursor
 from ..util.paths import ext_path, path_key, to_nfc
@@ -67,6 +67,12 @@ def _loads(raw: Any) -> dict:
     except (ValueError, TypeError):
         return {"raw": raw}
     return parsed if isinstance(parsed, dict) else {"value": parsed}
+
+
+def _like_prefix(key: str) -> str:
+    r"""LIKE 접두 패턴용 이스케이프. 경로에 '%'나 '_'가 들어가면 와일드카드로 해석돼
+    엉뚱한 서브트리를 함께 옮기게 된다(쿼리에 ESCAPE '\' 를 함께 지정할 것)."""
+    return key.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _read_schema() -> str:
@@ -313,6 +319,156 @@ class Store:
                 (drive_id, rel_path_key),
             )
 
+    def iter_by_status(self, drive_id: str, statuses: Sequence[str]) -> Iterator[FileRecord]:
+        """지정한 sync_status의 레코드만 순회(규약_M2 §7)."""
+        wanted = tuple(statuses or ())
+        if not wanted:
+            return
+        placeholders = ", ".join("?" * len(wanted))
+        with self._lock:
+            rows = self._conn.execute(
+                _SELECT_FILE + f" WHERE drive_id = ? AND sync_status IN ({placeholders}) ORDER BY id",
+                (drive_id, *wanted),
+            ).fetchall()
+        for row in rows:
+            yield _row_to_record(row)
+
+    def dirty_file_ids(self, drive_id: str) -> list[str]:
+        """'확실히 동기화된 상태'가 아닌 레코드의 file_id (규약_M2 I6).
+
+        델타 모드는 changes에 안 나온 항목을 '변경 없음'으로 취급하는데, 지난 실행에서
+        전송이 실패했거나 크래시로 중단된 항목은 그렇게 두면 영원히 뒤처진다.
+        이 목록만 원격 메타를 직접 확인해 그 구멍을 막는다.
+        'unsyncable'/'ignored'는 매 실행 재조회해도 결론이 같으므로 제외한다.
+        """
+        skip = ("synced", "unsyncable", "ignored")
+        placeholders = ", ".join("?" * len(skip))
+        with self._lock:
+            # **가장 오래 확인 안 된 것부터** 돌린다. 고정 순서로 뽑으면 호출측 예산이
+            # 매 실행 앞부분만 다시 확인하고 뒤쪽은 영원히 차례가 오지 않는다(기아).
+            # init 직후에는 이 목록이 수천 건이라 그 차이가 그대로 미수렴으로 남는다.
+            rows = self._conn.execute(
+                "SELECT file_id, MIN(COALESCE(last_synced_at, '')) AS seen FROM files "
+                f"WHERE drive_id = ? AND file_id IS NOT NULL AND file_id != '' "
+                f"AND sync_status NOT IN ({placeholders}) "
+                "GROUP BY file_id ORDER BY seen ASC, file_id ASC",
+                (drive_id, *skip),
+            ).fetchall()
+        return [str(r["file_id"]) for r in rows]
+
+    def touch_seen(self, drive_id: str, file_ids: Sequence[str]) -> int:
+        """'이 시각에 원격 상태를 확인했다'만 기록한다(다른 컬럼은 건드리지 않는다).
+
+        dirty 목록을 '가장 오래 확인 안 된 것부터' 도는 회전이 실제로 돌게 하는 장치다.
+        이것이 없으면 확인해도 순서가 바뀌지 않아 예산 안쪽 앞부분만 매번 다시 확인하고
+        뒤쪽은 영원히 차례가 오지 않는다.
+        """
+        ids = [str(f) for f in file_ids if f]
+        if not ids:
+            return 0
+        stamp = now_iso()
+        total = 0
+        with self.transaction() as conn:
+            for i in range(0, len(ids), 500):     # SQLite 변수 상한 회피
+                chunk = ids[i:i + 500]
+                placeholders = ", ".join("?" * len(chunk))
+                cur = conn.execute(
+                    f"UPDATE files SET last_synced_at = ? WHERE drive_id = ? "
+                    f"AND file_id IN ({placeholders})",
+                    (stamp, drive_id, *chunk),
+                )
+                total += int(cur.rowcount or 0)
+        return total
+
+    def move_record(self, drive_id: str, old_key: str, new_rel_path: str) -> None:
+        """레코드 하나의 경로를 옮긴다(이동/개명 반영).
+
+        대상 키가 이미 다른 레코드에 잡혀 있으면 ValueError — UNIQUE 위반을 조용한
+        데이터 손실(덮어쓰기)로 바꾸지 않는다.
+        """
+        new_rel = to_nfc(new_rel_path)
+        new_key = path_key(new_rel)
+        with self.transaction() as conn:
+            if new_key != old_key:
+                clash = conn.execute(
+                    "SELECT id FROM files WHERE drive_id = ? AND rel_path_key = ?",
+                    (drive_id, new_key),
+                ).fetchone()
+                if clash is not None:
+                    raise ValueError(f"이동 대상 경로에 이미 레코드가 있습니다: {new_rel}")
+            cur = conn.execute(
+                "UPDATE files SET rel_path = ?, rel_path_key = ? "
+                "WHERE drive_id = ? AND rel_path_key = ?",
+                (new_rel, new_key, drive_id, old_key),
+            )
+            if cur.rowcount == 0:
+                raise KeyError(f"옮길 레코드가 없습니다: {old_key}")
+
+    def move_subtree(self, drive_id: str, old_rel_prefix: str, new_rel_prefix: str) -> int:
+        """폴더 이동/개명 시 **하위 전체**의 경로를 한 트랜잭션으로 옮긴다. 반환: 옮긴 건수.
+
+        폴더만 옮기고 자손 레코드를 옛 경로에 남겨 두면, 다음 스캔에서 자손이 통째로
+        '로컬 삭제 + 로컬 신규'로 보인다 — 삭제 전파가 켜져 있으면 그대로 대량 오삭제다.
+        그래서 이 갱신은 폴더 이동과 같은 트랜잭션 안에서 일어나야 한다.
+        """
+        old_prefix = to_nfc(old_rel_prefix).strip("/")
+        new_prefix = to_nfc(new_rel_prefix).strip("/")
+        if not old_prefix or not new_prefix or old_prefix == new_prefix:
+            return 0
+        old_key = path_key(old_prefix)
+        depth = len([c for c in old_prefix.split("/") if c])
+        new_parts = [c for c in new_prefix.split("/") if c]
+
+        moved = 0
+        with self.transaction() as conn:
+            rows = conn.execute(
+                "SELECT id, rel_path FROM files WHERE drive_id = ? "
+                "AND (rel_path_key = ? OR rel_path_key LIKE ? ESCAPE '\\') ORDER BY id",
+                (drive_id, old_key, _like_prefix(old_key) + "/%"),
+            ).fetchall()
+            if not rows:
+                return 0
+
+            # 옮길 대상 집합 밖에 목적지 키가 이미 있으면 중단한다(부분 이동 금지).
+            moving_ids = {int(r["id"]) for r in rows}
+            plan: list[tuple[int, str, str]] = []
+            for row in rows:
+                parts = [c for c in to_nfc(row["rel_path"]).split("/") if c]
+                target = "/".join(new_parts + parts[depth:])
+                plan.append((int(row["id"]), target, path_key(target)))
+            for _id, target, key in plan:
+                clash = conn.execute(
+                    "SELECT id FROM files WHERE drive_id = ? AND rel_path_key = ?",
+                    (drive_id, key),
+                ).fetchone()
+                if clash is not None and int(clash["id"]) not in moving_ids:
+                    raise ValueError(f"이동 대상 경로에 이미 레코드가 있습니다: {target}")
+
+            # 깊은 쪽부터 갱신해 이동 도중 자기 하위와 키가 겹치는 상황을 피한다.
+            for _id, target, key in sorted(plan, key=lambda t: -t[1].count("/")):
+                conn.execute(
+                    "UPDATE files SET rel_path = ?, rel_path_key = ? WHERE id = ?",
+                    (target, key, _id),
+                )
+                moved += 1
+        return moved
+
+    def delete_subtree(self, drive_id: str, rel_path_key: str) -> int:
+        """키 자신과 그 하위 레코드를 전부 지운다. 반환: 지운 건수.
+
+        폴더를 휴지통으로 보내면 하위에 재귀 적용되므로(C5) 기록도 함께 정리해야 한다.
+        남겨 두면 다음 패스에서 '원격에만 있던 것이 사라졌다'로 다시 판정된다.
+        """
+        if not rel_path_key:
+            return 0
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "DELETE FROM files WHERE drive_id = ? "
+                "AND (rel_path_key = ? OR rel_path_key LIKE ? ESCAPE '\\')",
+                (drive_id, rel_path_key, _like_prefix(rel_path_key) + "/%"),
+            )
+            return int(cur.rowcount or 0)
+
     def count_files(self, drive_id: str) -> int:
         with self._lock:
             row = self._conn.execute(
@@ -384,11 +540,31 @@ class Store:
         )
         with self._lock:
             rows = self._conn.execute(sql, TERMINAL_PHASES).fetchall()
+            if not rows:
+                return
+            # 항목의 detail은 **begin 행부터 병합**해야 한다. journal_phase는 이전 detail을
+            # 물려주지 않으므로, 마지막 phase 행만 보면 begin이 남긴 임시파일 경로·충돌
+            # 사본 경로가 통째로 사라진다 — 복구가 정리할 대상을 모르게 된다.
+            ids = [int(r["entry_id"]) for r in rows]
+            placeholders = ", ".join("?" * len(ids))
+            group = self._conn.execute(
+                "SELECT id, detail, "
+                f"COALESCE(json_extract(detail, '$.{_ENTRY_KEY}'), id) AS entry_id "
+                f"FROM journal WHERE COALESCE(json_extract(detail, '$.{_ENTRY_KEY}'), id) "
+                f"IN ({placeholders}) ORDER BY id",
+                ids,
+            ).fetchall()
+
+        merged: dict[int, dict] = {}
+        for g in group:
+            d = _loads(g["detail"])
+            d.pop(_ENTRY_KEY, None)
+            merged.setdefault(int(g["entry_id"]), {}).update(d)
+
         for row in rows:
-            detail = _loads(row["detail"])
-            detail.pop(_ENTRY_KEY, None)
+            entry_id = int(row["entry_id"])
             yield {
-                "entry_id": int(row["entry_id"]),
+                "entry_id": entry_id,
                 "id": row["id"],
                 "ts": row["ts"],
                 "session": row["session"],
@@ -396,18 +572,33 @@ class Store:
                 "phase": row["phase"],
                 "file_id": row["file_id"],
                 "rel_path": row["rel_path"],
-                "detail": detail,
+                "detail": merged.get(entry_id, {}),
             }
 
     # ---------- conflicts ----------
     def add_conflict(self, rel_path: str, kind: str,
-                     local_copy_path: str | None = None) -> None:
+                     local_copy_path: str | None = None) -> int:
+        """충돌 기록을 남기고 id를 반환한다(M1 호출측은 반환값을 무시해도 무방)."""
         with self.transaction() as conn:
-            conn.execute(
+            cur = conn.execute(
                 "INSERT INTO conflicts (ts, rel_path, kind, local_copy_path, resolved) "
                 "VALUES (?, ?, ?, ?, 0)",
                 (now_iso(), to_nfc(rel_path), kind, local_copy_path),
             )
+            return int(cur.lastrowid)
+
+    def get_conflict(self, conflict_id: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, ts, rel_path, kind, local_copy_path, resolved "
+                "FROM conflicts WHERE id = ?", (conflict_id,)
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    def resolve_conflict(self, conflict_id: int) -> None:
+        """해결 표시. 행을 지우지 않는다 — 무엇이 있었는지가 사후 검증의 근거다."""
+        with self.transaction() as conn:
+            conn.execute("UPDATE conflicts SET resolved = 1 WHERE id = ?", (conflict_id,))
 
     def iter_unresolved(self) -> Iterator[dict]:
         with self._lock:

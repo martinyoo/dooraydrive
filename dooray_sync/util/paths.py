@@ -111,6 +111,15 @@ def ext_path(p: Path | str) -> str:
     return _EXT_PREFIX + abs_s
 
 
+def plain_abs(p: Path | str) -> str:
+    r"""'\\?\' 접두가 **없는** 절대경로 문자열.
+
+    확장 접두를 인식하지 못하는 호출자 전용이다(셸 API 계열 — send2trash가 대표적).
+    로컬 파일 IO에는 쓰지 말 것. 그쪽은 ext_path가 정본이다(규약 §0-2, §12-4).
+    """
+    return _lexical_abs(p)
+
+
 def rel_posix(root: Path, target: Path) -> str:
     """root 기준 상대경로를 '/' 구분자 + NFC 문자열로. 루트 자신은 ''."""
     r = _lexical_abs(root).rstrip("\\")
