@@ -190,7 +190,10 @@ class RemoteCollector:
         self.drive_id = drive_id
         self.prefix = to_nfc(str(remote_prefix or "").replace("\\", "/").strip("/"))
         self.root_id = root_id
-        self.exclude = tuple(exclude or ())
+        # 스캐너의 상시 제외(도구 파일 포함)를 원격 축에도 동일하게 적용한다 —
+        # 로컬만 제외하면 원격 사본이 '원격 신규'로 보여 매번 되받으려 든다.
+        from .scanner import ALWAYS_EXCLUDE
+        self.exclude = ALWAYS_EXCLUDE + tuple(p for p in (exclude or ()) if p)
         self.log = logger or log
 
     # ------------------------------------------------------------------ 전체

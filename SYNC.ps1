@@ -5,16 +5,22 @@
 #
 # 기본 동작은 "계획을 먼저 보여주고 확인받은 뒤 실행"이다.
 # push는 원격을 삭제·이동하지 않고, pull은 수정된 로컬 파일을 덮어쓰지 않는다.
+# sync는 양방향이며 삭제는 전파하지 않고 보고만 한다(충돌은 양쪽 보존).
+#
+# ⚠ 이 스크립트는 어떤 경로로도 --propagate-deletes / --allow-bulk-delete 를
+#   CLI에 넘기지 않는다. 삭제를 정말 전파하려면 CLI를 직접 실행한다.
 #
 # 사용 예
 #   .\SYNC.ps1                    전체 push (계획 확인 후 실행)
 #   .\SYNC.ps1 -Pull              전체 pull
+#   .\SYNC.ps1 -Sync              전체 양방향 동기화 (제외 목록 적용)
 #   .\SYNC.ps1 -DryRun            계획만 보고 끝
 #   .\SYNC.ps1 -Yes               확인 없이 바로 실행
 #   .\SYNC.ps1 -Status            상태만 요약
 #   .\SYNC.ps1 -Only spri2026,swstat    일부 프로파일만
 param(
   [switch]$Pull,
+  [switch]$Sync,
   [switch]$DryRun,
   [switch]$Yes,
   [switch]$Status,
@@ -23,7 +29,13 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
-$verb = if ($Pull) { 'pull' } else { 'push' }
+if ($Pull -and $Sync) {
+  Write-Host "-Pull과 -Sync는 함께 쓸 수 없습니다." -ForegroundColor Red
+  exit 1
+}
+$verb = 'push'
+if ($Pull) { $verb = 'pull' }
+if ($Sync) { $verb = 'sync' }
 
 # ---------------------------------------------------------------------------
 # 프로파일 목록 (config.toml에서 읽음)
@@ -52,8 +64,47 @@ if ($Status) {
     Write-Host ("== {0}" -f $p) -ForegroundColor Cyan
     python -m dooray_sync.cli.main status -p $p |
       Select-String -Pattern '총 항목|sync_status|synced|error|pending|미해결 충돌|미완료 저널|마지막 push|마지막 pull'
+    # '마지막 sync'는 status CLI가 출력하지 않아 meta에서 직접 읽는다.
+    # mode=ro 필수 — 일반 connect는 DB 파일이 없으면 빈 파일을 만들어 버린다.
+    # 주의: 이 파이썬 코드에는 큰따옴표를 쓰면 안 된다 — PS 5.1이 네이티브 인자의
+    # 내장 큰따옴표를 이스케이프하지 않아 인자가 그 지점에서 쪼개진다(실측).
+    $lastSync = python -c @'
+import os, sqlite3, sys
+sys.path.insert(0, '.')
+from dooray_sync.config import db_path
+p = str(db_path(sys.argv[1]))
+v = '-'
+if os.path.exists(p):
+    try:
+        c = sqlite3.connect('file:' + p.replace(chr(92), '/') + '?mode=ro', uri=True)
+        r = c.execute('SELECT value FROM meta WHERE key=?', ('last_sync_at',)).fetchone()
+        if r:
+            v = r[0]
+    except sqlite3.Error:
+        pass
+print(v)
+'@ $p
+    Write-Host ("  마지막 sync      : {0}" -f $lastSync)
   }
   exit 0
+}
+
+# ---------------------------------------------------------------------------
+# sync 제외 프로파일 — tools/sync_here.py 의 표와 함께 관리한다.
+# -Only 로 명시 지정했을 때만 제외를 무시한다(사용자가 결정을 바꾸는 경로).
+# ---------------------------------------------------------------------------
+if ($verb -eq 'sync' -and -not $Only) {
+  $syncExcluded = [ordered]@{
+    workenv = '원격 전용 336건(약 1GB) 미수신 결정(2026-08-07) — push 전용 운용'
+    study   = 'sync 전환 미검토 — push/pull로만 운용'
+    writing = '보류 4건 정리 전 sync 금지(충돌보존으로 로컬 원본이 개명됨)'
+  }
+  foreach ($k in @($syncExcluded.Keys)) {
+    if ($k -in $profiles) {
+      Write-Host ("  [제외] {0} — {1}" -f $k, $syncExcluded[$k]) -ForegroundColor DarkGray
+    }
+  }
+  $profiles = @($profiles | Where-Object { $_ -notin @($syncExcluded.Keys) })
 }
 
 # ---------------------------------------------------------------------------
@@ -107,6 +158,77 @@ foreach ($p in $profiles) {
   $hold = if ($err -match '보류\s+(\d+)건')      { [int]$Matches[1] } else { 0 }
   $rerr = if ($err -match '읽기 실패\s+(\d+)건') { [int]$Matches[1] } else { 0 }
   $skip = if ($out -match '스캔 제외\s*:\s*(\d+)건') { [int]$Matches[1] } else { 0 }
+
+  # --- sync 전용 판정 -------------------------------------------------------
+  # 라벨 존재가 아니라 값을 본다(교훈 §5). sync 요약 kv에는 '변경 없음 : N건'이
+  # 항상 있으므로 비앵커 '변경 없음' 매칭은 금지다(앵커형만 사용).
+  if ($verb -eq 'sync') {
+    $del = -1
+    if ($out -match '실제로 사라질 항목\s*:\s*(\d+)건') { $del = [int]$Matches[1] }
+    if ($del -ne 0) {
+      # 이 스크립트는 삭제 전파를 절대 켜지 않으므로 항상 0이어야 한다.
+      # 0이 아니거나 값을 못 읽으면 실행하지 않는다(fail-closed).
+      $delTxt = "${del}건"
+      if ($del -lt 0) { $delTxt = '판독 불가' }
+      Write-Host ("  [중단] {0,-10} 실제로 사라질 항목 {1} — -Sync는 삭제를 실행하지 않습니다" -f $p, $delTxt) -ForegroundColor Red
+      Write-Host  "             원인 확인:  .\dsync sync -p $p --full --dry-run" -ForegroundColor Yellow
+      $blocked += "$p(사라질 $delTxt)"
+      continue
+    }
+
+    $labels = '원격폴더생성|로컬폴더생성|신규업로드|새버전업로드|신규받기|갱신받기|충돌보존|로컬이동|원격이동|로컬휴지통|원격휴지통|기록갱신|기록정리'
+    $n = 0; $conf = 0
+    foreach ($m in [regex]::Matches($out, "(?m)^\s*($labels)\s+(\d+)건")) {
+      $n += [int]$m.Groups[2].Value
+      if ($m.Groups[1].Value -eq '충돌보존') { $conf += [int]$m.Groups[2].Value }
+    }
+    $none = $out -match '(?m)^\s*변경 없음\s*$'
+    if ($none -ne ($n -eq 0)) {
+      Write-Host ("  [실패] {0,-10} 출력 형식이 예상과 다릅니다(판정 불일치) — 직접 확인:  .\dsync sync -p {0} --dry-run" -f $p) -ForegroundColor Red
+      continue
+    }
+
+    if ($n -gt 0) {
+      $up = ''; $down = ''
+      if ($out -match '올릴 용량\s*:\s*(\S+)') { $up = $Matches[1] }
+      if ($out -match '받을 용량\s*:\s*(\S+)') { $down = $Matches[1] }
+      Write-Host ("  [*] {0,-10} 계획 {1}건 (올릴 {2} / 받을 {3})" -f $p, $n, $up, $down) -ForegroundColor Yellow
+      if ($conf -gt 0) {
+        Write-Host ("      [충돌] {0}건 — 양쪽 내용을 모두 보존합니다. 실행 후 정리:  .\dsync resolve -p {1}" -f $conf, $p) -ForegroundColor Yellow
+      }
+      # 미리보기는 '동작별 건수' 표 이전 구간에서만 — 같은 라벨이 두 표에 나온다.
+      $head = ($out -split '(?m)^\s*동작별 건수\s*$')[0]
+      $rows = @([regex]::Matches($head, "(?m)^\s*($labels)\s+\S.*$") | ForEach-Object { $_.Value.Trim() })
+      ($rows | Select-Object -First 5) | ForEach-Object { Write-Host ("        {0}" -f $_) -ForegroundColor DarkGray }
+      if ($rows.Count -gt 5) { Write-Host ("        ... 외 {0}건" -f ($rows.Count - 5)) -ForegroundColor DarkGray }
+      $todo += $p
+    } else {
+      $chg = 0
+      if ($out -match 'changes 항목\s*:\s*(\d+)건') { $chg = [int]$Matches[1] }
+      if ($chg -ge 1000) {
+        Write-Host ("  [-] {0,-10} 변경 없음 (밀린 변경기록 {1}건 — '.\dsync sync -p {0}' 1회 실행으로 커서를 전진시키면 다음부터 빨라집니다)" -f $p, $chg) -ForegroundColor DarkGray
+      } else {
+        Write-Host ("  [-] {0,-10} 변경 없음" -f $p) -ForegroundColor DarkGray
+      }
+    }
+
+    # 막힌 것은 계획이 없어도 반드시 보고한다(push 경로와 같은 규칙).
+    $prot = 0
+    if ($out -match '(?m)^\s*보호\s*:\s*(\d+)건') { $prot = [int]$Matches[1] }
+    if ($prot -gt 0) {
+      Write-Host ("      [보호] {0}건 — 덮어쓰지 않고 남겨둔 파일입니다. 상세:  .\dsync sync -p {1} --dry-run" -f $prot, $p) -ForegroundColor Yellow
+      $blocked += "$p(보호 $prot)"
+    }
+    if ($rerr -gt 0) {
+      Write-Host ("      [읽기 실패] {0}건 — 파일이 잠겨 있습니다. 오피스·한글을 닫고 다시 확인하세요." -f $rerr) -ForegroundColor Red
+      $blocked += "$p(읽기실패 $rerr)"
+    }
+    if ($skip -gt 0) {
+      Write-Host ("      [스캔 제외] {0}건 — 이 파일들은 계획에 아예 없습니다. 사유를 확인하세요." -f $skip) -ForegroundColor Red
+      $blocked += "$p(스캔제외 $skip)"
+    }
+    continue
+  }
 
   $n = @([regex]::Matches($out, '(?m)^\s*(신규업로드|새버전|폴더생성|기록갱신|신규다운로드|덮어쓰기)\s')).Count
   $none = $out -match '(?m)^\s*변경 없음\s*$'
@@ -167,8 +289,10 @@ if (-not $Yes) {
   Write-Host ("실행 대상: {0}" -f ($todo -join ', ')) -ForegroundColor Yellow
   if ($verb -eq 'push') {
     Write-Host "push는 원격을 삭제·이동하지 않습니다(추가와 새 버전만)." -ForegroundColor DarkGray
-  } else {
+  } elseif ($verb -eq 'pull') {
     Write-Host "pull은 수정된 로컬 파일을 덮어쓰지 않습니다(보호로 건너뜁니다)." -ForegroundColor DarkGray
+  } else {
+    Write-Host "sync는 양방향입니다. 삭제는 전파하지 않고 보고만 하며, 충돌은 양쪽을 보존합니다." -ForegroundColor DarkGray
   }
   $ans = Read-Host "진행할까요? (y/N)"
   if ($ans -notmatch '^[Yy]') {
@@ -199,6 +323,13 @@ foreach ($p in $todo) {
     Write-Host ("   [주의] {0} — 보류 {1}건은 올라가지 않았습니다(종료코드는 0입니다)." -f $p, $left) -ForegroundColor Yellow
     $failed += "$p(보류 $left)"
   }
+  # sync에서 충돌 사본이 생겼으면 실패는 아니지만 정리를 안내한다.
+  if ($verb -eq 'sync' -and "$($r.Out)" -match '충돌 사본\s*:\s*(\d+)건') {
+    $confDone = [int]$Matches[1]
+    if ($confDone -gt 0) {
+      Write-Host ("   [충돌] {0} — 충돌 사본 {1}건 생성(양쪽 보존됨). 정리:  .\dsync resolve -p {0}" -f $p, $confDone) -ForegroundColor Yellow
+    }
+  }
 }
 
 # ---------------------------------------------------------------------------
@@ -210,4 +341,7 @@ if ($failed.Count -gt 0) {
   exit 1
 }
 Write-Host "전부 완료했습니다." -ForegroundColor Green
-Write-Host "확인:  .\SYNC.ps1 -DryRun   (남은 게 없으면 '변경 없음')" -ForegroundColor DarkGray
+$hint = '.\SYNC.ps1 -DryRun'
+if ($verb -eq 'pull') { $hint = '.\SYNC.ps1 -Pull -DryRun' }
+if ($verb -eq 'sync') { $hint = '.\SYNC.ps1 -Sync -DryRun' }
+Write-Host "확인:  $hint   (남은 게 없으면 '변경 없음')" -ForegroundColor DarkGray

@@ -36,9 +36,12 @@ _TAG_MOUNT_POINT = 0xA0000003
 _TAG_SYMLINK = 0xA000000C
 
 # 사용자 exclude와 무관하게 항상 제외.
+# 'synchere.bat'은 각 동기화 폴더에 놓아 쓰는 실행 도구다(더블클릭 = 그 폴더 동기화).
+# 도구 자신이 전송 대상이 되면 안 되므로 양축(스캐너·RemoteCollector) 모두에서 제외한다
+# — 2026-08-07 사용자 요구. 원격 축은 RemoteCollector가 이 튜플을 가져다 쓴다.
 # '.dooraysync_tmp'는 원자적 다운로드(C1)가 대상 폴더마다 만드는 임시 디렉터리다 —
 # 스캔에 잡히면 다음 push에서 원격으로 역류한다.
-ALWAYS_EXCLUDE: tuple[str, ...] = (".dooraysync/", ".dooraysync_tmp/")
+ALWAYS_EXCLUDE: tuple[str, ...] = (".dooraysync/", ".dooraysync_tmp/", "synchere.bat")
 
 
 @dataclass

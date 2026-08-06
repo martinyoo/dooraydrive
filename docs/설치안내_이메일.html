@@ -132,20 +132,20 @@
         <!-- 평소 사용법 -->
         <tr>
           <td style="padding:24px 28px 0 28px;">
-            <h2 style="margin:0 0 12px 0; font-size:16px; color:#1e40af; border-left:4px solid #2563eb; padding-left:10px;">평소 사용법 — 이 순서만 기억하세요</h2>
+            <h2 style="margin:0 0 12px 0; font-size:16px; color:#1e40af; border-left:4px solid #2563eb; padding-left:10px;">평소 사용법 — 폴더 안 파일 하나만 기억하세요</h2>
             <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background:#eff6ff; border-left:4px solid #2563eb; border-radius:4px; margin-bottom:12px;">
               <tr>
                 <td style="padding:14px 16px; font-size:14px; color:#1f2937;">
-                  <strong>① 일 시작 전</strong> <code style="background:#fff; padding:2px 8px; border-radius:3px; font-family:Consolas,monospace;">.\SYNC.ps1 -Pull</code> — 다른 PC에서 올린 최신본 받기<br>
-                  <strong>② 파일 작업</strong> (평소처럼)<br>
-                  <strong>③ 일 끝난 뒤</strong> <code style="background:#fff; padding:2px 8px; border-radius:3px; font-family:Consolas,monospace;">.\SYNC.ps1</code> — 고친 것 올리기
+                  동기화 폴더 안에 있는 <strong><code style="background:#fff; padding:2px 8px; border-radius:3px; font-family:Consolas,monospace;">synchere.bat</code> 을 더블클릭</strong>
+                  — 그 폴더의 올리기와 받기가 한 번에 처리됩니다.<br>
+                  <span style="font-size:13px; color:#4b5563;">일 시작 전과 끝난 뒤 한 번씩 눌러 주시면 충분합니다.
+                  최상위 폴더(예: WORK)의 <code style="background:#fff; padding:2px 8px; border-radius:3px; font-family:Consolas,monospace;">synchere.bat</code> 을 누르면 아래 동기화 폴더 전부를 한 번에 처리합니다.</span>
                 </td>
               </tr>
             </table>
             <div style="font-size:13px; color:#4b5563;">
-              두 명령 모두 <strong>계획을 먼저 보여주고 확인받은 뒤</strong> 실행합니다.
-              순서를 어겨도 <strong>파일이 사라지지는 않습니다</strong> — 받기는 내가 고친 파일을 절대 덮지 않고
-              "보호"로 건너뛰며, 올리기는 원격을 지우지 않습니다. 어느 쪽을 살릴지만 직접 정하면 됩니다.
+              <strong>파일이 사라지는 일은 없습니다</strong> — 삭제는 어느 방향으로도 전파하지 않고 보고만 하며,
+              같은 파일을 양쪽에서 고친 경우에는 <strong>양쪽 내용을 모두 보존</strong>합니다(아래 "충돌 사본" 참조).
             </div>
           </td>
         </tr>
@@ -172,6 +172,12 @@
               <tr>
                 <td style="padding:6px 0; border-bottom:1px solid #f3f4f6;"><strong>"unsyncable"</strong><br>
                 Windows에 저장할 수 없는 이름(끝의 점, CON 같은 예약어 등)이라 받지 않은 파일. Dooray 웹에서 이름을 바꾸면 다음에 받아집니다.</td>
+              </tr>
+              <tr>
+                <td style="padding:6px 0; border-bottom:1px solid #f3f4f6;"><strong>"충돌보존 / 충돌 사본 N건"</strong><br>
+                같은 파일을 이 PC와 다른 곳에서 동시에 고친 경우입니다. <strong>어느 쪽도 잃지 않습니다</strong> —
+                원래 이름에는 상대방 것이, <code style="background:#f3f4f6; padding:1px 6px; border-radius:3px; font-family:Consolas,monospace;">파일명 (충돌 날짜).확장자</code> 사본에는 내 것이 남습니다.
+                정리: <code style="background:#f3f4f6; padding:1px 6px; border-radius:3px; font-family:Consolas,monospace;">.\dsync resolve -p 프로파일</code></td>
               </tr>
               <tr>
                 <td style="padding:6px 0;"><strong>"실패 N건"</strong><br>
@@ -203,7 +209,7 @@
               <li><strong>삭제는 전파되지 않습니다.</strong> 어느 쪽에서 지워도 반대편은 그대로이며 보고만 됩니다(안전 정책).</li>
               <li>같은 폴더를 두 창에서 동시에 동기화할 수 없습니다(자동으로 막힙니다).</li>
               <li>명령 뒤에 <code style="background:#f3f4f6; padding:1px 6px; border-radius:3px; font-family:Consolas,monospace;">--dry-run</code> 을 붙이면 계획만 보고 아무것도 바꾸지 않습니다.</li>
-              <li>양방향 자동 동기화(<code style="background:#f3f4f6; padding:1px 6px; border-radius:3px; font-family:Consolas,monospace;">sync</code>)와 충돌 자동 보존 기능이 있지만, 아직 <strong>안내 전까지는 쓰지 말아 주세요.</strong></li>
+              <li><code style="background:#f3f4f6; padding:1px 6px; border-radius:3px; font-family:Consolas,monospace;">synchere.bat</code> 은 <strong>모든 사본이 동일한 파일</strong>입니다 — 아무 동기화 폴더에나 복사해 두면 동작하며, 이 파일 자신은 동기화되지 않습니다(프로그램 폴더에 원본이 있습니다). 이 안내는 <strong>프로그램 업데이트 이후</strong> 기준입니다.</li>
             </ul>
           </td>
         </tr>

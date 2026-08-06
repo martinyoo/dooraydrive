@@ -836,6 +836,30 @@ def test_cli_sync_end_to_end(tmp_path: Path):
     assert drive.nodes[same.id]["version"] == 1, "내용이 같은데 재업로드했다"
 
 
+def test_tool_file_is_never_scanned_locally(tmp_path: Path):
+    """synchere.bat(폴더 동기화 도구)은 로컬 스캔에서 항상 제외된다 — 도구 자신이
+    전송 대상이 되면 안 된다(2026-08-07 사용자 요구). 하위 폴더에 있어도 같다."""
+    root, _store, _p = _setup(tmp_path)
+    _write(root, "synchere.bat", b"@echo off")
+    _write(root, "sub/synchere.bat", b"@echo off")
+    _write(root, "normal.txt", b"DATA")
+    entries = LocalScanner(root, []).scan()
+    assert path_key("normal.txt") in entries
+    assert path_key("synchere.bat") not in entries
+    assert path_key("sub/synchere.bat") not in entries
+
+
+def test_tool_file_is_excluded_from_remote_view(tmp_path: Path):
+    """원격에 올라간 synchere.bat(과거 업로드 잔재 등)도 뷰에서 제외된다 —
+    로컬만 제외하면 '원격 신규'로 보여 매번 되받으려 든다."""
+    drive = _FakeDrive()
+    drive.put("synchere.bat", "root", b"@echo off")
+    drive.put("normal.txt", "root", b"DATA")
+    view = RemoteCollector(drive, "d", "", root_id="root").full()
+    assert path_key("normal.txt") in view.entries
+    assert path_key("synchere.bat") not in view.entries
+
+
 def test_reconcile_finds_remote_counterpart_missing_from_db(tmp_path: Path):
     """UT-04(2026-08-04 사용자 테스트): init 이후 원격에 생긴 파일은 DB에 기록이 없어
     reconcile이 '대조 대상 0건'으로 끝났다 — pull이 '기준선 없음 → reconcile로
