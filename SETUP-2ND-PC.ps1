@@ -9,10 +9,23 @@
 #
 # 사용 예:  .\SETUP-2ND-PC.ps1 -LocalBase 'D:\Dooray'
 param(
-  [string]$LocalBase = 'C:\Dooray'
+  [string]$LocalBase = 'C:\Dooray',
+  [switch]$Discover
 )
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
+
+# -Discover: 드라이브의 마커(synchere.bat)를 스캔해 동기화 루트 후보를 보여준다.
+# 마커는 발견 힌트일 뿐 자동 등록은 하지 않는다 — init은 사용자가 확인 후 실행.
+if ($Discover) {
+  Write-Host "== 원격 마커 기반 동기화 루트 발견 ==" -ForegroundColor Cyan
+  python tools\discover_roots.py --local-base $LocalBase
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  Write-Host ""
+  Write-Host "위 후보를 확인한 뒤, 쓰려는 폴더의 init 명령을 복사해 실행하세요." -ForegroundColor Green
+  Write-Host "(기본 4개 프로파일 자동 설정은 -Discover 없이 실행합니다)" -ForegroundColor DarkGray
+  exit 0
+}
 
 $DRIVE   = '3229053305881780627'
 $NEED_GB = 11.5   # 원격 실측 11.24GB + 여유
