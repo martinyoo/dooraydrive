@@ -40,12 +40,23 @@ if ($Sync) { $verb = 'sync' }
 # ---------------------------------------------------------------------------
 # 프로파일 목록 (config.toml에서 읽음)
 # ---------------------------------------------------------------------------
-$profiles = python -c "import sys,tomllib;sys.path.insert(0,'.');from dooray_sync.config import config_path;d=tomllib.load(open(config_path(),'rb'));print('\n'.join(d.get('profile',{}).keys()))" 2>$null
-if ($LASTEXITCODE -ne 0 -or -not $profiles) {
+# 이름·sync_mode·sync_note를 탭 구분으로 읽는다(정책의 단일 정본 = config.toml).
+# 주의: PS 5.1은 네이티브 인자 속 큰따옴표를 이스케이프하지 않으므로 이 파이썬
+# 코드에는 큰따옴표·백슬래시를 넣지 않는다(탭·개행은 chr()로).
+$raw = python -c "import sys,tomllib;sys.path.insert(0,'.');from dooray_sync.config import config_path;d=tomllib.load(open(config_path(),'rb'));print(chr(10).join(n+chr(9)+str((b or {}).get('sync_mode','') or '')+chr(9)+str((b or {}).get('sync_note','') or '').replace(chr(9),' ').replace(chr(10),' ') for n,b in d.get('profile',{}).items()))" 2>$null
+if ($LASTEXITCODE -ne 0 -or -not $raw) {
   Write-Host "설정을 읽지 못했습니다. 'dsync init'을 먼저 실행하세요." -ForegroundColor Red
   exit 1
 }
-$profiles = @($profiles -split "`r?`n" | Where-Object { $_ })
+$profiles = @()
+$modeMap = @{}
+$noteMap = @{}
+foreach ($line in @($raw -split "`r?`n" | Where-Object { $_ })) {
+  $parts = $line -split "`t", 3
+  $profiles += $parts[0]
+  $modeMap[$parts[0]] = if ($parts.Count -ge 2) { $parts[1] } else { '' }
+  $noteMap[$parts[0]] = if ($parts.Count -ge 3) { $parts[2] } else { '' }
+}
 if ($Only) {
   $unknown = $Only | Where-Object { $_ -notin $profiles }
   if ($unknown) {
@@ -90,21 +101,22 @@ print(v)
 }
 
 # ---------------------------------------------------------------------------
-# sync 제외 프로파일 — tools/sync_here.py 의 표와 함께 관리한다.
-# -Only 로 명시 지정했을 때만 제외를 무시한다(사용자가 결정을 바꾸는 경로).
+# sync 정책 — 정본은 config.toml의 sync_mode다 (변경: tools/set_sync_mode.py).
+# 'sync'만 실행하고 나머지(push/pull/off/미설정)는 사유를 표시하고 건너뛴다.
+# -Only 로도 우회할 수 없다 — 우회해 봤자 CLI 게이트가 exit 2로 막는다.
 # ---------------------------------------------------------------------------
-if ($verb -eq 'sync' -and -not $Only) {
-  $syncExcluded = [ordered]@{
-    workenv = '원격 전용 336건(약 1GB) 미수신 결정(2026-08-07) — push 전용 운용'
-    study   = 'sync 전환 미검토 — push/pull로만 운용'
-    writing = '보류 4건 정리 전 sync 금지(충돌보존으로 로컬 원본이 개명됨)'
-  }
-  foreach ($k in @($syncExcluded.Keys)) {
-    if ($k -in $profiles) {
-      Write-Host ("  [제외] {0} — {1}" -f $k, $syncExcluded[$k]) -ForegroundColor DarkGray
+if ($verb -eq 'sync') {
+  foreach ($k in @($profiles)) {
+    if ($modeMap[$k] -ne 'sync') {
+      $why = $noteMap[$k]
+      if (-not $why) {
+        if ($modeMap[$k]) { $why = "sync_mode=$($modeMap[$k])" }
+        else { $why = "sync_mode 미설정 — python tools\set_sync_mode.py $k sync" }
+      }
+      Write-Host ("  [제외] {0} — {1}" -f $k, $why) -ForegroundColor DarkGray
     }
   }
-  $profiles = @($profiles | Where-Object { $_ -notin @($syncExcluded.Keys) })
+  $profiles = @($profiles | Where-Object { $modeMap[$_] -eq 'sync' })
 }
 
 # ---------------------------------------------------------------------------

@@ -935,6 +935,76 @@ def test_sync_follows_renamed_remote_root_and_updates_config(tmp_path: Path):
             os.environ.pop(k, None)
 
 
+def test_sync_mode_roundtrip_defaults_and_validation(tmp_path: Path):
+    """sync 정책의 정본은 config다: 왕복 보존 / 구버전 config(키 없음)는 기본값
+    'sync' / 잘못된 값은 load에서 ValueError(fail-closed)."""
+    from dooray_sync import config as cfg
+
+    os.environ[cfg.ENV_CONFIG_DIR] = str(tmp_path / "cfg")
+    try:
+        cfg.save_config(cfg.Profile(name="a", drive_id="d", local_root=r"C:\x",
+                                    sync_mode="push", sync_note="사유입니다"))
+        pa = cfg.load_config("a")
+        assert pa.sync_mode == "push" and pa.sync_note == "사유입니다"
+
+        # 구버전 config 재현(save_config는 전 필드를 쓰므로 손으로 기록해야 한다)
+        cp = Path(cfg.config_path())
+        cp.write_text("[profile.old]\ndrive_id = 'd'\nlocal_root = 'C:\\x'\n",
+                      encoding="utf-8")
+        assert cfg.load_config("old").sync_mode == "sync"
+
+        cp.write_text("[profile.bad]\ndrive_id = 'd'\nlocal_root = 'C:\\x'\n"
+                      "sync_mode = 'banana'\n", encoding="utf-8")
+        try:
+            cfg.load_config("bad")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("잘못된 sync_mode를 통과시켰다")
+    finally:
+        os.environ.pop(cfg.ENV_CONFIG_DIR, None)
+
+
+def test_sync_cli_refuses_non_sync_mode(tmp_path: Path):
+    """sync_mode != 'sync'면 CLI가 원격에 손대기 전에 exit 2로 거부한다 —
+    'dsync sync -p writing' 직접 입력 사고 차단(BulkDeleteAbort와 같은 급의 게이트)."""
+    import contextlib
+
+    from dooray_sync import config as cfg
+    from dooray_sync.cli import main as cli
+
+    os.environ[cfg.ENV_CONFIG_DIR] = str(tmp_path / "cfg")
+    os.environ[cfg.ENV_STATE_DIR] = str(tmp_path / "state")
+    os.environ["DOORAY_API_TOKEN"] = "테스트토큰" + "x" * 30
+    root = tmp_path / "local"
+    os.makedirs(ext_path(root), exist_ok=True)
+
+    api_calls: list[int] = []
+
+    @contextlib.contextmanager
+    def fake_api(p, log):
+        api_calls.append(1)
+        yield _FakeDrive()
+
+    real_api = cli._drive_api
+    cli._drive_api = fake_api
+    try:
+        cfg.save_config(cfg.Profile(name="pol", drive_id="d", local_root=str(root),
+                                    sync_mode="push", sync_note="이유"))
+        code = 0
+        try:
+            cli.sync(profile="pol", dry_run=False, full=True, propagate_deletes=False,
+                     allow_bulk_delete=False, md5_probes=200, verbose=False)
+        except (SystemExit, typer.Exit) as exc:
+            code = getattr(exc, "code", 0) or getattr(exc, "exit_code", 0) or 0
+        assert code == 2, f"거부되지 않았다(exit={code})"
+        assert not api_calls, "게이트 앞에서 원격에 접속했다"
+    finally:
+        cli._drive_api = real_api
+        for k in (cfg.ENV_CONFIG_DIR, cfg.ENV_STATE_DIR, "DOORAY_API_TOKEN"):
+            os.environ.pop(k, None)
+
+
 def test_tool_file_is_never_scanned_locally(tmp_path: Path):
     """synchere.bat(폴더 동기화 도구)은 로컬 스캔에서 항상 제외된다 — 도구 자신이
     전송 대상이 되면 안 된다(2026-08-07 사용자 요구). 하위 폴더에 있어도 같다."""

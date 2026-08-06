@@ -1768,6 +1768,23 @@ def sync(
     with _error_boundary(log):
         p = _load_profile(profile)
         _require_ready(p)
+        # sync 정책 게이트(fail-closed). 래퍼만 보게 두면 'dsync sync -p writing'을
+        # 직접 치는 사고 경로가 열려 있다 — writing의 제외 사유가 바로 "sync가
+        # 보류 4건을 충돌보존으로 판정해 로컬 원본을 개명한다"이므로, 이것은
+        # BulkDeleteAbort와 같은 급의 게이트다. 우회 플래그는 두지 않는다 —
+        # 결정 변경은 tools/set_sync_mode.py 한 곳으로(단일 정본 유지).
+        if p.sync_mode != "sync":
+            if p.sync_mode in ("push", "pull"):
+                alt = f"  대안: dsync {p.sync_mode} -p {p.name}\n"
+            else:
+                alt = f"  수동 운용: dsync push -p {p.name} / dsync pull -p {p.name}\n"
+            _fail(
+                f"프로파일 '{p.name}'은(는) sync_mode={p.sync_mode!r} 로 설정되어 "
+                "sync를 실행하지 않습니다.\n"
+                + (f"  사유: {p.sync_note}\n" if p.sync_note else "")
+                + alt
+                + f"  전환하려면: python tools\\set_sync_mode.py {p.name} sync",
+                EXIT_CONFIG)
         do_delete = bool(propagate_deletes or p.propagate_deletes)
 
         with _instance_lock(p.name):

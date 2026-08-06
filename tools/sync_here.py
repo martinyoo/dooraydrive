@@ -3,22 +3,23 @@
 배치파일은 자기 위치(%~dp0)를 `--root`로 넘긴다. 위치 해석은 두 방향이다:
 
   상향 — 이 폴더를 **품는** 프로파일이 있으면(local_root 자신 또는 그 하위)
-         그 프로파일 하나를 동기화한다. "한 단계씩 위로 올라가며 등록된 최상위
-         폴더를 찾는" 동작과 동치이며, 최장 접두 일치로 구현했다.
+         그 프로파일 하나를 동기화한다. 최장 접두 일치로 구현했다.
   하향 — 품는 프로파일이 없으면 이 폴더 **아래에 있는** 프로파일 전부를 차례로
-         동기화한다. WORK처럼 여러 동기화 폴더를 거느린 상위 폴더에 배치파일을
-         두는 경우다. 제외 프로파일은 사유를 표시하고 건너뛴다.
+         동기화한다(WORK처럼 여러 동기화 폴더를 거느린 상위 폴더용).
 
-둘 다 아니면 등록 방법(dsync init 명령)을 경로까지 채워 안내한다.
-프로파일 자동 생성은 하지 않는다 — 원격 경로를 추정할 수 없다(실제 구성만 봐도
-'WORK/spri 2025'와 최상위 '근무환경'이 공존한다). 잘못 추정해 빈 원격 폴더를
-만들면 pull 0건이 정상처럼 보이는 함정이 생긴다.
+둘 다 아니면 등록 방법(dsync init 명령)을 경로까지 채워 안내한다. 프로파일 자동
+생성은 하지 않는다 — 원격 경로를 추정할 수 없다(실제 구성만 봐도 'WORK/spri 2025'와
+최상위 '근무환경'이 공존한다).
 
-`synchere.bat` 자신은 어느 쪽으로도 동기화되지 않는다(스캐너·원격 수집기 양축의
-ALWAYS_EXCLUDE — dooray_sync/core/scanner.py).
+sync 실행 여부는 config.toml의 **sync_mode**가 정한다(단일 정본 — 예전의 하드코딩
+제외 표는 폐지). 'sync'만 실행하고, 나머지(push/pull/off/미설정)는 사유와 대안을
+안내한다. 변경은 `python tools\\set_sync_mode.py`로.
+
+성공적으로 동기화한 프로파일의 원격 루트에는 **마커(synchere.bat)를 자동 유지**한다
+— 마커는 발견(discovery) 힌트일 뿐이며 sync 엔진에는 보이지 않는다(양축
+ALWAYS_EXCLUDE). dry-run에서는 마커도 만들지 않는다.
 
 실행:  python tools\\sync_here.py [--root <폴더>] [dsync sync 추가 인자...]
-       --root 생략 시 현재 폴더(CWD) 기준.
 """
 from __future__ import annotations
 
@@ -36,23 +37,7 @@ sys.path.insert(0, str(REPO))
 from dooray_sync.config import config_path      # noqa: E402
 from dooray_sync.util.paths import to_nfc       # noqa: E402
 
-# sync 실행에서 제외하는 프로파일과 그 사유. 제외를 풀려면 이 표에서 지우고,
-# 같은 표가 SYNC.ps1(-Sync 모드)에도 있으므로 함께 고친다.
-SYNC_EXCLUDED: dict[str, tuple[str, str]] = {
-    # 프로파일: (사유, 대안 안내)
-    "workenv": (
-        "원격 전용 336건(약 1GB)을 받지 않기로 결정(2026-08-07) — push 전용 운용",
-        "올리기만 하려면:  dsync push -p workenv",
-    ),
-    "study": (
-        "sync 전환 미검토 — push/pull로만 운용",
-        "올리기: dsync push -p study / 받기: dsync pull -p study",
-    ),
-    "writing": (
-        "보류 4건 정리 전 sync 금지 — sync가 이를 충돌보존으로 판정해 로컬 원본을 개명한다",
-        "정리하려면 원격과 내용 대조 후 결정:  dsync reconcile -p writing",
-    ),
-}
+MARKER = "synchere.bat"
 
 
 def _norm(p: str | Path) -> str:
@@ -62,29 +47,73 @@ def _norm(p: str | Path) -> str:
 
 
 def _under(child: str, parent: str) -> bool:
-    """child가 parent 자신이거나 그 하위인가 (정규화 키 기준)."""
     return child == parent or child.startswith(parent + "\\") or child.startswith(parent + "/")
 
 
-def _load_profiles() -> dict[str, str]:
-    """{프로파일명: local_root}. 설정이 없으면 빈 dict."""
+def _load_profiles() -> dict[str, dict]:
+    """{프로파일명: {root, mode(None=미설정), note}}. 설정이 없으면 빈 dict."""
     cp = config_path()
     if not os.path.exists(cp):
         return {}
     with open(cp, "rb") as f:
         doc = tomllib.load(f)
-    out: dict[str, str] = {}
+    out: dict[str, dict] = {}
     for name, body in (doc.get("profile") or {}).items():
-        root = str((body or {}).get("local_root") or "").strip()
-        if root:
-            out[name] = root
+        body = body or {}
+        root = str(body.get("local_root") or "").strip()
+        if not root:
+            continue
+        mode = body.get("sync_mode")
+        out[name] = {
+            "root": root,
+            "mode": str(mode).strip().lower() if mode is not None else None,
+            "note": str(body.get("sync_note") or "").strip(),
+        }
     return out
 
 
-def _run_sync(name: str, lroot: str, extra: list[str]) -> int:
-    print(f"[프로파일 '{name}'] {lroot}")
+def _explain_skip(name: str, info: dict) -> None:
+    mode, note = info["mode"], info["note"]
+    if mode is None:
+        print(f"[제외] 프로파일 '{name}' — sync_mode 미설정")
+        print(f"       지정: python tools\\set_sync_mode.py {name} sync")
+        return
+    print(f"[제외] 프로파일 '{name}' — sync_mode={mode}"
+          + (f" ({note})" if note else ""))
+    if mode in ("push", "pull"):
+        print(f"       수동 실행: dsync {mode} -p {name}")
+    else:
+        print(f"       수동 운용: dsync push -p {name} / dsync pull -p {name}")
+    print(f"       전환: python tools\\set_sync_mode.py {name} sync")
+
+
+def _ensure_marker(name: str) -> None:
+    """성공한 sync 뒤 원격 루트에 마커가 없으면 올린다 — 실패해도 경고만."""
+    try:
+        from dooray_sync.api.client import DoorayClient
+        from dooray_sync.api.drive import DriveAPI
+        from dooray_sync.auth import get_token
+        from dooray_sync.config import load_config
+        from dooray_sync.core.remote import resolve_remote_root
+
+        p = load_config(name)
+        with DoorayClient(p.base_url, get_token()) as client:
+            api = DriveAPI(client)
+            root_id, _ = resolve_remote_root(api, p.drive_id, p.remote_path)
+            if api.find_child_by_name(p.drive_id, root_id, MARKER) is None:
+                api.upload_new(p.drive_id, root_id, MARKER, REPO / MARKER)
+                print(f"       (원격 마커 복구: {p.remote_path}/{MARKER})")
+    except Exception as exc:  # noqa: BLE001 — 마커는 힌트일 뿐, sync 결과에 영향 금지
+        print(f"       (원격 마커 확인 실패 — 무시함: {type(exc).__name__}: {exc})")
+
+
+def _run_sync(name: str, root: str, extra: list[str]) -> int:
+    print(f"[프로파일 '{name}'] {root}")
     cmd = [sys.executable, "-m", "dooray_sync.cli.main", "sync", "-p", name, *extra]
-    return subprocess.call(cmd, cwd=str(REPO))
+    rc = subprocess.call(cmd, cwd=str(REPO))
+    if rc == 0 and "--dry-run" not in extra:
+        _ensure_marker(name)
+    return rc
 
 
 def main(argv: list[str]) -> int:
@@ -97,7 +126,7 @@ def main(argv: list[str]) -> int:
             return 2
         root = args[i + 1]
         del args[i:i + 2]
-    extra = args                      # --dry-run, --full 등은 그대로 전달
+    extra = args
 
     profiles = _load_profiles()
     if not profiles:
@@ -106,27 +135,25 @@ def main(argv: list[str]) -> int:
 
     base = _norm(root)
 
-    # 상향: 이 폴더를 품는 프로파일 (가장 구체적인 것 하나)
-    containing: tuple[str, str] | None = None
-    for name, lroot in profiles.items():
-        lkey = _norm(lroot)
+    containing: tuple[str, dict] | None = None
+    for name, info in profiles.items():
+        lkey = _norm(info["root"])
         if _under(base, lkey):
-            if containing is None or len(lkey) > len(_norm(containing[1])):
-                containing = (name, lroot)
+            if containing is None or len(lkey) > len(_norm(containing[1]["root"])):
+                containing = (name, info)
 
-    # 하향: 품는 프로파일이 없으면 이 폴더 아래의 프로파일 전부 (WORK 등 상위 폴더)
     if containing is not None:
         targets = [containing]
     else:
-        targets = [(n, r) for n, r in profiles.items() if _under(_norm(r), base)]
+        targets = [(n, i) for n, i in profiles.items() if _under(_norm(i["root"]), base)]
 
     if not targets:
         print(f"이 폴더는 동기화 대상이 아닙니다: {root}")
         print()
         print("등록된 동기화 폴더:")
-        for name, lroot in profiles.items():
-            mark = "  (sync 제외)" if name in SYNC_EXCLUDED else ""
-            print(f"  {name:<10} {lroot}{mark}")
+        for name, info in profiles.items():
+            mark = "" if info["mode"] == "sync" else f"  (sync 제외: {info['mode'] or '미설정'})"
+            print(f"  {name:<10} {info['root']}{mark}")
         print()
         print("이 폴더를 새로 등록하려면 (원격 경로는 Dooray 웹에서 확인해 지정):")
         print(f'  dsync init -p <프로파일이름> --local-root "{os.path.abspath(str(root))}" '
@@ -134,15 +161,12 @@ def main(argv: list[str]) -> int:
         print("  (원격에 아직 없는 폴더면 --create-remote 를 붙입니다)")
         return 2
 
-    runnable = [(n, r) for n, r in targets if n not in SYNC_EXCLUDED]
-    for name, _lroot in targets:
-        if name in SYNC_EXCLUDED:
-            why, alt = SYNC_EXCLUDED[name]
-            print(f"[제외] 프로파일 '{name}' — {why}")
-            print(f"       {alt}")
+    runnable = [(n, i) for n, i in targets if i["mode"] == "sync"]
+    for name, info in targets:
+        if info["mode"] != "sync":
+            _explain_skip(name, info)
 
     if not runnable:
-        print("       (제외를 풀려면 tools/sync_here.py 와 SYNC.ps1 의 제외 표에서 지우세요)")
         return 2
 
     if len(runnable) > 1:
@@ -151,8 +175,8 @@ def main(argv: list[str]) -> int:
         print()
 
     failed: list[str] = []
-    for name, lroot in runnable:
-        rc = _run_sync(name, lroot, extra)
+    for name, info in runnable:
+        rc = _run_sync(name, info["root"], extra)
         if rc != 0:
             failed.append(name)
         print()

@@ -65,6 +65,11 @@ class Profile:
     max_file_mb_warn: int = 400
     bulk_delete_abort_count: int = 50
     bulk_delete_abort_ratio: float = 0.20
+    # 이 프로파일에 어떤 자동 동작을 허용하는가 — sync 제외 정책의 단일 정본
+    # (예전에는 tools/sync_here.py와 SYNC.ps1에 하드코딩 표가 중복돼 있었다).
+    # 'sync'(양방향) | 'push'(올리기 전용) | 'pull'(받기 전용) | 'off'(수동 push/pull만)
+    sync_mode: str = "sync"
+    sync_note: str = ""               # 결정 사유(사람이 읽는 문장) — 래퍼가 제외 사유로 출력
     exclude: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDE))
 
     @property
@@ -360,6 +365,12 @@ def load_config(profile: str = "default") -> Profile:
     p.base_url = p.base_url.strip().rstrip("/")
     p.drive_id = p.drive_id.strip()
     p.local_root = p.local_root.strip()
+    # config는 프로그램 소유 파일이라 잘못된 값 = 손상/손편집이다 — fail-closed.
+    # (_load_profile이 ValueError를 EXIT_CONFIG로 옮긴다.)
+    p.sync_mode = (p.sync_mode or "sync").strip().lower()
+    if p.sync_mode not in ("sync", "push", "pull", "off"):
+        raise ValueError(f"sync_mode 값이 올바르지 않습니다: {p.sync_mode!r} "
+                         "(sync | push | pull | off)")
     return p
 
 
