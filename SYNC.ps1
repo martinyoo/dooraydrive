@@ -63,28 +63,88 @@ Write-Host ("== 계획 확인 ({0}, 프로파일 {1}개) ==" -f $verb, $profiles
 Write-Host "  이 단계는 아무것도 바꾸지 않습니다." -ForegroundColor DarkGray
 Write-Host ""
 
-$todo = @()
-foreach ($p in $profiles) {
-  $out = python -m dooray_sync.cli.main $verb -p $p --dry-run 2>&1
-  $rc  = $LASTEXITCODE
-  $txt = $out -join "`n"
+# 두 스트림을 각각 파일로 받는다.
+#   - 2>&1 을 쓰면 안 된다: PowerShell 5.1이 네이티브 exe의 stderr 한 줄을 NativeCommandError로
+#     감싸고, $ErrorActionPreference='Stop' 아래에서 종료 오류가 되어 스크립트가 그 자리에서 죽는다.
+#     실제로 '보류'가 있는 프로파일에서 중단되어 뒤 프로파일이 확인조차 안 됐다.
+#   - 그런데 stderr를 버려도 안 된다: '보류'·'읽기 실패'·'경고'가 전부 stderr로 나가므로,
+#     stdout만 보면 1,000건이 막혀 있어도 '변경 없음'으로 읽힌다(fail-open).
+function Invoke-Dsync {
+  param([string[]]$DsyncArgs)
+  $o = [System.IO.Path]::GetTempFileName()
+  $e = [System.IO.Path]::GetTempFileName()
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    & python -m dooray_sync.cli.main @DsyncArgs > $o 2> $e
+    $rc = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $prev
+  }
+  $res = [pscustomobject]@{
+    Code   = $rc
+    Out    = (Get-Content -LiteralPath $o -Raw -Encoding UTF8 -ErrorAction SilentlyContinue)
+    Err    = (Get-Content -LiteralPath $e -Raw -Encoding UTF8 -ErrorAction SilentlyContinue)
+  }
+  Remove-Item -LiteralPath $o, $e -Force -ErrorAction SilentlyContinue
+  return $res
+}
 
-  if ($rc -ne 0) {
-    Write-Host ("  [실패] {0} — 계획 산출 실패(종료코드 {1})" -f $p, $rc) -ForegroundColor Red
-    ($out | Select-Object -Last 3) | ForEach-Object { Write-Host "         $_" -ForegroundColor DarkGray }
+$todo    = @()
+$blocked = @()
+foreach ($p in $profiles) {
+  $r = Invoke-Dsync @($verb, '-p', $p, '--dry-run')
+  $out = "$($r.Out)"; $err = "$($r.Err)"
+
+  if ($r.Code -ne 0) {
+    Write-Host ("  [실패] {0,-10} 계획 산출 실패 (종료코드 {1})" -f $p, $r.Code) -ForegroundColor Red
+    ($err -split "`r?`n" | Where-Object { $_ } | Select-Object -Last 3) |
+      ForEach-Object { Write-Host "             $_" -ForegroundColor DarkGray }
     continue
   }
-  # '변경 없음(건너뜀)' 같은 요약줄과 구분해서 계획 유무를 판정한다.
-  if ($txt -match '(?m)^\s*변경 없음\s*$') {
+
+  # stderr에만 나오는 것들 — 이걸 안 보면 막힌 파일을 '이상 없음'으로 오독한다.
+  $hold = if ($err -match '보류\s+(\d+)건')      { [int]$Matches[1] } else { 0 }
+  $rerr = if ($err -match '읽기 실패\s+(\d+)건') { [int]$Matches[1] } else { 0 }
+  $skip = if ($out -match '스캔 제외\s*:\s*(\d+)건') { [int]$Matches[1] } else { 0 }
+
+  $n = @([regex]::Matches($out, '(?m)^\s*(신규업로드|새버전|폴더생성|기록갱신|신규다운로드|덮어쓰기)\s')).Count
+  $none = $out -match '(?m)^\s*변경 없음\s*$'
+
+  if ($none -and $hold -eq 0 -and $rerr -eq 0 -and $skip -eq 0) {
     Write-Host ("  [-] {0,-10} 변경 없음" -f $p) -ForegroundColor DarkGray
     continue
   }
-  $n = @($out | Select-String -Pattern '신규업로드|새버전|폴더생성|기록갱신|신규다운로드|덮어쓰기').Count
-  Write-Host ("  [*] {0,-10} 계획 {1}건" -f $p, $n) -ForegroundColor Yellow
-  ($out | Select-String -Pattern '^\s*(신규업로드|새버전|폴더생성|기록갱신|신규다운로드|덮어쓰기)' |
-     Select-Object -First 5) | ForEach-Object { Write-Host ("        {0}" -f $_.Line.Trim()) -ForegroundColor DarkGray }
-  if ($n -gt 5) { Write-Host ("        ... 외 {0}건" -f ($n - 5)) -ForegroundColor DarkGray }
-  $todo += $p
+
+  if (-not $none) {
+    Write-Host ("  [*] {0,-10} 계획 {1}건" -f $p, $n) -ForegroundColor Yellow
+    ([regex]::Matches($out, '(?m)^\s*(신규업로드|새버전|폴더생성|기록갱신|신규다운로드|덮어쓰기)\s.*$') |
+       Select-Object -First 5) | ForEach-Object { Write-Host ("        {0}" -f $_.Value.Trim()) -ForegroundColor DarkGray }
+    if ($n -gt 5) { Write-Host ("        ... 외 {0}건" -f ($n - 5)) -ForegroundColor DarkGray }
+    $todo += $p
+  }
+
+  # 막힌 것은 계획이 없어도 반드시 보고한다.
+  if ($hold -gt 0) {
+    Write-Host ("      [보류] {0}건 — 원격에도 있는데 기준선이 없어 올리지 않습니다." -f $hold) -ForegroundColor Yellow
+    Write-Host  "             해소:  .\dsync reconcile -p $p" -ForegroundColor DarkGray
+    Write-Host  "             (화면이 권하는 --assume-local-newer 는 쓰지 마세요 — 보류 전체를 덮어쓰는 전역 스위치입니다)" -ForegroundColor DarkGray
+    $blocked += "$p(보류 $hold)"
+  }
+  if ($rerr -gt 0) {
+    Write-Host ("      [읽기 실패] {0}건 — 파일이 잠겨 있습니다. 오피스·한글을 닫고 다시 확인하세요." -f $rerr) -ForegroundColor Red
+    $blocked += "$p(읽기실패 $rerr)"
+  }
+  if ($skip -gt 0) {
+    Write-Host ("      [스캔 제외] {0}건 — 이 파일들은 계획에 아예 없습니다. 사유를 확인하세요." -f $skip) -ForegroundColor Red
+    $blocked += "$p(스캔제외 $skip)"
+  }
+}
+
+if ($blocked.Count -gt 0) {
+  Write-Host ""
+  Write-Host ("막혀 있는 항목: {0}" -f ($blocked -join ', ')) -ForegroundColor Yellow
+  Write-Host "이 파일들은 push해도 올라가지 않습니다. 위 안내대로 먼저 해소하세요." -ForegroundColor Yellow
 }
 
 if ($todo.Count -eq 0) {
@@ -126,10 +186,18 @@ $failed = @()
 foreach ($p in $todo) {
   Write-Host ""
   Write-Host ("-- {0}" -f $p) -ForegroundColor Cyan
-  python -m dooray_sync.cli.main $verb -p $p
-  if ($LASTEXITCODE -ne 0) {
-    Write-Host ("   [실패] {0} — 종료코드 {1}" -f $p, $LASTEXITCODE) -ForegroundColor Red
+  $r = Invoke-Dsync @($verb, '-p', $p)
+  if ($r.Out) { Write-Host $r.Out.TrimEnd() }
+  if ($r.Err) { Write-Host $r.Err.TrimEnd() -ForegroundColor Yellow }
+  # 종료코드만 믿지 않는다 — 보류·스캔 제외는 종료코드에 반영되지 않아
+  # 1,000건을 안 올린 push도 '실패 0건 / exit 0'으로 끝난다.
+  $left = if ("$($r.Err)" -match '보류\s+(\d+)건') { [int]$Matches[1] } else { 0 }
+  if ($r.Code -ne 0) {
+    Write-Host ("   [실패] {0} — 종료코드 {1}" -f $p, $r.Code) -ForegroundColor Red
     $failed += $p
+  } elseif ($left -gt 0) {
+    Write-Host ("   [주의] {0} — 보류 {1}건은 올라가지 않았습니다(종료코드는 0입니다)." -f $p, $left) -ForegroundColor Yellow
+    $failed += "$p(보류 $left)"
   }
 }
 
