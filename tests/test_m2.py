@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import dataclasses
 import datetime as _dt
 import hashlib
 import os
@@ -40,7 +41,13 @@ from dooray_sync.core.executor import SyncExecutor  # noqa: E402
 from dooray_sync.core.journal import SyncJournal, recover  # noqa: E402
 from dooray_sync.core.planner import BulkDeleteAbort  # noqa: E402
 from dooray_sync.core.planner import plan as build_plan  # noqa: E402
-from dooray_sync.core.remote import RemoteCollector, RemoteEntry, RemoteView  # noqa: E402
+from dooray_sync.core.remote import (  # noqa: E402
+    RemoteCollector,
+    RemoteEntry,
+    RemoteRootError,
+    RemoteView,
+    resolve_remote_root_anchored,
+)
 from dooray_sync.core.scanner import LocalEntry, LocalScanner  # noqa: E402
 from dooray_sync.store.db import FileRecord, Store  # noqa: E402
 from dooray_sync.util.paths import ext_path, path_key  # noqa: E402
@@ -557,7 +564,16 @@ class _FakeDrive:
         return _md5(self.nodes[file_id]["content"])
 
     def get_file_meta(self, drive_id, file_id):
-        return self._rf(self.nodes[file_id])
+        # 실제 meta 응답은 parentFile.path를 담는다(models.py 실측 주석) — 부모 체인으로
+        # 재현한다. 이걸 빼먹으면 앵커 추종 테스트가 '내가 믿는 서버'만 검증하게 된다.
+        n = self.nodes[file_id]
+        parts: list[str] = []
+        cur = n["parent"]
+        while cur and cur != "root":
+            parts.append(self.nodes[cur]["name"])
+            cur = self.nodes[cur]["parent"]
+        parent_path = "/" + "/".join(reversed(parts)) if parts else "/"
+        return dataclasses.replace(self._rf(n), parent_path=parent_path)
 
     def move(self, drive_id, file_id, destination_file_id):
         if destination_file_id == "trash":
@@ -834,6 +850,89 @@ def test_cli_sync_end_to_end(tmp_path: Path):
     # 같은 내용은 새 버전을 만들지 않았다(전송 없음)
     same = drive.find_child_by_name("d", "root", "양쪽같음.txt")
     assert drive.nodes[same.id]["version"] == 1, "내용이 같은데 재업로드했다"
+
+
+def test_resolve_anchored_follows_rename():
+    """원격 루트가 개명돼 경로 해석이 실패하면 앵커(folder_id)로 되찾는다."""
+    drive = _FakeDrive()
+    work = drive.put("WORK", "root", type_="folder")
+    target = drive.put("옛이름", work, type_="folder")
+    drive.rename("d", target, "새이름")
+    res = resolve_remote_root_anchored(drive, "d", "WORK/옛이름", anchor_id=target)
+    assert res.followed and res.root_id == target and res.prefix == "WORK/새이름"
+
+
+def test_resolve_anchored_refuses_trashed_anchor():
+    """앵커가 휴지통에 있으면 추종하지 않고 원래 오류를 낸다 — 재해석이 생존 게이트다."""
+    drive = _FakeDrive()
+    work = drive.put("WORK", "root", type_="folder")
+    target = drive.put("옛이름", work, type_="folder")
+    drive.rename("d", target, "새이름")
+    drive.trashed.add(target)
+    try:
+        resolve_remote_root_anchored(drive, "d", "WORK/옛이름", anchor_id=target)
+    except RemoteRootError:
+        pass
+    else:
+        raise AssertionError("휴지통 앵커를 추종했다")
+
+
+def test_sync_follows_renamed_remote_root_and_updates_config(tmp_path: Path):
+    """원격 루트 개명 시: dry-run은 앵커로 계획만 내고 설정을 안 바꾸며,
+    실제 실행은 알림과 함께 config.toml의 remote_path를 자동 갱신한다.
+    앵커는 첫 성공 해석에서 지연 백필된다(기존 프로파일 마이그레이션 불필요)."""
+    import contextlib
+
+    from dooray_sync import config as cfg
+    from dooray_sync.cli import main as cli
+    from dooray_sync.store.db import META_REMOTE_ROOT_ID
+
+    os.environ[cfg.ENV_CONFIG_DIR] = str(tmp_path / "cfg")
+    os.environ[cfg.ENV_STATE_DIR] = str(tmp_path / "state")
+    os.environ["DOORAY_API_TOKEN"] = "테스트토큰" + "x" * 30
+    root = tmp_path / "local"
+    os.makedirs(ext_path(root), exist_ok=True)
+
+    drive = _FakeDrive()
+    work = drive.put("WORK", "root", type_="folder")
+    target = drive.put("대상", work, type_="folder")
+    drive.put("a.txt", target, b"DATA")
+
+    @contextlib.contextmanager
+    def fake_api(p, log):
+        yield drive
+
+    def run_sync(**kw):
+        try:
+            cli.sync(profile="anch", propagate_deletes=False,
+                     allow_bulk_delete=False, md5_probes=200, verbose=False, **kw)
+        except (SystemExit, typer.Exit) as exc:
+            code = getattr(exc, "code", 0) or getattr(exc, "exit_code", 0)
+            assert code in (0, None), f"sync 실패(exit={code})"
+
+    real_api = cli._drive_api
+    cli._drive_api = fake_api
+    try:
+        cfg.save_config(cfg.Profile(name="anch", drive_id="d",
+                                    local_root=str(root), remote_path="WORK/대상"))
+        run_sync(dry_run=False, full=True)
+        assert _read(root, "a.txt") == b"DATA"
+        with Store(cli.db_path("anch")) as store:
+            assert store.get_meta(META_REMOTE_ROOT_ID) == target, "앵커 백필 실패"
+
+        drive.rename("d", target, "대상개명")
+
+        # dry-run: 앵커로 추종해 계획은 내되, 설정·meta는 그대로
+        run_sync(dry_run=True, full=True)
+        assert cfg.load_config("anch").remote_path == "WORK/대상", "dry-run이 설정을 바꿨다"
+
+        # 실제 실행: remote_path 자동 갱신
+        run_sync(dry_run=False, full=True)
+        assert cfg.load_config("anch").remote_path == "WORK/대상개명"
+    finally:
+        cli._drive_api = real_api
+        for k in (cfg.ENV_CONFIG_DIR, cfg.ENV_STATE_DIR, "DOORAY_API_TOKEN"):
+            os.environ.pop(k, None)
 
 
 def test_tool_file_is_never_scanned_locally(tmp_path: Path):

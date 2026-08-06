@@ -31,6 +31,7 @@ META_CURSOR_REVISION = "revision_cursor"
 META_CURSOR_FILE_ID = "cursor_file_id"
 META_LAST_FULL_SCAN = "last_full_scan_at"
 META_HASH_ALGO = "hash_algo"
+META_REMOTE_ROOT_ID = "remote_root_id"   # 동기화 루트 폴더의 앵커(원격 개명·이동 추종용)
 
 # journal.detail 안에 심는 예약 키 — phase 행이 어느 begin 항목에 속하는지 역참조용.
 # 스키마에 링크 컬럼을 추가할 수 없어(규약 §9 DDL 고정) detail JSON에 보관한다.

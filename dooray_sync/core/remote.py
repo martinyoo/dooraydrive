@@ -181,6 +181,56 @@ def resolve_remote_root(
     return cur, "/".join(resolved)
 
 
+@dataclass(frozen=True)
+class RootResolution:
+    root_id: str
+    prefix: str
+    followed: bool = False          # 앵커로 개명/이동을 추종했는가
+    old_remote_path: str = ""       # 실패했던 설정값(알림용)
+
+
+def resolve_remote_root_anchored(
+    drive: DriveAPI, drive_id: str, remote_path: str, *,
+    anchor_id: str | None = None, create: bool = False,
+    on_create: Callable[[str], None] | None = None,
+) -> RootResolution:
+    """경로 해석이 실패하면 앵커(folder_id)로 폴더를 되찾는다 — 원격 개명·이동 추종.
+
+    안전 규칙(전부 fail-closed — 하나라도 어긋나면 **원래 오류**를 그대로 올린다):
+    - 앵커 meta 응답에 parent_path가 없으면 위치를 추정하지 않는다
+      (_probe_dirty와 같은 원칙 — 실측상 부모 경로가 빈 응답이 존재한다).
+    - 재구성한 경로를 resolve_remote_root로 **재해석해 검증**한다. 루트에서의 정상
+      하강 탐색은 휴지통을 지나지 않으므로, 휴지통에 들어간 폴더는 여기서 걸러진다.
+    - 재해석 결과 id가 앵커와 다르면 추종하지 않는다(대소문자 무시 서버에서 동명
+      재생성 시나리오 — 이 한 줄이 빠지면 엉뚱한 폴더에 push하는 사고가 된다).
+    """
+    try:
+        rid, pref = resolve_remote_root(drive, drive_id, remote_path,
+                                        create=create, on_create=on_create)
+        return RootResolution(rid, pref)
+    except RemoteRootError as orig:
+        if not anchor_id:
+            raise
+        try:
+            rf = drive.get_file_meta(drive_id, anchor_id)
+        except DoorayApiError as exc:
+            log.info("앵커 조회 실패(원래 오류로 진행) anchor=%s: %s", anchor_id, exc)
+            raise orig from None
+        if not rf.id or not rf.is_dir or not rf.parent_path:
+            raise orig from None
+        candidate = rf.full_path.strip("/")
+        if not candidate:
+            raise orig from None
+        try:
+            rid, pref = resolve_remote_root(drive, drive_id, candidate)
+        except RemoteRootError:
+            raise orig from None        # 휴지통·도달 불가 — 추종 금지
+        if rid != anchor_id:
+            raise orig from None        # 재구성 경로가 다른 폴더 — fail-closed
+        return RootResolution(rid, pref, followed=True,
+                              old_remote_path=str(remote_path or ""))
+
+
 class RemoteCollector:
     """원격 뷰 생성기. DriveAPI 호출은 전부 여기에 모은다."""
 

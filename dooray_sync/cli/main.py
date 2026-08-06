@@ -37,7 +37,9 @@ import typer
 
 from .. import __version__
 from ..api.client import DoorayApiError, DoorayClient
-from ..api.drive import DriveAPI
+# NO_ACCESS_AUTHORITY: resolve --keep remote의 원격 사본 정리(-15700100 관용)가 참조.
+# import 누락 상태로 배포돼 그 오류 경로에서 NameError가 났다(2026-08-07 설계 검토에서 발견).
+from ..api.drive import NO_ACCESS_AUTHORITY, DriveAPI
 from ..api.models import RemoteFile
 from ..auth import TokenNotFound, get_token, mask
 from ..config import (
@@ -61,11 +63,17 @@ from ..core.remote import (
     RemoteRootError,
     iter_known_by_file_id,
     rel_from_remote,
-    resolve_remote_root,
+    resolve_remote_root_anchored,
 )
 from ..core.scanner import LocalScanner
 from ..logging_setup import current_log_path, setup_logging
-from ..store.db import META_LAST_FULL_SCAN, FileRecord, Store, now_iso
+from ..store.db import (
+    META_LAST_FULL_SCAN,
+    META_REMOTE_ROOT_ID,
+    FileRecord,
+    Store,
+    now_iso,
+)
 from ..util.hashing import md5_file
 from ..util.lock import AlreadyRunning, SingleInstanceLock
 from ..util.trash import unavailable_reason as trash_unavailable_reason
@@ -301,23 +309,56 @@ def _rel_from_remote(full_path: str, remote_prefix: str = "") -> str:
 
 
 def _resolve_remote_root(drive: DriveAPI, drive_id: str, remote_path: str,
-                         *, create: bool = False, log=None) -> tuple[str, str]:
+                         *, create: bool = False, log=None,
+                         store: Store | None = None,
+                         profile: Profile | None = None,
+                         persist: bool = True) -> tuple[str, str]:
     """동기화 시작 폴더를 정한다. (folder_id, 정규화된 원격 접두) 반환.
 
-    구현은 core.remote.resolve_remote_root에 있다(대소문자 무시 탐색 포함).
-    여기서는 예외를 CLI 종료코드로 옮기는 일만 한다.
+    구현은 core.remote.resolve_remote_root_anchored에 있다(대소문자 무시 탐색 +
+    앵커 추종). 여기서는 예외를 CLI 종료코드로 옮기고, 추종 시 알림·설정 갱신·
+    앵커 지연 백필을 처리한다.
+
+    - store를 주면 meta의 앵커(remote_root_id)로 원격 개명·이동을 추종하고,
+      성공 해석 때 앵커가 없으면 저장한다(지연 백필 — 기존 프로파일 마이그레이션 불필요).
+    - persist=False(dry-run)면 설정·meta를 일절 쓰지 않는다 — "아무것도 변경하지
+      않았습니다" 약속 유지.
+    - config.toml은 프로그램 소유 파일이므로 추종 시 remote_path 자동 갱신이 정당하다.
+      단, 같은 config를 다른 프로파일의 실행이 동시에 저장하면 나중 쓰기가 이 갱신을
+      되돌릴 수 있다(인스턴스 잠금은 프로파일별) — 되돌아가도 다음 실행의 앵커 추종이
+      다시 고쳐 쓰므로 수렴한다.
     """
     def _notify(name: str) -> None:
         _out(f"  원격 폴더 생성: {name}")
         if log:
             log.info("원격 폴더 생성: %s", name)
 
+    anchor = store.get_meta(META_REMOTE_ROOT_ID) if store is not None else None
     try:
-        return resolve_remote_root(drive, drive_id, remote_path, create=create,
-                                   on_create=_notify)
+        res = resolve_remote_root_anchored(drive, drive_id, remote_path,
+                                           anchor_id=anchor, create=create,
+                                           on_create=_notify)
     except RemoteRootError as exc:
         _fail(str(exc), EXIT_CONFIG)
-    raise AssertionError("도달 불가")
+        raise AssertionError("도달 불가")
+
+    if res.followed:
+        _err("  알림: 원격 동기화 폴더가 개명/이동되었습니다 — 앵커(folder_id)로 추적했습니다.")
+        _err(f"        remote_path: '{res.old_remote_path}' → '{res.prefix}'")
+        if log:
+            log.warning("원격 루트 개명 추종: %r → %r (folder_id=%s)",
+                        res.old_remote_path, res.prefix, res.root_id)
+        if persist and profile is not None:
+            profile.remote_path = res.prefix
+            save_config(profile)
+            _err(f"        설정 파일을 갱신했습니다: {config_path()}")
+        else:
+            _err("        (dry-run — 설정 파일은 갱신하지 않았습니다)")
+
+    # 지연 백필: 성공 해석 때 앵커가 없거나 다르면 저장 (dry-run 제외)
+    if store is not None and persist and store.get_meta(META_REMOTE_ROOT_ID) != res.root_id:
+        store.set_meta(META_REMOTE_ROOT_ID, res.root_id)
+    return res.root_id, res.prefix
 
 
 def _stat_or_none(path: Path) -> os.stat_result | None:
@@ -417,8 +458,11 @@ def _init_files_table(
 
     반환: (기록 건수, 폴더 수, unsyncable 수, 경로키 충돌 목록)
     """
+    # init에는 앵커를 물리지 않는다 — init은 **새 의도 선언**이므로 낡은 앵커로
+    # 옛 폴더에 끌려가면 안 된다. 해석 성공 후 새 앵커를 기록할 뿐이다.
     root_id, prefix = _resolve_remote_root(drive, drive_id, remote_path,
                                            create=create_remote, log=log)
+    store.set_meta(META_REMOTE_ROOT_ID, root_id)
     log.info("원격 동기화 시작 폴더: %s (%s)", root_id, prefix or "드라이브 루트")
 
     progress = _Progress("원격 항목 스캔", every=100)
@@ -803,7 +847,8 @@ class _PushExecutor:
         self.log = log
         self.root = p.root_path
         self.drive_id = p.drive_id
-        self.root_id, _ = _resolve_remote_root(drive, p.drive_id, p.remote_path)
+        self.root_id, _ = _resolve_remote_root(drive, p.drive_id, p.remote_path,
+                                               log=log, store=store, profile=p)
         self.folder_ids: dict[str, str] = {"": self.root_id}
         self._index: dict[str, dict[str, RemoteFile]] = {}
         # 대소문자 무시 보조 색인. 서버의 이름 중복 검사가 대소문자를 무시하므로
@@ -1197,9 +1242,8 @@ def _local_modified(entry, rec: FileRecord | None, scanner: LocalScanner) -> str
 
 
 def _plan_pull(drive: DriveAPI, scanner: LocalScanner, entries: dict, base: dict,
-               p: Profile, log) -> _PullPlan:
+               p: Profile, log, *, root_id: str, prefix: str) -> _PullPlan:
     plan = _PullPlan()
-    root_id, prefix = _resolve_remote_root(drive, p.drive_id, p.remote_path)
     progress = _Progress("원격 항목 스캔", every=100)
     seen: set[str] = set()
     bad_dirs: set[str] = set()
@@ -1435,7 +1479,11 @@ def pull(
                 ])
 
                 with _drive_api(p, log) as drive:
-                    plan = _plan_pull(drive, scanner, entries, base, p, log)
+                    root_id, prefix = _resolve_remote_root(
+                        drive, p.drive_id, p.remote_path, log=log,
+                        store=store, profile=p, persist=not dry_run)
+                    plan = _plan_pull(drive, scanner, entries, base, p, log,
+                                      root_id=root_id, prefix=prefix)
                     _print_pull_plan(plan)
 
                     if dry_run:
@@ -1533,7 +1581,8 @@ def reconcile(
                     # 정규화만 다른 이름)은 pull과 같은 규칙 — 먼저 본 것이 정본이고
                     # 뒤에 온 것은 무시한다.
                     root_id, prefix = _resolve_remote_root(
-                        drive, p.drive_id, p.remote_path)
+                        drive, p.drive_id, p.remote_path, log=log,
+                        store=store, profile=p, persist=not dry_run)
                     seen_rkeys: set[str] = set()
                     matched = 0
                     for rf, full in drive.walk(
@@ -1764,7 +1813,9 @@ def sync(
                     _err(f"  건너뜀: {s.rel_path} — {s.reason}")
 
                 with _drive_api(p, log) as drive:
-                    root_id, prefix = _resolve_remote_root(drive, p.drive_id, p.remote_path)
+                    root_id, prefix = _resolve_remote_root(
+                        drive, p.drive_id, p.remote_path, log=log,
+                        store=store, profile=p, persist=not dry_run)
                     collector = RemoteCollector(drive, p.drive_id, prefix, root_id,
                                                 exclude=p.exclude, logger=log)
                     cursor = store.get_cursor()
