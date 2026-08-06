@@ -37,9 +37,36 @@ if not defined REPO if exist "C:\dooraydrive\tools\sync_here.py" set "REPO=C:\do
 if not defined REPO if exist "C:\drive\dev\dooraydrive\tools\sync_here.py" set "REPO=C:\drive\dev\dooraydrive"
 if not defined REPO goto :no_repo
 
+REM On failure (exit code 1: one or more profiles failed - usually transient
+REM network / locked-file trouble) ANY KEY RETRIES in this same window instead
+REM of closing it. Exit code 2 (guidance: unregistered/excluded folder) and 0
+REM (success) close normally - retrying those changes nothing.
+REM TRIES cap: if stdin is redirected (EOF), pause returns instantly and the
+REM loop would spin forever - cap it.
+set /a TRIES=0
+
+:run
 python "%REPO%\tools\sync_here.py" --root "%HERE%" %*
 set "RC=%ERRORLEVEL%"
 echo.
+if "%RC%"=="0" goto :finish
+if "%RC%"=="2" goto :finish
+set /a TRIES+=1
+if %TRIES% GEQ 30 goto :give_up
+echo [FAILED] Sync finished with errors (exit code %RC%).
+echo          Press ANY KEY to RETRY in this window. (attempt %TRIES%/30)
+echo          To stop instead: close this window (X) or press Ctrl+C.
+pause >nul
+echo.
+echo ============================== RETRY ==============================
+echo.
+goto :run
+
+:give_up
+echo [STOP] Still failing after %TRIES% attempts. Fix the cause first
+echo        (check the messages above), then run this file again.
+
+:finish
 pause
 endlocal & exit /b %RC%
 

@@ -1827,6 +1827,14 @@ def sync(
                         raise AssertionError("도달 불가")
                     _print_sync_plan(pl, stats, view)
 
+                    # 보호·보고 판정을 파일 로그에도 남긴다. 화면에만 나오면 창을 닫는
+                    # 순간 증거가 사라져, 일시 상태('기준선 없음' 등)의 사후 진단이
+                    # 불가능하다(2026-08-07 spri2026 사건).
+                    for _rel, _why in pl.protected:
+                        log.info("보호: %s — %s", _rel, _why)
+                    for _rel, _why in pl.reports:
+                        log.info("보고: %s — %s", _rel, _why)
+
                     if dry_run:
                         _out("")
                         _out("dry-run — 아무것도 변경하지 않았습니다.")

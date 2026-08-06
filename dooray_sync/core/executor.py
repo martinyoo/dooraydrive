@@ -141,6 +141,10 @@ class SyncExecutor:
                 continue
             try:
                 fn(action)
+                # 성공한 동작을 파일 로그에 남긴다. M1 push는 남겼는데 M2 executor는
+                # 남기지 않아, 실계정에서 일시 상태(예: '기준선 없음' 보호)가 지나간 뒤
+                # 사후 진단이 불가능했다(2026-08-07 spri2026 사건 — 미해결 항목 참조).
+                self.log.info("%s: %s", action.kind, action.rel_path)
             except LocalChangedDuringSync as exc:
                 # 로컬을 지킨 것이므로 실패로 집계하지 않는다(종료코드에 영향 없음).
                 self.report.protected.append((action.rel_path, str(exc)))
