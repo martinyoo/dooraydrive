@@ -63,21 +63,22 @@ def _load_profiles() -> dict[str, dict]:
         root = str(body.get("local_root") or "").strip()
         if not root:
             continue
-        mode = body.get("sync_mode")
+        # 키 없음 = 기본 'sync' — load_config의 기본값과 정렬(2026-08-07 사용자 피드백:
+        # sync_mode 도입 전에 만들어진 config에서 전부 '미설정 제외'가 떠 혼란).
+        # 정책은 PC별 config 소관이므로 기본 sync가 각 PC에서 올바른 해석이다.
+        mode = str(body.get("sync_mode") or "sync").strip().lower()
         out[name] = {
             "root": root,
-            "mode": str(mode).strip().lower() if mode is not None else None,
+            "mode": mode,
             "note": str(body.get("sync_note") or "").strip(),
+            "remote": str(body.get("remote_path") or "").strip(),
+            "drive_id": str(body.get("drive_id") or "").strip(),
         }
     return out
 
 
 def _explain_skip(name: str, info: dict) -> None:
     mode, note = info["mode"], info["note"]
-    if mode is None:
-        print(f"[제외] 프로파일 '{name}' — sync_mode 미설정")
-        print(f"       지정: python tools\\set_sync_mode.py {name} sync")
-        return
     print(f"[제외] 프로파일 '{name}' — sync_mode={mode}"
           + (f" ({note})" if note else ""))
     if mode in ("push", "pull"):
@@ -148,15 +149,56 @@ def main(argv: list[str]) -> int:
         targets = [(n, i) for n, i in profiles.items() if _under(_norm(i["root"]), base)]
 
     if not targets:
+        # 미등록 폴더 — **형제 유도 자동 등록**을 시도한다(2026-08-07 사용자 요구:
+        # "안내가 아니라 그냥 진행"). 같은 부모 폴더 아래 등록된 형제가 있으면
+        # 부모의 로컬↔원격 결합이 이미 확정돼 있으므로, 이 폴더의 원격 경로는
+        # 추정이 아니라 유도다(예: WORK\spri 2025 → WORK/spri 2025 가 등록돼
+        # 있으면 WORK\spri 2024 → WORK/spri 2024). 형제가 없으면 안내로 돌아간다
+        # — 임의 위치 자동 등록은 하지 않는다(오결합·거대 폴더 사고 방지).
+        abs_root = os.path.abspath(str(root))
+        parent_key = _norm(os.path.dirname(abs_root))
+        leaf = to_nfc(os.path.basename(abs_root))
+        sibling = None
+        for _n, info in profiles.items():
+            if info["remote"] and _norm(os.path.dirname(info["root"])) == parent_key:
+                sibling = info
+                break
+        if sibling is not None:
+            remote_parent = sibling["remote"].replace("\\", "/").rstrip("/").rpartition("/")[0]
+            candidate = f"{remote_parent}/{leaf}" if remote_parent else leaf
+            pname = "".join(c for c in leaf if c.isalnum() or c in "._-") or "folder"
+            n = 1
+            base_name = pname
+            while pname in profiles:
+                n += 1
+                pname = f"{base_name}{n}"
+            print("미등록 폴더입니다 — 형제 프로파일의 결합에서 유도해 자동 등록합니다:")
+            print(f"  로컬  {abs_root}")
+            print(f"  원격  {candidate}   (프로파일 '{pname}')")
+            print()
+            if "--dry-run" in extra:
+                print("dry-run — 등록·동기화 없이 계획만 보였습니다. 실행하면 위대로 등록 후 동기화합니다.")
+                return 0
+            rc = subprocess.call(
+                [sys.executable, "-m", "dooray_sync.cli.main", "init", "-p", pname,
+                 "--drive-id", sibling["drive_id"], "--local-root", abs_root,
+                 "--remote-path", candidate, "--create-remote"],
+                cwd=str(REPO))
+            if rc != 0:
+                print(f"등록 실패(종료코드 {rc}) — 직접 확인이 필요합니다.")
+                return rc
+            print()
+            rc = _run_sync(pname, abs_root, extra)
+            return rc
         print(f"이 폴더는 동기화 대상이 아닙니다: {root}")
         print()
         print("등록된 동기화 폴더:")
         for name, info in profiles.items():
-            mark = "" if info["mode"] == "sync" else f"  (sync 제외: {info['mode'] or '미설정'})"
+            mark = "" if info["mode"] == "sync" else f"  (sync 제외: {info['mode']})"
             print(f"  {name:<10} {info['root']}{mark}")
         print()
         print("이 폴더를 새로 등록하려면 (원격 경로는 Dooray 웹에서 확인해 지정):")
-        print(f'  dsync init -p <프로파일이름> --local-root "{os.path.abspath(str(root))}" '
+        print(f'  dsync init -p <프로파일이름> --local-root "{abs_root}" '
               '--remote-path "<원격/경로>"')
         print("  (원격에 아직 없는 폴더면 --create-remote 를 붙입니다)")
         return 2

@@ -54,7 +54,9 @@ $noteMap = @{}
 foreach ($line in @($raw -split "`r?`n" | Where-Object { $_ })) {
   $parts = $line -split "`t", 3
   $profiles += $parts[0]
-  $modeMap[$parts[0]] = if ($parts.Count -ge 2) { $parts[1] } else { '' }
+  $m = if ($parts.Count -ge 2) { $parts[1] } else { '' }
+  if (-not $m) { $m = 'sync' }   # 키 없음 = 기본 'sync' (load_config 기본값과 정렬)
+  $modeMap[$parts[0]] = $m
   $noteMap[$parts[0]] = if ($parts.Count -ge 3) { $parts[2] } else { '' }
 }
 if ($Only) {
