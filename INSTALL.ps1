@@ -44,13 +44,47 @@ Write-Host "  설치 폴더: $PSScriptRoot" -ForegroundColor DarkGray
 # --------------------------------------------------------------------- 1) Python
 Head "1/6  Python 확인"
 
+function Invoke-Py {
+  <# python을 부르고 {Code, Out, Err}를 돌려준다. 스크립트를 죽이지 않는다.
+
+     PowerShell 5.1은 네이티브 exe가 stderr에 한 줄이라도 쓰면 그것을 NativeCommandError로
+     감싸고, 이 파일 머리의 $ErrorActionPreference='Stop' 아래에서 **종료 오류**로 만든다.
+     `2>$null`로는 막을 수 없다 — 리다이렉션은 출력을 버릴 뿐 오류 레코드 생성은 그대로다.
+     실제로 구성요소가 없는 새 PC에서 `python -c "import httpx, ..."`가 ImportError
+     트레이스백을 내자 3/6 단계에서 설치가 그대로 중단됐다(2026-08-07 실측).
+     그래서 두 스트림을 파일로 받고, 호출 구간에서만 Stop을 푼다. #>
+  param([Parameter(ValueFromRemainingArguments = $true)][string[]]$PyArgs)
+  $o = [System.IO.Path]::GetTempFileName()
+  $e = [System.IO.Path]::GetTempFileName()
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  $code = 9009   # python 자체를 찾지 못한 경우의 기본값
+  try {
+    & python @PyArgs > $o 2> $e
+    $code = $LASTEXITCODE
+  } catch {
+    # 실행 파일 자체가 없을 때. $code는 9009로 둔다.
+  } finally {
+    $ErrorActionPreference = $prev
+  }
+  $res = [pscustomobject]@{
+    Code = $code
+    Out  = (('' + (Get-Content -LiteralPath $o -Raw -Encoding UTF8 -ErrorAction SilentlyContinue)).Trim())
+    Err  = (('' + (Get-Content -LiteralPath $e -Raw -Encoding UTF8 -ErrorAction SilentlyContinue)).Trim())
+  }
+  Remove-Item -LiteralPath $o, $e -Force -ErrorAction SilentlyContinue
+  return $res
+}
+
 function Get-WorkingPython {
   <# 쓸 수 있는 python이면 {Version, Path}, 아니면 $null.
      Microsoft Store의 'python' 껍데기는 실행하면 실패하므로 --version까지 확인한다. #>
   $c = Get-Command python -ErrorAction SilentlyContinue
   if (-not $c) { return $null }
-  $raw = (python --version) 2>$null
-  if ($LASTEXITCODE -ne 0 -or $raw -notmatch 'Python\s+(\d+\.\d+)') { return $null }
+  $r = Invoke-Py '--version'
+  # --version은 구버전에서 stderr로 나가기도 한다. 두 스트림을 모두 본다.
+  $raw = if ($r.Out) { $r.Out } else { $r.Err }
+  if ($r.Code -ne 0 -or $raw -notmatch 'Python\s+(\d+\.\d+)') { return $null }
   return [pscustomobject]@{ Version = [version]$Matches[1]; Path = $c.Source }
 }
 
@@ -135,29 +169,44 @@ Head "3/6  필요한 구성요소 설치"
 # 명령을 찾지 못해 ErrorActionPreference='Stop'에 걸려 스크립트가 죽는다.
 if (-not $py) {
   Warn "Python이 없어 확인을 건너뜁니다 — 설치할 때 함께 처리됩니다"
-} elseif ($(python -c "import httpx, keyring, typer, send2trash" 2>$null; $LASTEXITCODE) -eq 0) {
+} elseif ((Invoke-Py '-c' 'import httpx, keyring, typer, send2trash').Code -eq 0) {
   Ok "이미 설치되어 있습니다"
 } elseif ($Check) {
   Warn "구성요소가 없습니다 — 설치 시 자동으로 받습니다 (인터넷 필요)"
 } else {
   Info "pip로 내려받는 중입니다. 1~2분 걸릴 수 있습니다..."
-  python -m pip install --disable-pip-version-check -r requirements.txt
-  if ($LASTEXITCODE -ne 0) {
+  # pip은 진행 상황을 보여줘야 하므로 화면에 그대로 흘린다. 다만 경고를 stderr로
+  # 내보내므로 이 구간에서만 Stop을 풀어 NativeCommandError로 죽지 않게 한다.
+  $prevEAP = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    & python -m pip install --disable-pip-version-check -r requirements.txt
+    $pipCode = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $prevEAP
+  }
+  if ($pipCode -ne 0) {
     Die "구성요소 설치에 실패했습니다." @"
 인터넷 연결(사내 프록시 포함)을 확인하고 다시 실행하세요.
 수동으로는:  python -m pip install -r requirements.txt
 "@
   }
-  python -c "import httpx, keyring, typer, send2trash" 2>$null
-  if ($LASTEXITCODE -ne 0) { Die "설치는 끝났지만 구성요소를 불러오지 못합니다." "Python이 여러 개 설치돼 있을 수 있습니다." }
+  $verify = Invoke-Py '-c' 'import httpx, keyring, typer, send2trash'
+  if ($verify.Code -ne 0) {
+    Die "설치는 끝났지만 구성요소를 불러오지 못합니다." @"
+Python이 여러 개 설치돼 있을 수 있습니다.
+불러오기 오류:
+$($verify.Err)
+"@
+  }
   Ok "설치 완료"
 }
 
 # --------------------------------------------------------------------- 4) 토큰
 Head "4/6  Dooray API 토큰"
 $tokenState = 'N'
-if ($py -and $(python -c "import keyring" 2>$null; $LASTEXITCODE) -eq 0) {
-  $tokenState = (python -c "import keyring;t=keyring.get_password('dooray-sync','api-token');print('Y' if t else 'N')") 2>$null
+if ($py -and (Invoke-Py '-c' 'import keyring').Code -eq 0) {
+  $tokenState = (Invoke-Py '-c' "import keyring;t=keyring.get_password('dooray-sync','api-token');print('Y' if t else 'N')").Out
 }
 if (-not $py) {
   Warn "Python이 없어 확인을 건너뜁니다 — 설치할 때 입력받습니다"
@@ -187,7 +236,7 @@ if (-not $py) {
   $plain = $null
   if ($rc -ne 0) { Die "토큰 저장에 실패했습니다." "Windows 자격 증명 관리자에 접근하지 못했습니다." }
 
-  $tokenState = (python -c "import keyring;t=keyring.get_password('dooray-sync','api-token');print('Y' if t else 'N')") 2>$null
+  $tokenState = (Invoke-Py '-c' "import keyring;t=keyring.get_password('dooray-sync','api-token');print('Y' if t else 'N')").Out
   if ($tokenState -ne 'Y') { Die "토큰이 저장되지 않았습니다." "다시 실행해 주세요." }
   Ok "등록 완료 (Windows 자격 증명 관리자에 저장 — 설정 파일에는 남지 않습니다)"
 }
@@ -243,8 +292,8 @@ if ($NoPull) {
 }
 
 $profiles = @()
-$raw = python -c "import sys,tomllib;sys.path.insert(0,'.');from dooray_sync.config import config_path;d=tomllib.load(open(config_path(),'rb'));print('\n'.join(d.get('profile',{}).keys()))" 2>$null
-if ($LASTEXITCODE -eq 0 -and $raw) { $profiles = @($raw -split "`r?`n" | Where-Object { $_ }) }
+$r = Invoke-Py '-c' "import sys,tomllib;sys.path.insert(0,'.');from dooray_sync.config import config_path;d=tomllib.load(open(config_path(),'rb'));print(chr(10).join(d.get('profile',{}).keys()))"
+if ($r.Code -eq 0 -and $r.Out) { $profiles = @($r.Out -split "`r?`n" | Where-Object { $_ }) }
 if ($profiles.Count -eq 0) { Die "설정에서 프로파일을 읽지 못했습니다." "설정은 끝났을 수 있습니다. '.\SYNC.ps1 -Pull'로 직접 받아 보세요." }
 
 # 작은 것부터 받는다 — 경로·권한 문제는 13개 파일에서 드러나는 편이 낫다.
