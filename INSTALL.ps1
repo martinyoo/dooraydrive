@@ -177,13 +177,19 @@ if (-not $py) {
   Info "pip로 내려받는 중입니다. 1~2분 걸릴 수 있습니다..."
   # pip은 진행 상황을 보여줘야 하므로 화면에 그대로 흘린다. 다만 경고를 stderr로
   # 내보내므로 이 구간에서만 Stop을 풀어 NativeCommandError로 죽지 않게 한다.
+  # PYTHONUTF8=1: pip은 BOM 없는 requirements.txt를 로케일 코덱(cp949)으로 읽어,
+  # 한글 주석이 있으면 UnicodeDecodeError로 설치가 통째로 죽는다(2026-08-07 동료 PC
+  # 실측). requirements.txt는 ASCII 전용으로 유지하지만, 재유입 대비 이중 방어다.
   $prevEAP = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
+  $prevUtf8 = $env:PYTHONUTF8
+  $env:PYTHONUTF8 = '1'
   try {
     & python -m pip install --disable-pip-version-check -r requirements.txt
     $pipCode = $LASTEXITCODE
   } finally {
     $ErrorActionPreference = $prevEAP
+    $env:PYTHONUTF8 = $prevUtf8
   }
   if ($pipCode -ne 0) {
     Die "구성요소 설치에 실패했습니다." @"

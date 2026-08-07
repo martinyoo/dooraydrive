@@ -1,9 +1,15 @@
-# dooray_sync 런타임 의존성 (Python 3.11+, Windows)
+# dooray_sync runtime dependencies (Python 3.11+, Windows)
 #   pip install -r requirements.txt
 #
-# PoC용 최소 의존성은 poc/requirements.txt에 그대로 둔다(실행 재현성 보존).
+# ASCII ONLY in this file. pip decodes requirements files with the LOCALE
+# codec (cp949 on Korean Windows) when there is no BOM, so UTF-8 Korean
+# comments here crashed the colleague-PC installer with UnicodeDecodeError
+# (measured 2026-08-07, byte 0xeb = first byte of a Korean char).
+# Keep Korean annotations in docs/, not in this file.
+#
+# PoC-only minimum deps stay in poc/requirements.txt (run reproducibility).
 
-httpx>=0.27          # HTTP 클라이언트. follow_redirects=False 고정으로 307을 수동 처리(A2)
-keyring>=25          # API 토큰 보관(OS 자격 증명 관리자). 환경변수는 테스트용
-typer>=0.12          # CLI. 3.11 + `from __future__ import annotations` 조합은 0.9+에서만 정상 동작
-send2trash>=1.8      # 로컬 삭제는 휴지통으로만(C5). M2 삭제 전파에서 사용
+httpx>=0.27          # HTTP client. follow_redirects=False; 307 handled manually (A2)
+keyring>=25          # API token storage (OS credential manager); env vars are test-only
+typer>=0.12          # CLI. Python 3.11 + `from __future__ import annotations` needs >=0.9
+send2trash>=1.8      # local deletes go to the recycle bin only (C5); used by M2 delete propagation
