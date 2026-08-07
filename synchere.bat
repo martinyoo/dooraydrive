@@ -10,6 +10,13 @@ REM     synchronized in turn (excluded targets are skipped with a reason)
 REM  Every copy of this file is IDENTICAL - just copy it anywhere.
 REM  This file itself is NEVER synchronized (excluded on both sides).
 REM
+REM  This file is also the REGISTRATION SWITCH (2026-08-07):
+REM   - copy it into an unregistered folder and run it: the folder gets
+REM     registered (derived from a registered sibling) and synced
+REM   - delete it from a sync folder's root: the folder is unregistered on
+REM     the next run (soft - config keeps the baseline; copy the file back
+REM     and run it to re-register). Manual push/pull/off folders never flip.
+REM
 REM  Pass-through args work too:  synchere.bat --dry-run
 REM
 REM  Deletions are never propagated (report only). Conflicts keep both sides.

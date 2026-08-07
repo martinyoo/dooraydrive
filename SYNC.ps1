@@ -38,12 +38,59 @@ if ($Pull) { $verb = 'pull' }
 if ($Sync) { $verb = 'sync' }
 
 # ---------------------------------------------------------------------------
+# -Sync 전 마커↔config 정합 — 로컬 synchere.bat = 등록/해제 스위치(2026-08-07).
+# 규칙 구현은 tools/sync_here.py 한 곳(reconcile_markers)이고 여기서는 호출만 한다:
+# 마커가 지워진 sync 프로파일은 off로 기록되어 아래 제외 필터에 걸리고,
+# 마커를 되살린(자동 해제 태그) 프로파일은 sync로 복귀한다.
+# -DryRun은 예정만 보고하고 config를 바꾸지 않는다.
+# (stderr를 2>&1로 감싸지 말 것 — 아래 Invoke-Dsync 주석의 NativeCommandError 문제)
+# ---------------------------------------------------------------------------
+$effMode = $null
+$reenablePending = @()
+if ($Sync -and -not $Status) {
+  $mArgs = @('tools\sync_here.py', '--check-markers')
+  $modesFile = $null
+  if ($DryRun) {
+    # dry-run은 config를 안 쓰므로, 정합 결과(유효 mode)를 임시 파일로 받아
+    # 미리보기의 대상 집합을 실제 실행과 일치시킨다(적대 검증 지적: 프로세스
+    # 경계에서 메모리 정합이 소실돼 미리보기가 반대 집합을 보여줬다).
+    $modesFile = [System.IO.Path]::GetTempFileName()
+    $mArgs += @('--dry-run', '--emit-modes', $modesFile)
+  }
+  # 임시 파일은 여기서 읽고 바로 지운다 — 뒤쪽 조기 종료(config 읽기 실패,
+  # 모르는 -Only)마다 정리를 챙기면 누수가 생긴다(2차 적대 검증 지적).
+  $mRc = 1
+  try {
+    & python @mArgs
+    $mRc = $LASTEXITCODE
+    if ($mRc -eq 0 -and $modesFile -and (Test-Path -LiteralPath $modesFile)) {
+      $effMode = @{}
+      foreach ($line in @(Get-Content -LiteralPath $modesFile -Encoding UTF8 | Where-Object { $_ })) {
+        $parts = $line -split "`t"
+        if ($parts.Count -ge 2) {
+          $effMode[$parts[0]] = $parts[1]
+          if ($parts.Count -ge 3 -and $parts[2] -eq '1') { $reenablePending += $parts[0] }
+        }
+      }
+    }
+  } finally {
+    if ($modesFile) { Remove-Item -LiteralPath $modesFile -Force -ErrorAction SilentlyContinue }
+  }
+  if ($mRc -ne 0) {
+    Write-Host "마커 점검이 실패했습니다(위 메시지 참조) — 계속하지 않습니다." -ForegroundColor Red
+    exit 1
+  }
+}
+
+# ---------------------------------------------------------------------------
 # 프로파일 목록 (config.toml에서 읽음)
 # ---------------------------------------------------------------------------
 # 이름·sync_mode·sync_note를 탭 구분으로 읽는다(정책의 단일 정본 = config.toml).
 # 주의: PS 5.1은 네이티브 인자 속 큰따옴표를 이스케이프하지 않으므로 이 파이썬
 # 코드에는 큰따옴표·백슬래시를 넣지 않는다(탭·개행은 chr()로).
-$raw = python -c "import sys,tomllib;sys.path.insert(0,'.');from dooray_sync.config import config_path;d=tomllib.load(open(config_path(),'rb'));print(chr(10).join(n+chr(9)+str((b or {}).get('sync_mode','') or '')+chr(9)+str((b or {}).get('sync_note','') or '').replace(chr(9),' ').replace(chr(10),' ') for n,b in d.get('profile',{}).items()))" 2>$null
+# errors='replace' 필수: 파이프 stdout은 cp949라 note에 cp949 비인코딩 문자
+# (em dash 등)가 있으면 UnicodeEncodeError로 통째로 죽는다(전역 인코딩 교훈).
+$raw = python -c "import sys,tomllib;sys.stdout.reconfigure(errors='replace');sys.path.insert(0,'.');from dooray_sync.config import config_path;d=tomllib.load(open(config_path(),'rb'));print(chr(10).join(n+chr(9)+str((b or {}).get('sync_mode','') or '')+chr(9)+str((b or {}).get('sync_note','') or '').replace(chr(9),' ').replace(chr(10),' ') for n,b in d.get('profile',{}).items()))" 2>$null
 if ($LASTEXITCODE -ne 0 -or -not $raw) {
   Write-Host "설정을 읽지 못했습니다. 'dsync init'을 먼저 실행하세요." -ForegroundColor Red
   exit 1
@@ -108,6 +155,18 @@ print(v)
 # -Only 로도 우회할 수 없다 — 우회해 봤자 CLI 게이트가 exit 2로 막는다.
 # ---------------------------------------------------------------------------
 if ($verb -eq 'sync') {
+  # -DryRun: 정합의 유효 mode를 겹쳐 써 미리보기를 실제 실행과 같은 대상 집합으로.
+  # 재등록 예정은 계획을 산출할 수 없어(기록 없인 CLI 게이트가 off 거부)
+  # 예고만 하고 제외한다 — 실제 실행은 재등록(config 기록) 후 계획 확인을 거친다.
+  if ($effMode) {
+    foreach ($k in @($effMode.Keys)) {
+      if ($modeMap.ContainsKey($k)) { $modeMap[$k] = $effMode[$k] }
+    }
+    foreach ($k in $reenablePending) {
+      Write-Host ("  [재등록 예정] {0} — 실제 실행에서 sync로 복귀합니다. 계획은 그때 산출·확인됩니다" -f $k) -ForegroundColor Yellow
+      $noteMap[$k] = '재등록 예정 (위 안내 참조)'
+    }
+  }
   foreach ($k in @($profiles)) {
     if ($modeMap[$k] -ne 'sync') {
       $why = $noteMap[$k]
@@ -310,7 +369,9 @@ if (-not $Yes) {
   }
   $ans = Read-Host "진행할까요? (y/N)"
   if ($ans -notmatch '^[Yy]') {
-    Write-Host "취소했습니다. 아무것도 바꾸지 않았습니다." -ForegroundColor DarkGray
+    # '아무것도'라고 쓰지 않는다 — -Sync는 이 프롬프트 전에 마커 정합이 config를
+    # 이미 기록했을 수 있다(위에 [해제]/[재등록]으로 보고됨). 파일 전송만 취소된다.
+    Write-Host "취소했습니다. 파일 동기화는 실행하지 않았습니다." -ForegroundColor DarkGray
     exit 0
   }
 }

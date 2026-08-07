@@ -12,6 +12,8 @@ load_config → 수정 → save_config 왕복으로 안전하게 바꾼다(타 �
 """
 from __future__ import annotations
 
+import datetime
+import importlib.util
 import sys
 import tomllib
 from pathlib import Path
@@ -22,6 +24,13 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from dooray_sync.config import config_path, load_config, save_config   # noqa: E402
+
+# 마커 규칙(AUTO_OFF_PREFIX, _ensure_local_marker)의 단일 정본은 sync_here.py다.
+# tools/는 패키지가 아니라 파일 경로로 로드해 재사용한다(상수·로직 중복 금지).
+_spec = importlib.util.spec_from_file_location(
+    "_sync_here_for_policy", Path(__file__).with_name("sync_here.py"))
+_sync_here = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_sync_here)
 
 MODES = ("sync", "push", "pull", "off")
 
@@ -63,10 +72,20 @@ def main() -> int:
     p.sync_mode = mode
     if note is not None:
         p.sync_note = note
+    elif p.sync_note.startswith(_sync_here.AUTO_OFF_PREFIX):
+        # 사람이 이 도구로 모드를 명시하면 자동 해제 태그를 걷어낸다 — 태그가
+        # 남으면 마커 파일이 (GDrive 복원 등으로) 되살아나는 순간 자동 재등록이
+        # 사람의 결정을 뒤집는다(적대 검증 지적). 태그 없는 값 = 수동 상태.
+        p.sync_note = f"{datetime.date.today().isoformat()} 수동 {mode} 설정"
     save_config(p)
     print(f"[{name}] sync_mode: {before[0]!r} → {p.sync_mode!r}")
-    if note is not None:
+    if p.sync_note != before[1]:
         print(f"[{name}] sync_note: {before[1]!r} → {p.sync_note!r}")
+    if mode == "sync":
+        # sync 전환 = 등록. '등록 = 루트에 마커 ON' 불변식(구현계획서 M2.5) —
+        # 마커 없이 두면 다음 정합이 방금 켠 sync를 도로 해제한다(적대 검증 지적:
+        # CLI 게이트·synchere가 안내하는 공식 전환 경로가 이 함정에 빠졌었다).
+        _sync_here._ensure_local_marker(p.local_root)
     return 0
 
 

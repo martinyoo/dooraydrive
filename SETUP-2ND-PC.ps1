@@ -23,6 +23,8 @@ if ($Discover) {
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
   Write-Host ""
   Write-Host "위 후보를 확인한 뒤, 쓰려는 폴더의 init 명령을 복사해 실행하세요." -ForegroundColor Green
+  Write-Host "init 후에는 그 로컬 폴더에 synchere.bat를 복사해 두세요 — 실행기이자" -ForegroundColor Green
+  Write-Host "등록 스위치입니다(없으면 다음 SYNC.ps1 -Sync가 그 프로파일을 자동 해제)." -ForegroundColor Green
   Write-Host "(기본 4개 프로파일 자동 설정은 -Discover 없이 실행합니다)" -ForegroundColor DarkGray
   exit 0
 }
@@ -87,6 +89,15 @@ foreach ($j in $jobs) {
   Write-Host ""
   Write-Host ("-- {0}  ->  {1}" -f $j.p, $j.remote) -ForegroundColor Cyan
 
+  # 재실행 복구: 이미 설정된 프로파일은 건너뛴다(--force 금지 원칙 유지 — 기존
+  # 기준선 보호). 이 분기가 없으면 부분 실패 후 재실행이 첫 기존 프로파일의
+  # init에서 죽어 아래 2-2(마커 배치)에 영원히 도달하지 못한다(적대 검증 지적).
+  $exists = python -c "import sys;sys.path.insert(0,'.');from dooray_sync.config import config_exists;print(1 if config_exists('$($j.p)') else 0)" 2>$null
+  if ("$exists".Trim() -eq '1') {
+    Write-Host ("  [건너뜀] {0} — 설정이 이미 있습니다(재실행 복구). init을 다시 하지 않습니다." -f $j.p) -ForegroundColor DarkGray
+    continue
+  }
+
   # 로컬에 파일이 이미 있으면 이 스크립트의 전제(빈 로컬)가 깨진다.
   if (Test-Path -LiteralPath $local) {
     $n = @(Get-ChildItem -LiteralPath $local -Recurse -File -ErrorAction SilentlyContinue).Count
@@ -126,6 +137,26 @@ if ($missing.Count -gt 0) {
   Write-Host ""
   Write-Host "원격 스캔이 끝나지 않은 프로파일이 있습니다: $($missing -join ', ')" -ForegroundColor Red
   exit 1
+}
+
+# ---------------------------------------------------------------------------
+Write-Host ""
+Write-Host "== 2-2) 로컬 마커(synchere.bat) 배치 ==" -ForegroundColor Cyan
+# '등록 = 루트에 마커 ON'이 불변식이다(구현계획서 M2.5). 마커 없이 두면 이 PC의
+# 첫 SYNC.ps1 -Sync 정합이 방금 만든 프로파일을 전부 자동 해제(off)해 버린다.
+# 마커는 양축 상시 제외라 pull로도 내려오지 않는다 — 여기서 직접 놓는 것이 유일하다.
+foreach ($j in $jobs) {
+  $local = Join-Path $LocalBase $j.sub
+  if (-not (Test-Path -LiteralPath $local)) {
+    New-Item -ItemType Directory -Force -Path $local | Out-Null
+  }
+  $dst = Join-Path $local 'synchere.bat'
+  if (Test-Path -LiteralPath $dst) {
+    Write-Host ("  [정상] {0}" -f $dst) -ForegroundColor DarkGray
+  } else {
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'synchere.bat') -Destination $dst
+    Write-Host ("  [배치] {0}" -f $dst) -ForegroundColor DarkGray
+  }
 }
 
 # ---------------------------------------------------------------------------
