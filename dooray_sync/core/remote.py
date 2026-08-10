@@ -24,13 +24,19 @@ from ..util.paths import join_remote, matches_any, name_issue, path_key, to_nfc
 
 __all__ = [
     "RemoteEntry", "RemoteView", "RemoteCollector", "RemoteRootError",
-    "rel_from_remote", "resolve_remote_root",
+    "rel_from_remote", "resolve_remote_root", "DEFAULT_PROBE_BUDGET",
 ]
 
 log = logging.getLogger(__name__)
 
 # 폴더 하나의 하위 재열람(B4) 상한. 넘으면 잘렸다고 표시하고 전체 재조정을 권한다.
 _MAX_SUBTREE_ITEMS = 50_000
+
+# 델타 패스가 미완료 레코드를 개별 조회로 확인할 수 있는 한 번의 상한(_probe_dirty).
+# 이름을 붙여 밖으로 내보낸다 — 백로그가 이 수를 넘으면 델타로는 따라잡을 수 없고,
+# 그 판단(전체 순회로 전환)은 CLI가 한다. 두 곳이 서로 다른 수를 쓰면 '전환했는데도
+# 여전히 부분 처리' 같은 조용한 미수렴이 된다.
+DEFAULT_PROBE_BUDGET = 500
 
 
 class RemoteRootError(ValueError):
@@ -266,7 +272,7 @@ class RemoteCollector:
     # ------------------------------------------------------------------ 델타
     def delta(self, cursor: Cursor, *, known_by_file_id: dict[str, str] | None = None,
               dirty_file_ids: Iterable[str] = (), max_items: int = 20_000,
-              max_probes: int = 500,
+              max_probes: int = DEFAULT_PROBE_BUDGET,
               on_item: Callable[[str], None] | None = None) -> RemoteView:
         """changes 소비(B1~B4). is_complete=False.
 
@@ -417,7 +423,7 @@ class RemoteCollector:
 
     def _probe_dirty(self, view: RemoteView, dirty_file_ids: Iterable[str],
                      known: dict[str, str], seen: dict[str, str],
-                     bad_dirs: set[str], max_probes: int = 500) -> None:
+                     bad_dirs: set[str], max_probes: int = DEFAULT_PROBE_BUDGET) -> None:
         """지난 실행에서 끝내지 못한 항목만 원격 메타를 직접 확인한다(규약_M2 I6).
 
         델타는 '변경이 없으면 아무 말도 하지 않는' 뷰라, 지난 번에 전송이 실패한 항목은

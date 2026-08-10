@@ -62,6 +62,7 @@ from ..core.journal import SyncJournal, recover
 from ..core.planner import ACTION_LABEL, BulkDeleteAbort
 from ..core.planner import plan as build_plan
 from ..core.remote import (
+    DEFAULT_PROBE_BUDGET,
     RemoteCollector,
     RemoteRootError,
     iter_known_by_file_id,
@@ -1683,6 +1684,41 @@ def reconcile(
 
 META_LAST_SYNC_AT = "last_sync_at"
 
+# 백로그가 전체의 이 비율을 넘으면 델타를 포기하고 전체 순회로 간다.
+# 건수만 보고 전환하면 20만 건짜리 드라이브가 501건 때문에 매번 전체를 돈다 —
+# 전체 순회 비용은 폴더 수에 비례하므로(폴더당 목록 호출 최소 1회) 백로그가 전체의
+# 일부에 불과할 땐 개별 조회가 더 싸다. 그래서 건수와 비율을 **둘 다** 넘을 때만 전환한다.
+_BACKLOG_FULL_RATIO = 0.10
+
+
+def _decide_full_pass(*, forced: bool, cursor_revision: int, scanned_before: bool,
+                      synced_before: bool, dirty: int, total: int) -> tuple[bool, str]:
+    """이번 패스를 전체 순회로 돌릴지와 그 사유. 사유 ''는 '설명할 것이 없음'.
+
+    델타는 changes에 안 나온 항목을 '변경 없음'으로 두고, 뒤처진 레코드는 개별 조회로만
+    따라잡는다(core.remote._probe_dirty). 그 예산이 DEFAULT_PROBE_BUDGET건이므로 백로그가
+    그보다 크면 이번 패스는 **어차피 부분 처리로 끝난다**.
+
+    init 직후가 정확히 그 상황이다 — init은 원격 목록을 base로만 기록하고(전 항목
+    pending_download) changes 커서는 tip까지 밀어 둔다. 그래서 이어지는 첫 sync가 델타로
+    들어가면 changes는 0건이고 예산만큼만 처리한 뒤 나머지는 '원격 미확인'으로 남았다
+    (2026-08-10 실측: 15085건 중 500건만 처리, 14585건 보류).
+    """
+    if forced:
+        return True, ""                       # 사용자가 --full로 지시 — 사유 설명 불필요
+    if cursor_revision <= 0:
+        return True, "changes 커서가 없습니다"
+    if not scanned_before:
+        return True, "원격 전체 스캔 이력이 없습니다"
+    if not synced_before:
+        return True, "이 프로파일의 첫 sync입니다"
+    if (dirty > DEFAULT_PROBE_BUDGET and total > 0
+            and dirty >= total * _BACKLOG_FULL_RATIO):
+        return True, (f"미완료 레코드 {dirty}건 / 전체 {total}건 — 델타 예산"
+                      f"({DEFAULT_PROBE_BUDGET}건)으로는 부분 처리로 끝납니다")
+    return False, ""
+
+
 # 되돌리기 어려운 동작을 사용자가 표에서 바로 알아보게 한다.
 _KIND_EFFECT = {
     "DOWNLOAD_UPDATE": "로컬 파일을 원격본으로 교체",
@@ -1791,7 +1827,9 @@ def sync(
         do_delete = bool(propagate_deletes or p.propagate_deletes)
 
         with _instance_lock(p.name):
-            mode = "전체" if full else "델타"
+            # 실제 모드는 DB(커서·백로그)를 열어 봐야 정해진다(_decide_full_pass).
+            # 여기서 "델타"라고 단정하면 자동 전환된 실행의 머리말이 거짓말을 한다.
+            mode = "전체" if full else "자동"
             _section(f"sync (profile={p.name}, {mode}{', dry-run' if dry_run else ''})")
             root = p.root_path
             if not os.path.isdir(ext_path(root)):
@@ -1839,10 +1877,23 @@ def sync(
                     collector = RemoteCollector(drive, p.drive_id, prefix, root_id,
                                                 exclude=p.exclude, logger=log)
                     cursor = store.get_cursor()
-                    scanned_before = store.get_meta(META_LAST_FULL_SCAN)
-                    use_full = bool(full or cursor.revision <= 0 or not scanned_before)
+                    # dirty 목록은 전환 판정과 델타 수집이 **같은 값**을 봐야 한다.
+                    # 따로 조회하면 그 사이에 상태가 바뀌어 판정과 실제가 어긋난다.
+                    dirty = store.dirty_file_ids(p.drive_id)
+                    use_full, why_full = _decide_full_pass(
+                        forced=full,
+                        cursor_revision=cursor.revision,
+                        scanned_before=bool(store.get_meta(META_LAST_FULL_SCAN)),
+                        synced_before=bool(store.get_meta(META_LAST_SYNC_AT)),
+                        dirty=len(dirty),
+                        total=store.count_files(p.drive_id),
+                    )
 
                     _section("원격 상태 " + ("전체 순회" if use_full else "변경 수집"))
+                    if why_full:
+                        # 자동 전환은 반드시 사유를 밝힌다 — 전체 순회는 델타보다 오래
+                        # 걸리므로, 이유를 안 적으면 '왜 갑자기 느리지'가 된다.
+                        _out(f"  자동 전환: {why_full}")
                     progress = _Progress("원격 항목", every=100)
                     if use_full:
                         # 순회 중에 일어난 변경을 건너뛰지 않도록 커서를 **먼저** 확보한다.
@@ -1853,7 +1904,9 @@ def sync(
                         view = collector.delta(
                             cursor,
                             known_by_file_id=iter_known_by_file_id(base.values()),
-                            dirty_file_ids=store.dirty_file_ids(p.drive_id),
+                            dirty_file_ids=dirty,
+                            # 예산을 명시해 전환 판정과 같은 수를 쓰게 한다(암묵 기본값 금지).
+                            max_probes=DEFAULT_PROBE_BUDGET,
                             on_item=lambda _rel: progress.tick(),
                         )
                         next_cursor = view.cursor

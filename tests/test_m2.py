@@ -1304,6 +1304,50 @@ def test_dirty_probe_order_rotates_by_last_checked(tmp_path: Path):
     store.close()
 
 
+def test_full_pass_decision_table():
+    """델타로 못 따라잡을 백로그는 자동으로 전체 순회로 간다(2026-08-10 실측 결함).
+
+    init은 원격 목록을 base로만 기록하고(전 항목 pending_download) 커서는 tip까지 밀어
+    둔다. 그래서 첫 sync가 델타로 들어가면 changes 0건 + 개별 조회 예산(500)만큼만
+    처리하고 나머지는 '원격 미확인'으로 남았다 — 15085건 중 500건.
+    """
+    from dooray_sync.cli.main import _decide_full_pass
+    from dooray_sync.core.remote import DEFAULT_PROBE_BUDGET as B
+
+    ok = dict(forced=False, cursor_revision=100, scanned_before=True,
+              synced_before=True, dirty=0, total=10_000)
+
+    # 정상 정상 상태 = 델타. 이 줄이 깨지면 매 실행이 전체 순회가 된다.
+    assert _decide_full_pass(**ok)[0] is False
+
+    # init 직후: 스캔·커서는 있지만 sync는 처음이다 → 전체
+    first = {**ok, "synced_before": False, "dirty": 15_085, "total": 15_085}
+    use_full, why = _decide_full_pass(**first)
+    assert use_full and "첫 sync" in why
+
+    # 두 번째 실행부터는 '첫 sync' 조건이 사라진다 — 백로그 비율이 대신 잡아야 한다.
+    # 사용자 실측값 그대로: 500건 처리 후 남은 14585/15085.
+    use_full, why = _decide_full_pass(**{**ok, "dirty": 14_585, "total": 15_085})
+    assert use_full, "백로그 97%인데 델타로 갔다 — 500건씩 30회 반복된다"
+    assert "14585" in why and str(B) in why
+
+    # 예산 안에 드는 백로그는 이번 델타 패스가 다 소화한다 → 전환할 이유가 없다
+    assert _decide_full_pass(**{**ok, "dirty": B, "total": B})[0] is False
+
+    # 건수만 보면 안 된다: 20만 건 드라이브의 501건은 개별 조회가 훨씬 싸다
+    # (전체 순회 비용은 폴더 수에 비례한다)
+    assert _decide_full_pass(**{**ok, "dirty": B + 1, "total": 200_000})[0] is False
+
+    # 비율만 봐도 안 된다: 작은 드라이브가 매번 전체 순회로 가면 안 된다
+    assert _decide_full_pass(**{**ok, "dirty": 40, "total": 100})[0] is False
+
+    # 커서·스캔 이력이 없으면 종전대로 전체
+    assert _decide_full_pass(**{**ok, "cursor_revision": 0})[0] is True
+    assert _decide_full_pass(**{**ok, "scanned_before": False})[0] is True
+    # --full은 사유를 붙이지 않는다(사용자가 지시한 것이라 설명할 게 없다)
+    assert _decide_full_pass(**{**ok, "forced": True}) == (True, "")
+
+
 # =========================================================== 실제 휴지통 경로
 # 이 절만 send2trash를 **실제로 호출**한다. 나머지 테스트는 삭제 직전 보호에 걸려
 # 성공 경로를 지나가지 않으므로, 여기가 없으면 삭제 기능은 한 번도 실행되지 않은 채 남는다.
