@@ -1880,6 +1880,17 @@ def sync(
                     # dirty 목록은 전환 판정과 델타 수집이 **같은 값**을 봐야 한다.
                     # 따로 조회하면 그 사이에 상태가 바뀌어 판정과 실제가 어긋난다.
                     dirty = store.dirty_file_ids(p.drive_id)
+                    # 로컬에서 사라진 항목은 원격에 **아무 사건도 만들지 않는다** — changes에
+                    # 나올 수가 없어 델타로는 영원히 '원격 상태 미확인'으로 남는다. 그래서
+                    # 삭제 전파를 켜도 사용자가 'sync --full'을 직접 치기 전에는 아무 일도
+                    # 일어나지 않았다(2026-08-10 사용자 보고). 그 항목의 원격 메타만 콕 집어
+                    # 확인한다 — 비용은 사라진 건수에 비례하고 드라이브 크기와 무관하다.
+                    #
+                    # 삭제를 전파할 때만 지목한다. 전파가 꺼져 있으면 판정이 '보고'로 끝나
+                    # base 레코드가 그대로 남으므로, 매 실행 같은 항목을 영원히 재조회하게 된다.
+                    gone_ids = [rec.file_id for key, rec in base.items()
+                                if do_delete and rec.file_id and key not in entries
+                                and rec.sync_status not in ("unsyncable", "ignored")]
                     use_full, why_full = _decide_full_pass(
                         forced=full,
                         cursor_revision=cursor.revision,
@@ -1904,7 +1915,9 @@ def sync(
                         view = collector.delta(
                             cursor,
                             known_by_file_id=iter_known_by_file_id(base.values()),
-                            dirty_file_ids=dirty,
+                            # 사라진 항목을 앞에 둔다 — 예산을 공유하므로, 사용자가 방금 한
+                            # 행동(삭제)의 결과가 먼저 보이는 편이 낫다.
+                            probe_file_ids=[*gone_ids, *dirty],
                             # 예산을 명시해 전환 판정과 같은 수를 쓰게 한다(암묵 기본값 금지).
                             max_probes=DEFAULT_PROBE_BUDGET,
                             on_item=lambda _rel: progress.tick(),

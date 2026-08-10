@@ -271,7 +271,7 @@ class RemoteCollector:
 
     # ------------------------------------------------------------------ 델타
     def delta(self, cursor: Cursor, *, known_by_file_id: dict[str, str] | None = None,
-              dirty_file_ids: Iterable[str] = (), max_items: int = 20_000,
+              probe_file_ids: Iterable[str] = (), max_items: int = 20_000,
               max_probes: int = DEFAULT_PROBE_BUDGET,
               on_item: Callable[[str], None] | None = None) -> RemoteView:
         """changes 소비(B1~B4). is_complete=False.
@@ -279,6 +279,10 @@ class RemoteCollector:
         known_by_file_id: file_id → rel_path. `deleted`는 id만 오므로(실측) 경로를 알려면
         상태 DB의 역참조가 필요하다. 여기에 없는 id의 deleted는 **무시한다**(B3 — 동기화
         범위 밖이거나 애초에 모르던 객체다. 정상 동작이며 오류가 아니다).
+
+        probe_file_ids: changes가 말해 주지 않는데 **이번 패스가 반드시 원격 상태를 알아야
+        하는** 레코드의 file_id. 개별 메타 조회로 관측 목록에 넣는다(_probe_dirty).
+        호출측이 무엇을 넣을지 정한다 — 미완료 레코드(I6)와 로컬에서 사라진 레코드가 그것이다.
         """
         known = dict(known_by_file_id or {})
         view = RemoteView(is_complete=False, cursor=cursor)
@@ -337,7 +341,7 @@ class RemoteCollector:
                 self._relist_subtree(view, entry, seen, bad_dirs, relisted, on_item=on_item)
 
         view.cursor = last
-        self._probe_dirty(view, dirty_file_ids, known, seen, bad_dirs, max_probes)
+        self._probe_dirty(view, probe_file_ids, known, seen, bad_dirs, max_probes)
         return view
 
     # ------------------------------------------------------------------ 내부
@@ -421,16 +425,22 @@ class RemoteCollector:
         view.deleted_keys.add(key)
         view.entries.pop(key, None)
 
-    def _probe_dirty(self, view: RemoteView, dirty_file_ids: Iterable[str],
+    def _probe_dirty(self, view: RemoteView, probe_file_ids: Iterable[str],
                      known: dict[str, str], seen: dict[str, str],
                      bad_dirs: set[str], max_probes: int = DEFAULT_PROBE_BUDGET) -> None:
-        """지난 실행에서 끝내지 못한 항목만 원격 메타를 직접 확인한다(규약_M2 I6).
+        """호출측이 지목한 항목만 원격 메타를 직접 확인한다(규약_M2 I6).
 
-        델타는 '변경이 없으면 아무 말도 하지 않는' 뷰라, 지난 번에 전송이 실패한 항목은
-        영원히 뒤처진다. 그 구멍을 여기서 막는다. 대상은 sync_status != 'synced'인
-        레코드뿐이라 비용이 상태 수에 비례하고 드라이브 크기와 무관하다.
+        델타는 '변경이 없으면 아무 말도 하지 않는' 뷰다. 그래서 changes가 언급하지 않는
+        두 부류는 여기서 따로 확인해 주지 않으면 영원히 관측되지 않는다.
+
+        1. 지난 실행에서 전송이 실패한 항목(sync_status != 'synced')
+        2. **로컬에서 사라진 항목** — 로컬 삭제는 원격에 아무 사건도 만들지 않으므로
+           changes에 나올 수가 없다. 이것을 빠뜨리면 삭제 전파를 켜도 사용자가
+           'sync --full'을 직접 치기 전에는 아무 일도 일어나지 않는다(2026-08-10 사용자 보고).
+
+        어느 쪽이든 비용은 **지목된 건수**에 비례하고 드라이브 크기와 무관하다.
         """
-        for fid in dirty_file_ids:
+        for fid in probe_file_ids:
             if not fid or fid in view.probed_ids:
                 continue
             rel_known = known.get(fid, "")

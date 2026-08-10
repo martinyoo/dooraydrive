@@ -388,6 +388,10 @@ class _FakeApiClient:
 
     def api(self, method, path, **kw):
         params = kw.get("params") or {}
+        if params.get("media") == "meta":
+            n = self.nodes.get(path.rsplit("/", 1)[-1])
+            return {"header": {"isSuccessful": True},
+                    "result": (dict(n, path="/") if n else {})}
         if "/changes" in path:
             after = int(params.get("latestRevision") or 0)
             rest = [c for c in self.changes if int(c["revision"]) > after]
@@ -1302,6 +1306,41 @@ def test_dirty_probe_order_rotates_by_last_checked(tmp_path: Path):
     assert set(first) & set(second) == set(), (
         f"확인 후에도 같은 것이 다시 앞에 온다: {first} → {second}")
     store.close()
+
+
+def test_local_delete_is_observed_without_full(tmp_path: Path):
+    """로컬 삭제는 원격에 아무 사건도 만들지 않는다 — 지목해서 확인하지 않으면
+    델타로는 영원히 '원격 상태 미확인'이고, 삭제 전파를 켜도 아무 일이 없다.
+
+    2026-08-10 사용자 보고: propagate_deletes를 켰는데도 지운 폴더가 계속 보고만 됐다.
+    'sync --full'을 직접 쳐야만 처리됐는데, 그것은 더블클릭 하나로 쓰게 한다는
+    이 도구의 설계 원칙과 어긋난다.
+    """
+    client = _FakeApiClient()
+    client.add("DIR", "지운폴더", "root", type_="folder")
+    # changes는 비어 있다 — 로컬에서 지웠을 뿐이라 원격에는 아무 사건이 없다.
+    collector = RemoteCollector(DriveAPI(client), "d", "", "root")
+    known = {"DIR": "지운폴더"}
+    key = path_key("지운폴더")
+
+    bare = collector.delta(Cursor(revision=0), known_by_file_id=known)
+    assert bare.changes_seen == 0, "이 테스트의 전제(changes 없음)가 깨졌다"
+    assert not bare.observed(key), "changes만으로 관측됐다 — 전제가 깨졌다"
+
+    # 지목하면 관측된다. 이것이 있어야 differ가 case 7(원격 휴지통)까지 갈 수 있다.
+    probed = collector.delta(Cursor(revision=0), known_by_file_id=known,
+                             probe_file_ids=["DIR"])
+    assert probed.observed(key), (
+        "로컬에서 사라진 항목을 지목했는데도 관측되지 않았다 — "
+        "삭제 전파를 켜도 --full 없이는 처리되지 않는다")
+
+    # 관측됐으니 결정표가 실제로 삭제까지 간다.
+    base = {key: B("지운폴더", fid="DIR", is_dir=True)}
+    assert kinds(diff(base=base, local={}, remote=bare,
+                      propagate_deletes=True)[0]) == [(7, KIND_REPORT)], (
+        "관측하지 않은 항목을 지웠다 — 안전 규칙이 깨졌다")
+    assert kinds(diff(base=base, local={}, remote=probed,
+                      propagate_deletes=True)[0]) == [(7, KIND_REMOTE_TRASH)]
 
 
 def test_full_pass_decision_table():
