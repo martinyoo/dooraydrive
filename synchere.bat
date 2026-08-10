@@ -34,8 +34,13 @@ REM  tools\sync_here.py, which prints UTF-8 correctly.
 REM  %~dp0 may contain Korean folder names - that is fine: runtime variable
 REM  expansion is Unicode; only Korean in the FILE TEXT breaks.
 REM
-REM  Program folder lookup order: DSYNC_HOME env var, then C:\dooraydrive
-REM  (colleague PCs), then C:\drive\dev\dooraydrive (dev PC).
+REM  Program folder lookup order:
+REM    1. DSYNC_HOME env var        - set by the installer to wherever it put
+REM                                   the program (any drive)
+REM    2. <drive>:\dooraydrive      - every fixed drive is checked, so an
+REM                                   install on D: is found without DSYNC_HOME
+REM    3. <drive>:\drive\dev\dooraydrive  - dev PC checkout
+REM  The install folder is chooseable, so this file must NOT assume C:.
 REM ===========================================================================
 setlocal EnableExtensions
 set "HERE=%~dp0"
@@ -44,10 +49,12 @@ REM quote and swallows the next argument (measured: --dry-run got glued onto
 REM the path). Strip it - but keep it for drive roots like "C:\".
 if not "%HERE:~-2%"==":\" if "%HERE:~-1%"=="\" set "HERE=%HERE:~0,-1%"
 
+REM `if defined` is evaluated when the line runs, not when the FOR is parsed,
+REM so it works as a first-hit guard without delayed expansion.
 set "REPO="
 if defined DSYNC_HOME if exist "%DSYNC_HOME%\tools\sync_here.py" set "REPO=%DSYNC_HOME%"
-if not defined REPO if exist "C:\dooraydrive\tools\sync_here.py" set "REPO=C:\dooraydrive"
-if not defined REPO if exist "C:\drive\dev\dooraydrive\tools\sync_here.py" set "REPO=C:\drive\dev\dooraydrive"
+for %%D in (C D E F G H I J K L M N O P Q R S T U V W X Y Z) do if not defined REPO if exist "%%D:\dooraydrive\tools\sync_here.py" set "REPO=%%D:\dooraydrive"
+for %%D in (C D E F G H I J K L M N O P Q R S T U V W X Y Z) do if not defined REPO if exist "%%D:\drive\dev\dooraydrive\tools\sync_here.py" set "REPO=%%D:\drive\dev\dooraydrive"
 if not defined REPO goto :no_repo
 
 REM On failure (exit code 1: one or more profiles failed - usually transient
@@ -85,8 +92,11 @@ endlocal & exit /b %RC%
 
 :no_repo
 echo [STOP] dooraydrive program folder not found.
-echo        Checked: DSYNC_HOME, C:\dooraydrive, C:\drive\dev\dooraydrive
-echo        Install the program first, or set DSYNC_HOME to its folder.
+echo        Checked: DSYNC_HOME, then ^<drive^>:\dooraydrive and
+echo        ^<drive^>:\drive\dev\dooraydrive on every drive.
+echo        Install the program first (run the installer), or point
+echo        DSYNC_HOME at the folder that holds tools\sync_here.py:
+echo          setx DSYNC_HOME D:\dooraydrive
 echo.
 pause
 endlocal & exit /b 1

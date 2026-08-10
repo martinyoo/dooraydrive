@@ -4,8 +4,17 @@ REM  Dooray Drive sync - installer (single-file bootstrap)
 REM
 REM  Two modes, auto-detected:
 REM   (A) Bootstrap : this .bat was downloaded on its own.
-REM                   Fetch the repo into C:\dooraydrive, then run setup there.
+REM                   Fetch the repo into the install folder, run setup there.
 REM   (B) In-repo   : this .bat sits next to INSTALL.ps1. Run setup here.
+REM
+REM  Install folder, highest priority first:
+REM    1. first argument      installer.bat D:\dooraydrive
+REM                           (dragging a folder onto this file works too)
+REM    2. DSYNC_TARGET env    set DSYNC_TARGET=D:\dooraydrive
+REM    3. what you type at the prompt
+REM    4. the drive THIS FILE sits on - save it on D: and it installs on D:
+REM       (a copy already installed at C:\dooraydrive wins, so re-runs do not
+REM        fork into a second copy)
 REM
 REM  ENCODING - this file must stay pure ASCII. No Korean, not even in
 REM  comments or in a path that names this file.
@@ -19,14 +28,33 @@ REM  INSTALL.ps1 takes over.
 REM ===========================================================================
 setlocal EnableExtensions
 
-REM Install location. Overridable for PCs that cannot write to the C:\ root:
-REM   set DSYNC_TARGET=D:\dooraydrive
-if not defined DSYNC_TARGET set "DSYNC_TARGET=C:\dooraydrive"
-set "TARGET=%DSYNC_TARGET%"
 set "ZIPURL=https://github.com/martinyoo/dooraydrive/archive/refs/heads/main.zip"
 set "ZIPFILE=%TEMP%\dooraydrive-main.zip"
 set "EXDIR=%TEMP%\dooraydrive-extract"
 
+REM Split argv: the first non-switch argument is the install folder, the rest
+REM go to INSTALL.ps1. Parsed with goto, not with (), because %VAR% inside a
+REM parenthesised block expands before the block runs.
+set "TARGET="
+set "PSARGS="
+:parse
+if "%~1"=="" goto :parsed
+set "ARG=%~1"
+if defined TARGET goto :parse_ps
+if "%ARG:~0,1%"=="-" goto :parse_ps
+if "%ARG:~0,1%"=="/" goto :parse_ps
+set "TARGET=%ARG%"
+shift
+goto :parse
+:parse_ps
+set "PSARGS=%PSARGS% %1"
+shift
+goto :parse
+:parsed
+
+if not defined TARGET if defined DSYNC_TARGET set "TARGET=%DSYNC_TARGET%"
+
+REM Mode B is decided before any prompt - running in place needs no folder.
 if exist "%~dp0INSTALL.ps1" goto :in_repo
 
 REM ===========================================================================
@@ -35,8 +63,43 @@ REM ===========================================================================
 echo.
 echo ============================================================
 echo   Dooray Drive sync - installer
-echo   Fetching the program into %TARGET%
 echo ============================================================
+echo.
+
+REM Default: the drive this file sits on. %~d0 is empty on a UNC path, so
+REM require "X:" shape before trusting it.
+set "DEFTARGET=C:\dooraydrive"
+set "SELFDRIVE=%~d0"
+if "%SELFDRIVE:~1,1%"==":" set "DEFTARGET=%SELFDRIVE%\dooraydrive"
+
+if defined TARGET goto :have_target
+echo   Where should the program go? Press ENTER for the default.
+echo   Default: %DEFTARGET%
+REM Point at an install elsewhere instead of silently defaulting back to it.
+REM Quietly overriding the folder the user chose is the whole complaint here.
+if /I not "%DEFTARGET%"=="C:\dooraydrive" if exist "C:\dooraydrive\INSTALL.ps1" echo   Note: another copy is already installed at C:\dooraydrive
+echo.
+set /p "TARGET=  Folder: "
+REM set /p leaves TARGET undefined on EOF (piped input) - fall back.
+if not defined TARGET set "TARGET=%DEFTARGET%"
+
+:have_target
+REM Paths pasted from Explorer arrive wrapped in quotes.
+set TARGET=%TARGET:"=%
+REM Trailing separator, but keep it for a drive root so "D:\" stays valid.
+if not "%TARGET:~-2%"==":\" if "%TARGET:~-1%"=="\" set "TARGET=%TARGET:~0,-1%"
+REM A bare drive means "the usual folder on that drive", not the drive root -
+REM extracting the repo onto D:\ itself would scatter it across the disk.
+if "%TARGET:~-1%"==":" set "TARGET=%TARGET%\dooraydrive"
+if "%TARGET:~-2%"==":\" set "TARGET=%TARGET%dooraydrive"
+if not defined TARGET goto :bad_target
+if "%TARGET:~1,1%"==":" goto :target_ok
+if "%TARGET:~0,2%"=="\\" goto :target_ok
+goto :bad_target
+
+:target_ok
+echo.
+echo   Fetching the program into %TARGET%
 echo.
 
 if exist "%TARGET%\INSTALL.ps1" goto :have_repo
@@ -62,6 +125,15 @@ mkdir "%EXDIR%"
 tar -xf "%ZIPFILE%" -C "%EXDIR%"
 if errorlevel 1 goto :extract_failed
 if not exist "%EXDIR%\dooraydrive-main\INSTALL.ps1" goto :extract_failed
+
+REM `move SRC DST` puts SRC *inside* DST when DST already exists, which would
+REM bury the program one level deep (%TARGET%\dooraydrive-main\INSTALL.ps1) and
+REM the run step below would then not find INSTALL.ps1. Pre-making the folder
+REM in Explorer is a normal thing to do now that the folder is chooseable, so
+REM handle it: plain rmdir removes it only if empty, which is exactly the test
+REM we want - a non-empty folder is someone else's data and must not be touched.
+if exist "%TARGET%" rmdir "%TARGET%" 2>nul
+if exist "%TARGET%" goto :target_busy
 
 move "%EXDIR%\dooraydrive-main" "%TARGET%" >nul
 if errorlevel 1 goto :move_failed
@@ -95,7 +167,7 @@ REM  refuses to run them.
 REM ===========================================================================
 :run
 cd /d "%RUNDIR%"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%RUNDIR%\INSTALL.ps1" %*
+powershell -NoProfile -ExecutionPolicy Bypass -File "%RUNDIR%\INSTALL.ps1"%PSARGS%
 set "RC=%ERRORLEVEL%"
 echo.
 pause
@@ -136,6 +208,23 @@ goto :bail
 echo.
 echo   [STOP] Could not create %TARGET%.
 echo          A folder with that name may already exist, or permission denied.
+echo          Run this file again and give another folder, for example:
+echo            D:\dooraydrive
+goto :bail
+
+:bad_target
+echo.
+echo   [STOP] Not a usable folder: %TARGET%
+echo          Give a full path on a drive, for example:
+echo            D:\dooraydrive
+goto :bail
+
+:target_busy
+echo.
+echo   [STOP] %TARGET% already exists and is not a dooraydrive install.
+echo          Nothing was changed. Empty that folder, or run this file
+echo          again and give another one, for example:
+echo            D:\dooraydrive2
 goto :bail
 
 :bail

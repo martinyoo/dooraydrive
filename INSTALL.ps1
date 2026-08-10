@@ -280,6 +280,21 @@ if ($Check) {
   exit 0
 }
 
+# ------------------------------------------------------- 프로그램 위치 기록
+# synchere.bat은 프로그램 폴더를 스스로 찾아야 한다(복사본은 어디에나 놓인다).
+# 드라이브를 훑는 폴백이 있지만, 설치 폴더가 <드라이브>:\dooraydrive 형태가
+# 아니면 그 폴백도 못 찾는다. 설치 위치를 사용자가 정하게 만든 이상 여기서
+# 정확한 경로를 남겨 두는 것이 유일하게 확실한 방법이다.
+try {
+  [Environment]::SetEnvironmentVariable('DSYNC_HOME', $PSScriptRoot, 'User')
+  $env:DSYNC_HOME = $PSScriptRoot
+  Ok "프로그램 위치 등록: DSYNC_HOME = $PSScriptRoot"
+  Info "(synchere.bat이 이 폴더를 찾는 데 씁니다. 이미 열려 있는 창에는 다음 로그인 후 적용됩니다)"
+} catch {
+  Warn "DSYNC_HOME 등록 실패(계속 진행): $($_.Exception.Message)"
+  Info "synchere.bat은 각 드라이브의 \dooraydrive 를 훑어 찾습니다"
+}
+
 # --------------------------------------------------------------------- 완료
 Head "설치 완료"
 Write-Host "  동기화는 폴더 단위로 시작합니다. 대상 폴더를 미리 정할 필요가 없습니다:" -ForegroundColor White
