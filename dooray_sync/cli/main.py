@@ -33,6 +33,9 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError, OSError):
         pass  # 파이프·리다이렉트 등 reconfigure 불가 스트림 — 기본 인코딩으로 진행
 
+# truststore 주입(SSL 검사망 대응)은 api/client.py에 있다 — HTTP 단일 관문이라
+# sync_here 등 in-process 호출 경로까지 전부 지나가기 때문이다.
+
 import typer
 
 from .. import __version__

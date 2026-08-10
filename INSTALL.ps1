@@ -1,26 +1,21 @@
 ﻿# Dooray Drive 동기화 — 원클릭 설치. 사용자는 `설치.bat`을 더블클릭한다.
 #
-# 이 스크립트는 SETUP-2ND-PC.ps1을 **대체하지 않는다.** 그 앞뒤의 빈틈만 메운다:
-#   차단 해제(MOTW) · 의존성 설치 · 토큰 등록 · 폴더 위치 입력 · 내려받기
-# 프로파일 생성 자체는 이미 검증된 SETUP-2ND-PC.ps1에 그대로 맡긴다 — 새로 검증해야
-# 할 로직을 늘리지 않기 위해서다.
+# 설치는 **프로그램 준비까지만** 한다: 차단 해제(MOTW) · 의존성 설치 · 토큰 등록 ·
+# 연결 확인. 동기화 폴더는 여기서 정하지 않는다(2026-08-10 사용자 요구: 특정 폴더를
+# 미리 등록하는 방식은 동료 PC에 맞지 않는다). 등록은 사용 시점에 폴더 단위로 한다 —
+# 동기화할 폴더에 synchere.bat를 복사해 더블클릭하면 그 폴더가 등록되고 시작된다
+# (tools/sync_here.py의 유도 사슬 참조).
 #
 # 사용 예
-#   .\INSTALL.ps1                          전체 설치 (물어보며 진행)
-#   .\INSTALL.ps1 -Check                   이 PC가 준비됐는지 점검만 (아무것도 안 바꿈)
-#   .\INSTALL.ps1 -LocalBase "D:\Dooray"   폴더를 미리 지정
-#   .\INSTALL.ps1 -NoPull                  설정까지만, 내려받기는 나중에
+#   .\INSTALL.ps1           전체 설치 (물어보며 진행)
+#   .\INSTALL.ps1 -Check    이 PC가 준비됐는지 점검만 (아무것도 안 바꿈)
 param(
-  [string]$LocalBase = '',
-  [switch]$NoPull,
   [switch]$Check
 )
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
-$NEED_GB   = 11.5    # 원격 실측 11.24GB + 여유
 $MIN_PY    = [version]'3.11'
-$SMALLEST  = 'swstat'  # 가장 작은 프로파일 — 이것부터 받아 경로·권한을 먼저 검증한다
 
 # --------------------------------------------------------------------- 출력
 function Head($t) { Write-Host ""; Write-Host "== $t ==" -ForegroundColor Cyan }
@@ -42,7 +37,7 @@ if ($Check) { Write-Host "  (점검 모드 — 아무것도 바꾸지 않습니�
 Write-Host "  설치 폴더: $PSScriptRoot" -ForegroundColor DarkGray
 
 # --------------------------------------------------------------------- 1) Python
-Head "1/6  Python 확인"
+Head "1/5  Python 확인"
 
 function Invoke-Py {
   <# python을 부르고 {Code, Out, Err}를 돌려준다. 스크립트를 죽이지 않는다.
@@ -148,7 +143,7 @@ if ($py) {
 # --------------------------------------------------------------------- 2) 차단 해제
 # zip으로 받아 탐색기로 풀면 파일에 '인터넷에서 받음' 표시(MOTW)가 붙고, 기본
 # 실행 정책(RemoteSigned)이 .ps1 실행을 거부한다. 여기서 미리 풀어 둔다.
-Head "2/6  파일 차단 해제"
+Head "2/5  파일 차단 해제"
 if ($Check) {
   $blocked = @(Get-ChildItem -Path $PSScriptRoot -Recurse -Include *.ps1, *.cmd, *.bat, *.py -ErrorAction SilentlyContinue |
                Where-Object { Get-Item -LiteralPath $_.FullName -Stream Zone.Identifier -ErrorAction SilentlyContinue })
@@ -164,7 +159,7 @@ if ($Check) {
 }
 
 # --------------------------------------------------------------------- 3) 의존성
-Head "3/6  필요한 구성요소 설치"
+Head "3/5  필요한 구성요소 설치"
 # Python이 없는 채로 여기 오는 것은 점검 모드뿐이다. 그대로 `python`을 부르면
 # 명령을 찾지 못해 ErrorActionPreference='Stop'에 걸려 스크립트가 죽는다.
 if (-not $py) {
@@ -209,7 +204,7 @@ $($verify.Err)
 }
 
 # --------------------------------------------------------------------- 4) 토큰
-Head "4/6  Dooray API 토큰"
+Head "4/5  Dooray API 토큰"
 $tokenState = 'N'
 if ($py -and (Invoke-Py '-c' 'import keyring').Code -eq 0) {
   $tokenState = (Invoke-Py '-c' "import keyring;t=keyring.get_password('dooray-sync','api-token');print('Y' if t else 'N')").Out
@@ -247,26 +242,35 @@ if (-not $py) {
   Ok "등록 완료 (Windows 자격 증명 관리자에 저장 — 설정 파일에는 남지 않습니다)"
 }
 
-# --------------------------------------------------------------------- 5) 폴더
-Head "5/6  파일을 둘 폴더"
-if (-not $LocalBase) {
-  if ($Check) {
-    $LocalBase = 'C:\Dooray'
+# --------------------------------------------------------------------- 5) 연결
+Head "5/5  연결 확인"
+# 실제 API 왕복으로 토큰·프록시·TLS(사내 SSL 검사망 포함)·IP ACL을 한 번에 검증한다.
+# 예전 6단계(폴더 지정·프로파일 생성·내려받기)는 폐지 — 동기화 폴더는 설치 때 정하지
+# 않고, 사용할 폴더에 synchere.bat를 복사해 실행하는 시점에 등록된다(파일 머리 주석).
+$connCmd = "import sys;sys.path.insert(0,'.');from dooray_sync.api.client import DoorayClient;from dooray_sync.api.drive import DriveAPI;from dooray_sync.auth import get_token;from dooray_sync.config import Profile;c=DoorayClient(Profile().base_url,get_token());ds=DriveAPI(c).list_drives();c.close();print(chr(10).join((d.get('name') or '?') for d in ds))"
+if (-not $py) {
+  Warn "Python이 없어 건너뜁니다 — 설치할 때 함께 확인합니다"
+} elseif ($Check -and $tokenState -ne 'Y') {
+  Warn "토큰이 없어 건너뜁니다 — 설치 중 토큰 등록 뒤 확인합니다"
+} else {
+  $r = Invoke-Py '-c' $connCmd
+  if ($r.Code -eq 0 -and $r.Out) {
+    $names = @($r.Out -split "`r?`n" | Where-Object { $_ })
+    Ok ("Dooray 연결 정상 — 접근 가능한 드라이브: {0}" -f ($names -join ', '))
+  } elseif ($r.Code -eq 0) {
+    $msg = "연결은 되지만 접근 가능한 드라이브가 없습니다."
+    if ($Check) { Warn $msg } else { Die $msg @"
+토큰 권한과 IP ACL 설정을 확인하세요 (Dooray 웹 > 개인설정 > API).
+"@ }
   } else {
-    Write-Host "  동기화한 파일을 저장할 폴더입니다. 약 12GB가 필요합니다." -ForegroundColor DarkGray
-    Write-Host "  그냥 엔터를 누르면 C:\Dooray 를 씁니다." -ForegroundColor DarkGray
-    $answer = (Read-Host "  폴더 경로").Trim().Trim('"')
-    if ($answer) { $LocalBase = $answer } else { $LocalBase = 'C:\Dooray' }
+    # 트레이스백의 마지막 줄만 — 원인은 대개 거기에 있다(ConnectError 등).
+    $last = @($r.Err -split "`r?`n" | Where-Object { $_ } | Select-Object -Last 1)
+    $msg = "Dooray에 연결하지 못했습니다: $last"
+    if ($Check) { Warn $msg } else { Die $msg @"
+네트워크(사내 프록시 포함)와 토큰을 확인한 뒤 다시 실행하세요.
+진단:  .\dsync doctor
+"@ }
   }
-}
-if (-not [System.IO.Path]::IsPathRooted($LocalBase)) { Die "폴더는 절대경로여야 합니다: $LocalBase" "예:  D:\Dooray" }
-$qualifier = Split-Path -Qualifier $LocalBase
-if ($qualifier) {
-  $drive = Get-PSDrive ($qualifier -replace ':', '') -ErrorAction SilentlyContinue
-  if (-not $drive) { Die "드라이브를 찾을 수 없습니다: $qualifier" }
-  $freeGB = [math]::Round($drive.Free / 1GB, 1)
-  if ($freeGB -lt $NEED_GB) { Die "$qualifier 여유 공간 ${freeGB}GB — 최소 ${NEED_GB}GB가 필요합니다." "다른 드라이브를 지정하거나 공간을 확보하세요." }
-  Ok "$LocalBase  ($qualifier 여유 ${freeGB}GB)"
 }
 
 if ($Check) {
@@ -276,84 +280,17 @@ if ($Check) {
   exit 0
 }
 
-# --------------------------------------------------------------------- 6) 프로파일
-Head "6/6  동기화 폴더 설정"
-Info "검증된 SETUP-2ND-PC.ps1을 실행합니다. 원격 목록을 읽는 동안 몇 분 걸립니다."
+# --------------------------------------------------------------------- 완료
+Head "설치 완료"
+Write-Host "  동기화는 폴더 단위로 시작합니다. 대상 폴더를 미리 정할 필요가 없습니다:" -ForegroundColor White
 Write-Host ""
-# 별도 프로세스로 부른다 — 그 스크립트의 exit 코드를 이 스크립트와 섞지 않기 위해서다.
-powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'SETUP-2ND-PC.ps1') -LocalBase $LocalBase
-if ($LASTEXITCODE -ne 0) {
-  Die "동기화 폴더 설정에 실패했습니다 (위 메시지 참고)." @"
-토큰이 유효한지, 원격 폴더 이름이 맞는지 확인하세요.
-진단:  .\dsync doctor
-"@
-}
-
-# --------------------------------------------------------------------- 내려받기
-if ($NoPull) {
-  Head "설정 완료"
-  Write-Host "  내려받기는 건너뛰었습니다. 나중에 받으려면:" -ForegroundColor Green
-  Write-Host "    .\SYNC.ps1 -Pull" -ForegroundColor White
-  exit 0
-}
-
-$profiles = @()
-$r = Invoke-Py '-c' "import sys,tomllib;sys.path.insert(0,'.');from dooray_sync.config import config_path;d=tomllib.load(open(config_path(),'rb'));print(chr(10).join(d.get('profile',{}).keys()))"
-if ($r.Code -eq 0 -and $r.Out) { $profiles = @($r.Out -split "`r?`n" | Where-Object { $_ }) }
-if ($profiles.Count -eq 0) { Die "설정에서 프로파일을 읽지 못했습니다." "설정은 끝났을 수 있습니다. '.\SYNC.ps1 -Pull'로 직접 받아 보세요." }
-
-# 작은 것부터 받는다 — 경로·권한 문제는 13개 파일에서 드러나는 편이 낫다.
-$ordered = @($profiles | Where-Object { $_ -eq $SMALLEST }) + @($profiles | Where-Object { $_ -ne $SMALLEST })
-
-Head "파일 받기 (1/2) — 작은 폴더로 먼저 확인"
-$firstProfile = $ordered[0]
-Info "프로파일 '$firstProfile' 을 받습니다."
+Write-Host "    1. 동기화할 폴더에 이 파일을 복사합니다:" -ForegroundColor White
+Write-Host ("         {0}" -f (Join-Path $PSScriptRoot 'synchere.bat')) -ForegroundColor Yellow
+Write-Host "    2. 복사한 synchere.bat 를 더블클릭합니다." -ForegroundColor White
+Write-Host "       → 그 폴더가 동기화 대상으로 등록되고 첫 동기화가 시작됩니다." -ForegroundColor DarkGray
+Write-Host "       → 다른 PC에서 이미 동기화하던 같은 이름의 폴더면 그 내용을 이어받습니다." -ForegroundColor DarkGray
 Write-Host ""
-python -m dooray_sync.cli.main pull -p $firstProfile
-if ($LASTEXITCODE -ne 0) {
-  Die "'$firstProfile' 내려받기에 실패했습니다." @"
-나머지는 받지 않았습니다. 파일 단위로 격리되므로 이미 받은 것은 남아 있습니다.
-다시 시도:  .\dsync pull -p $firstProfile
-진단:      .\dsync doctor -p $firstProfile
-"@
-}
-Ok "'$firstProfile' 완료 — 경로·권한 정상"
-
-$restProfiles = @($ordered | Select-Object -Skip 1)
-if ($restProfiles.Count -eq 0) {
-  Head "설치 완료"
-} else {
-  Head "파일 받기 (2/2) — 나머지 $($restProfiles.Count)개"
-  Write-Host "  나머지: $($restProfiles -join ', ')  (약 11GB, 수십 분 걸릴 수 있습니다)" -ForegroundColor Yellow
-  Write-Host "  중단해도 안전합니다 — 다시 실행하면 받은 것은 건너뛰고 이어받습니다." -ForegroundColor DarkGray
-  $go = Read-Host "  지금 받을까요? (Y/n)"
-  if ($go -match '^[Nn]') {
-    Head "설정 완료 (내려받기는 나중에)"
-    Write-Host "  나중에 받으려면:  .\SYNC.ps1 -Pull" -ForegroundColor White
-    exit 0
-  }
-  $failed = @()
-  foreach ($p in $restProfiles) {
-    Write-Host ""
-    Write-Host "-- $p" -ForegroundColor Cyan
-    python -m dooray_sync.cli.main pull -p $p
-    if ($LASTEXITCODE -ne 0) { $failed += $p }
-  }
-  if ($failed.Count -gt 0) {
-    Head "일부 실패"
-    Write-Host "  실패한 프로파일: $($failed -join ', ')" -ForegroundColor Red
-    Write-Host "  파일 단위로 격리되므로 나머지는 받아졌습니다." -ForegroundColor Yellow
-    Write-Host "  다시 실행하면 실패한 것만 재시도합니다:  .\SYNC.ps1 -Pull" -ForegroundColor Yellow
-    exit 1
-  }
-  Head "설치 완료"
-}
-
-Write-Host "  파일 위치: $LocalBase" -ForegroundColor Green
-Write-Host ""
-Write-Host "  앞으로는 이 순서만 기억하시면 됩니다:" -ForegroundColor White
-Write-Host "    일 시작 전   .\SYNC.ps1 -Pull    (다른 PC에서 올린 최신본 받기)" -ForegroundColor DarkGray
-Write-Host "    일 끝난 뒤   .\SYNC.ps1          (내가 고친 것 올리기)" -ForegroundColor DarkGray
-Write-Host ""
-Write-Host "  두 명령 모두 계획을 먼저 보여주고 확인받은 뒤 실행합니다." -ForegroundColor DarkGray
+Write-Host "  이후에도 같은 파일을 더블클릭하면 그 폴더가 동기화됩니다." -ForegroundColor DarkGray
+Write-Host "  등록 해제: 폴더에서 synchere.bat 를 지우면 다음 실행 때 해제됩니다." -ForegroundColor DarkGray
+Write-Host "  여러 폴더도 같은 방법입니다 — 폴더마다 복사해 실행하면 됩니다." -ForegroundColor DarkGray
 exit 0

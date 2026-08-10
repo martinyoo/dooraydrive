@@ -33,6 +33,20 @@ from typing import Any
 
 import httpx
 
+# SSL 검사(중간 프록시)를 하는 망에서는 서버 인증서 체인에 기관 자체 서명 루트 CA가
+# 끼어든다. 그 CA는 Windows 인증서 저장소에는 있지만 certifi 번들에는 없으므로,
+# httpx 기본 설정으로는 모든 요청이 CERTIFICATE_VERIFY_FAILED → ConnectError로
+# 죽는다(실측 2026-08-10, gov-dooray). truststore를 ssl에 주입하면 OS 저장소를
+# 그대로 쓴다 — 검증을 끄는 것이 아니다. 위치가 여기인 이유: 이 모듈이 모든 HTTP의
+# 단일 관문이라(위 docstring), CLI 진입점만이 아니라 sync_here·discover_roots처럼
+# in-process로 API를 쓰는 경로도 전부 지나간다.
+try:
+    import truststore
+
+    truststore.inject_into_ssl()
+except ImportError:
+    pass  # 미설치 PC는 certifi 기본 동작 — SSL 검사가 없는 망에서는 문제없다
+
 from ..util.paths import ext_path
 
 __all__ = ["DoorayApiError", "DoorayClient"]

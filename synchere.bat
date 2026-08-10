@@ -10,9 +10,15 @@ REM     synchronized in turn (excluded targets are skipped with a reason)
 REM  Every copy of this file is IDENTICAL - just copy it anywhere.
 REM  This file itself is NEVER synchronized (excluded on both sides).
 REM
-REM  This file is also the REGISTRATION SWITCH (2026-08-07):
+REM  This file is also the REGISTRATION SWITCH (2026-08-07, extended 2026-08-10):
 REM   - copy it into an unregistered folder and run it: the folder gets
-REM     registered (derived from a registered sibling) and synced
+REM     registered and synced. The remote path is DERIVED, never guessed:
+REM       1) from a registered sibling folder (same parent), else
+REM       2) from a same-named remote folder carrying this marker file
+REM          (a folder another PC already syncs - content is picked up), else
+REM       3) from a same-named folder at the drive top level, else
+REM       4) a new remote folder with this folder's name is created.
+REM     Works on a fresh PC with no config yet (install must be done first).
 REM   - delete it from a sync folder's root: the folder is unregistered on
 REM     the next run (soft - config keeps the baseline; copy the file back
 REM     and run it to re-register). Manual push/pull/off folders never flip.

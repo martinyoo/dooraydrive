@@ -1,4 +1,8 @@
-﻿# Dooray Sync 최초 설정 — PowerShell에서 이 파일을 실행하세요:  .\SETUP.ps1
+﻿# [폐지 예정 2026-08-10] 이 스크립트는 더 이상 설치 흐름에서 쓰이지 않는다.
+# 하드코딩된 프로파일 목록은 특정 사용자 전용이다. 대체 흐름: 동기화할 폴더에
+# synchere.bat를 복사해 더블클릭하면 그 폴더가 등록되고 시작된다.
+#
+# Dooray Sync 최초 설정 — PowerShell에서 이 파일을 실행하세요:  .\SETUP.ps1
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -400,3 +401,283 @@ def test_set_sync_mode_explicit_set_clears_auto_tag(cfgdir, monkeypatch):
     changed, _failed = sh.reconcile_markers(profiles)
     assert changed == []
     assert cfg.load_config("a").sync_mode == "off"
+
+
+# ---------------------------------------------------------------------------
+# 자동 등록 유도 사슬 (2026-08-10 사용자 요구: 설치 때 폴더를 미리 정하지 않는다)
+# ---------------------------------------------------------------------------
+
+
+class _FakeChild:
+    """iter_children이 돌려주는 RemoteFile의 최소 대역."""
+
+    def __init__(self, name: str, is_dir: bool, cid: str = "") -> None:
+        self.name = name
+        self.is_dir = is_dir
+        self.id = cid or name
+
+
+class _FakeAPI:
+    """개인 드라이브 한 개 + 폴더 트리. children은 {folder_id: [_FakeChild]}.
+
+    listed에 조회한 폴더 id를 기록한다 — 조회 폭발(성능 회귀)을 테스트가 잡는다.
+    """
+
+    def __init__(self, children, drives=None):
+        self._children = children
+        self._drives = drives if drives is not None else [{"id": "d1", "name": "내 드라이브"}]
+        self.listed: list[str] = []
+
+    def list_drives(self, *a, **k):
+        return self._drives
+
+    def find_root_folder(self, drive_id):
+        return "root"
+
+    def iter_children(self, drive_id, fid):
+        self.listed.append(fid)
+        return iter(self._children.get(fid, []))
+
+    def find_child_by_name(self, drive_id, parent_id, name):
+        # 실제 DriveAPI와 같이 iter_children을 거친다 — 조회 비용이 listed에 잡혀야
+        # 성능 회귀 테스트가 의미를 갖는다.
+        for c in self.iter_children(drive_id, parent_id):
+            if c.name == name:
+                return c
+        return None
+
+
+def _patch_drive(monkeypatch, sh, api):
+    """_derive_from_drive가 쓰는 세 진입점(클라이언트·API·토큰)을 대역으로."""
+    import contextlib
+    import types
+
+    @contextlib.contextmanager
+    def _client(_base, _token):
+        yield object()
+
+    monkeypatch.setitem(sys.modules, "dooray_sync.api.client",
+                        types.SimpleNamespace(DoorayClient=_client))
+    monkeypatch.setitem(sys.modules, "dooray_sync.api.drive",
+                        types.SimpleNamespace(DriveAPI=lambda _c: api))
+    monkeypatch.setitem(sys.modules, "dooray_sync.auth",
+                        types.SimpleNamespace(get_token=lambda: "t",
+                                              TokenNotFound=RuntimeError))
+
+
+def _capture_init(monkeypatch, sh):
+    """init 서브프로세스 인자를 잡아 둔다(실제 등록은 하지 않는다)."""
+    import types
+    seen: list[list[str]] = []
+
+    def _call(cmd, **k):
+        seen.append(list(cmd))
+        return 0
+
+    monkeypatch.setattr(sh, "subprocess", types.SimpleNamespace(call=_call))
+    monkeypatch.setattr(sh, "_run_sync", lambda n, r, e: 0)
+    return seen
+
+
+def test_remote_marker_match_binds_without_create(cfgdir, monkeypatch):
+    """다른 PC가 동기화하던 동명 원격 폴더(마커 있음)에 결합 — 새로 만들지 않는다.
+    --create-remote가 붙으면 빈 폴더가 새로 생겨 pull이 0건을 받고 정상처럼 보인다."""
+    sh = _sync_here()
+    api = _FakeAPI({
+        "root": [_FakeChild("WORK", True, "work")],
+        "work": [_FakeChild("보고서", True, "rep")],
+        "rep": [_FakeChild("synchere.bat", False)],
+    })
+    _patch_drive(monkeypatch, sh, api)
+    seen = _capture_init(monkeypatch, sh)
+    target = cfgdir / "보고서"
+    target.mkdir()
+
+    assert sh.main(["--root", str(target)]) == 0
+    assert "--remote-path" in seen[0]
+    assert seen[0][seen[0].index("--remote-path") + 1] == "WORK/보고서"
+    assert "--create-remote" not in seen[0]
+
+
+def test_toplevel_same_name_binds_without_create(cfgdir, monkeypatch):
+    """마커는 없지만 최상위에 동명 폴더가 있으면 결합(웹에서 만들어 둔 폴더)."""
+    sh = _sync_here()
+    api = _FakeAPI({"root": [_FakeChild("근무환경", True, "we")], "we": []})
+    _patch_drive(monkeypatch, sh, api)
+    seen = _capture_init(monkeypatch, sh)
+    target = cfgdir / "근무환경"
+    target.mkdir()
+
+    assert sh.main(["--root", str(target)]) == 0
+    assert seen[0][seen[0].index("--remote-path") + 1] == "근무환경"
+    assert "--create-remote" not in seen[0]
+
+
+def test_no_match_creates_new_remote_folder(cfgdir, monkeypatch):
+    """원격에 같은 이름이 없으면 최상위에 새로 만든다 — 여기서만 --create-remote."""
+    sh = _sync_here()
+    api = _FakeAPI({"root": [_FakeChild("다른폴더", True, "x")], "x": []})
+    _patch_drive(monkeypatch, sh, api)
+    seen = _capture_init(monkeypatch, sh)
+    target = cfgdir / "새폴더"
+    target.mkdir()
+
+    assert sh.main(["--root", str(target)]) == 0
+    assert seen[0][seen[0].index("--remote-path") + 1] == "새폴더"
+    assert "--create-remote" in seen[0]
+
+
+def test_ambiguous_remote_markers_refuse_to_bind(cfgdir, monkeypatch):
+    """동명 마커 폴더가 여럿이면 자동 결합하지 않는다 — 오결합이 조용히 굳는다."""
+    sh = _sync_here()
+    api = _FakeAPI({
+        "root": [_FakeChild("A", True, "a"), _FakeChild("B", True, "b")],
+        "a": [_FakeChild("공유", True, "a1")],
+        "b": [_FakeChild("공유", True, "b1")],
+        "a1": [_FakeChild("synchere.bat", False)],
+        "b1": [_FakeChild("synchere.bat", False)],
+    })
+    _patch_drive(monkeypatch, sh, api)
+    seen = _capture_init(monkeypatch, sh)
+    target = cfgdir / "공유"
+    target.mkdir()
+
+    assert sh.main(["--root", str(target)]) == 2
+    assert seen == []          # 등록이 일어나면 안 된다
+
+
+def test_sibling_derivation_wins_over_drive_lookup(cfgdir, monkeypatch):
+    """형제 유도가 있으면 원격 조회를 하지 않는다 — 이미 확정된 결합이 더 정확하고,
+    수천 폴더 BFS(폴더당 ~0.4초)를 매번 도는 것도 피해야 한다."""
+    sh = _sync_here()
+
+    def _boom(*a, **k):
+        raise AssertionError("형제 유도가 있으면 드라이브 조회를 하면 안 된다")
+
+    monkeypatch.setattr(sh, "_derive_from_drive", _boom)
+    seen = _capture_init(monkeypatch, sh)
+    parent = cfgdir / "parent"
+    parent.mkdir()
+    sib = parent / "sib"
+    sib.mkdir()
+    _mk_profile("sib", sib, "sync")          # remote_path='WORK/sib'
+    target = parent / "새폴더"
+    target.mkdir()
+
+    assert sh.main(["--root", str(target)]) == 0
+    assert seen[0][seen[0].index("--remote-path") + 1] == "WORK/새폴더"
+
+
+def test_repo_copy_refuses_to_register(cfgdir, monkeypatch):
+    """프로그램 폴더 안의 원본을 그 자리에서 실행하면 등록하지 않는다 —
+    등록되면 프로그램 폴더 전체(.git 포함)가 원격으로 올라간다."""
+    sh = _sync_here()
+    seen = _capture_init(monkeypatch, sh)
+    monkeypatch.setattr(sh, "_derive_from_drive",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("조회 금지")))
+
+    assert sh.main(["--root", str(REPO / "tools")]) == 2
+    assert seen == []
+
+
+def test_drive_root_refuses_to_register(cfgdir, monkeypatch):
+    """드라이브 루트(D 드라이브 최상위)는 등록 대상이 아니다 — 디스크 전체가 대상이 된다."""
+    sh = _sync_here()
+    seen = _capture_init(monkeypatch, sh)
+    drive_root = os.path.splitdrive(str(cfgdir))[0] + os.sep
+
+    assert sh.main(["--root", drive_root]) == 2
+    assert seen == []
+
+
+def test_no_config_still_registers(cfgdir, monkeypatch):
+    """설정이 아직 없는 새 PC에서도 첫 등록이 되어야 한다 — 예전 코드는 여기서
+    '설정 파일이 없습니다'로 끝나 새 방식의 첫 폴더를 영원히 등록하지 못했다."""
+    sh = _sync_here()
+    api = _FakeAPI({"root": []})
+    _patch_drive(monkeypatch, sh, api)
+    seen = _capture_init(monkeypatch, sh)
+    target = cfgdir / "첫폴더"
+    target.mkdir()
+
+    assert sh._load_profiles() == {}      # 설정 없음이 전제
+    assert sh.main(["--root", str(target)]) == 0
+    assert seen[0][seen[0].index("--remote-path") + 1] == "첫폴더"
+
+
+def test_dry_run_registers_nothing(cfgdir, monkeypatch):
+    """--dry-run은 등록도 동기화도 하지 않는다(기존 계약 유지)."""
+    sh = _sync_here()
+    api = _FakeAPI({"root": []})
+    _patch_drive(monkeypatch, sh, api)
+    seen = _capture_init(monkeypatch, sh)
+    target = cfgdir / "폴더"
+    target.mkdir()
+
+    assert sh.main(["--root", str(target), "--dry-run"]) == 0
+    assert seen == []
+    assert not (target / "synchere.bat").exists()
+
+
+def test_lookup_does_not_list_every_folder(cfgdir, monkeypatch):
+    """이름이 다른 폴더의 내용은 조회하지 않는다 — 마커를 순회 중에 확인하던
+    예전 구현은 조회 수가 폴더 수와 같아져, 실제 드라이브(깊이 2에 124폴더)에서
+    더블클릭이 5분을 넘겨도 끝나지 않았다(2026-08-10 실측). 성능 회귀 방지."""
+    sh = _sync_here()
+    # 최상위에 폴더 30개. 그중 'WORK' 안에만 목표 이름이 있다.
+    children = {"root": [_FakeChild(f"top{i}", True, f"t{i}") for i in range(30)]}
+    children["root"].append(_FakeChild("WORK", True, "work"))
+    for i in range(30):
+        children[f"t{i}"] = [_FakeChild(f"sub{i}", True, f"s{i}")]
+    children["work"] = [_FakeChild("목표", True, "goal")]
+    children["goal"] = [_FakeChild("synchere.bat", False)]
+    api = _FakeAPI(children)
+    _patch_drive(monkeypatch, sh, api)
+    seen = _capture_init(monkeypatch, sh)
+    target = cfgdir / "목표"
+    target.mkdir()
+
+    assert sh.main(["--root", str(target)]) == 0
+    assert seen[0][seen[0].index("--remote-path") + 1] == "WORK/목표"
+    # 이름 탐색은 깊이 0~1(=root + 최상위 31개)만, 마커 확인은 후보 1개만.
+    assert "s0" not in api.listed          # 깊이 2 폴더는 열지 않는다
+    assert api.listed.count("goal") == 1   # 후보만 한 번 더 조회
+
+
+def test_profile_name_is_ascii_safe_for_korean_folders(cfgdir):
+    """한국어 폴더명에서도 config가 받는 이름이 나와야 한다. isalnum()은 한글에
+    True라 'SW통계'가 그대로 통과했고, init이 ValueError로 죽었다(2026-08-10 실측).
+    한국어 폴더가 기본인 환경이라 이 경로가 사실상 항상 걸린다."""
+    import re
+    sh = _sync_here()
+    ok = re.compile(r"^[A-Za-z0-9._-]+$")   # config._PROFILE_NAME_RE 와 동일
+
+    for leaf in ("SW통계", "근무환경", "spri 2025", "보고서", "..", "___"):
+        name = sh._new_profile_name(leaf, {})
+        assert ok.match(name), f"{leaf!r} -> {name!r} 는 config가 거부한다"
+        cfg._check_profile_name(name)       # 실제 검증기를 그대로 통과해야 한다
+
+    assert sh._new_profile_name("SW통계", {}) == "SW"       # ASCII가 남으면 살린다
+    assert sh._new_profile_name("근무환경", {}) == "folder"  # 남는 게 없으면 폴백
+
+
+def test_profile_name_avoids_existing_profiles(cfgdir):
+    """이름이 겹치면 숫자를 붙인다 — 겹치면 init이 '이미 있습니다'로 거부한다."""
+    sh = _sync_here()
+    _mk_profile("folder", cfgdir / "a", "sync")
+
+    assert sh._new_profile_name("근무환경", sh._load_profiles()) == "folder2"
+
+
+def test_korean_folder_registers_end_to_end(cfgdir, monkeypatch):
+    """한국어 폴더 자동 등록이 init까지 도달하고, 넘기는 -p 값이 유효해야 한다."""
+    sh = _sync_here()
+    api = _FakeAPI({"root": [_FakeChild("근무환경", True, "we")], "we": []})
+    _patch_drive(monkeypatch, sh, api)
+    seen = _capture_init(monkeypatch, sh)
+    target = cfgdir / "근무환경"
+    target.mkdir()
+
+    assert sh.main(["--root", str(target)]) == 0
+    cfg._check_profile_name(seen[0][seen[0].index("-p") + 1])
+    assert seen[0][seen[0].index("--remote-path") + 1] == "근무환경"

@@ -7,9 +7,20 @@
   하향 — 품는 프로파일이 없으면 이 폴더 **아래에 있는** 프로파일 전부를 차례로
          동기화한다(WORK처럼 여러 동기화 폴더를 거느린 상위 폴더용).
 
-둘 다 아니면 등록 방법(dsync init 명령)을 경로까지 채워 안내한다. 프로파일 자동
-생성은 하지 않는다 — 원격 경로를 추정할 수 없다(실제 구성만 봐도 'WORK/spri 2025'와
-최상위 '근무환경'이 공존한다).
+둘 다 아니면 **자동 등록**한다(2026-08-10 사용자 요구: 대상 폴더를 미리 정하지
+않는다 — synchere.bat 실행이 곧 등록이다). 원격 경로는 추정하지 않고 유도한다:
+
+  1) 형제 유도 — 같은 부모 아래 등록된 형제가 있으면 부모의 로컬↔원격 결합에서
+     유도(예: 'WORK/spri 2025'가 등록돼 있으면 그 형제 폴더는 'WORK/…'로 붙는다).
+  2) 원격 마커 발견 — 개인 드라이브를 깊이 제한 BFS로 훑어, 마커(synchere.bat)가
+     있고 이름이 같은 원격 폴더에 결합(다른 PC에서 이미 동기화하던 폴더를 이어받기).
+     동명이 여럿이면 자동 결합하지 않고 목록을 보여 준다(오결합 방지).
+  3) 최상위 동명 폴더 — 마커는 없지만 드라이브 최상위에 이름이 같은 폴더가 있으면
+     결합(웹에서 만들어 둔 폴더를 처음 내려받는 경우).
+  4) 신규 — 드라이브 최상위에 같은 이름의 원격 폴더를 새로 만든다.
+
+프로그램 폴더 안의 원본(템플릿)과 드라이브 루트는 등록을 거부한다. 설정 파일이
+아직 없는 새 PC에서도 그대로 동작한다(첫 등록이 설정을 만든다).
 
 sync 실행 여부는 config.toml의 **sync_mode**가 정한다(단일 정본 — 예전의 하드코딩
 제외 표는 폐지). 'sync'만 실행하고, 나머지(push/pull/off/미설정)는 사유와 대안을
@@ -91,6 +102,7 @@ def _load_profiles() -> dict[str, dict]:
             "note": str(body.get("sync_note") or "").strip(),
             "remote": str(body.get("remote_path") or "").strip(),
             "drive_id": str(body.get("drive_id") or "").strip(),
+            "base_url": str(body.get("base_url") or "").strip(),
         }
     return out
 
@@ -206,6 +218,159 @@ def reconcile_markers(
     return changed, failed
 
 
+# 원격에서 동명 폴더를 찾는 최대 깊이. 실제 동기화 루트는 깊이 1~2다
+# ('WORK/SW통계'=2, '근무환경'=1). 3으로 올리면 안 된다 — 아래 비용 구조 때문이다.
+#
+# 이름은 부모를 조회해야 보이므로, 깊이 N까지 찾으려면 깊이 0~N-1의 폴더를 전부
+# 조회해야 한다. 실측(2026-08-10, 이 계정): 깊이 0=1건, 깊이 1=6건(~6초),
+# 깊이 2=124건(~60~120초). 즉 N=2는 ~7회 호출로 끝나지만 N=3은 분 단위가 되어
+# 더블클릭 한 번의 대기로는 쓸 수 없다(실측: 5분 초과로 중단).
+#
+# 마커 확인은 **이름이 일치하는 후보만** 추가 조회한다. 예전 구현은 순회하는 모든
+# 폴더의 마커를 확인해 조회 수가 폴더 수와 같아졌다 — 그것이 위 폭발의 원인이었다.
+DISCOVER_DEPTH = 2
+
+
+def _new_profile_name(leaf: str, profiles: dict[str, dict]) -> str:
+    """폴더 이름에서 프로파일명 생성. config의 _PROFILE_NAME_RE(`[A-Za-z0-9._-]+`)를
+    반드시 만족해야 한다 — 어기면 init이 ValueError로 죽는다.
+
+    **str.isalnum()을 쓰면 안 된다**: 한글도 True라 'SW통계'가 그대로 통과해
+    등록이 실패했다(2026-08-10 실측). 한국어 폴더명이 기본인 환경이라 이 경로가
+    사실상 항상 걸린다. ASCII만 남기고, 남는 게 없으면 'folder'로 떨어진다.
+    """
+    pname = "".join(
+        c for c in leaf
+        if (c.isascii() and c.isalnum()) or c in "._-"
+    ).strip("._-")
+    if not pname or pname in (".", ".."):
+        pname = "folder"
+    # config_exists도 본다 — _load_profiles는 local_root 없는 항목을 걸러내므로
+    # 그런 항목과 이름이 겹치면 init이 '이미 있습니다'로 거부한다.
+    from dooray_sync.config import config_exists
+    base_name, n = pname, 1
+    while pname in profiles or config_exists(pname):
+        n += 1
+        pname = f"{base_name}{n}"
+    return pname
+
+
+def _derive_from_sibling(abs_root: str, profiles: dict[str, dict]) -> tuple | None:
+    """형제 유도: 같은 부모 아래 등록된 형제가 있으면 (drive_id, 원격경로, create=True).
+
+    부모의 로컬↔원격 결합이 이미 확정돼 있으므로 이 폴더의 원격 경로는 추정이
+    아니라 유도다. 없으면 None(다음 단계인 드라이브 유도로 넘어간다).
+    """
+    parent_key = _norm(os.path.dirname(abs_root))
+    leaf = to_nfc(os.path.basename(abs_root))
+    for _n, info in profiles.items():
+        if info["remote"] and _norm(os.path.dirname(info["root"])) == parent_key:
+            remote_parent = info["remote"].replace("\\", "/").rstrip("/").rpartition("/")[0]
+            candidate = f"{remote_parent}/{leaf}" if remote_parent else leaf
+            return (info["drive_id"], candidate, True)
+    return None
+
+
+def _derive_from_drive(leaf: str, profiles: dict[str, dict]) -> tuple[tuple | None, str, list[str]]:
+    """드라이브 유도: (binding, how, why). binding=(drive_id, 원격경로, create여부).
+
+    binding이 None이면 why에 사용자 안내 줄들이 온다(호출측이 출력 후 2로 종료).
+    토큰 없음·통신 오류는 예외로 던진다 — 호출측이 구분해 처리한다.
+    """
+    from dooray_sync.api.client import DoorayClient
+    from dooray_sync.api.drive import DriveAPI
+    from dooray_sync.auth import get_token
+    from dooray_sync.config import Profile
+    from dooray_sync.util.paths import path_key
+
+    base_url = next(
+        (p["base_url"] for p in profiles.values() if p.get("base_url")),
+        Profile().base_url)
+    want = path_key(leaf)
+
+    with DoorayClient(base_url, get_token()) as client:
+        api = DriveAPI(client)
+        drives = api.list_drives()  # type=private — 개인 드라이브만 자동 결합 대상
+        if not drives:
+            return None, "", [
+                "접근 가능한 개인 드라이브가 없습니다. 토큰 권한과 IP ACL 설정을 확인하세요."]
+        if len(drives) > 1:
+            return None, "", [
+                "개인 드라이브가 여러 개라 자동 결합하지 않습니다. 직접 지정하세요:",
+                '  dsync init -p <이름> --drive-id <드라이브id> '
+                '--local-root "<로컬>" --remote-path "<원격/경로>"']
+        drive_id = str(drives[0].get("id") or "")
+        root_id = api.find_root_folder(drive_id)
+
+        # 1단계: 이름 탐색. 깊이 0~DISCOVER_DEPTH-1의 폴더만 조회한다(자식 이름은
+        # 부모 조회로 얻는다). 여기서 마커를 확인하지 않는 것이 핵심이다 — 확인하면
+        # 조회 수가 폴더 수와 같아져 분 단위가 된다(상수 주석의 실측).
+        print("원격에서 같은 이름의 폴더를 찾는 중입니다...")
+        cand: list[tuple[str, str]] = []   # 이름이 일치하는 (folder_id, 원격경로)
+        root_names: dict[str, str] = {}    # path_key → 실제 표기 (최상위 폴더)
+        queue: list[tuple[str, str, int]] = [(root_id, "", 0)]
+        while queue:
+            fid, path, d = queue.pop(0)
+            for c in api.iter_children(drive_id, fid):
+                if not c.is_dir:
+                    continue
+                cname = to_nfc(c.name)
+                cpath = f"{path}/{cname}" if path else cname
+                if d == 0:
+                    root_names.setdefault(path_key(cname), cname)
+                if path_key(cname) == want:
+                    cand.append((c.id, cpath))
+                if d + 1 < DISCOVER_DEPTH:
+                    queue.append((c.id, cpath, d + 1))
+
+        # 2단계: 후보에서만 마커를 확인한다(보통 0~2건).
+        matches = [
+            cpath for cid, cpath in cand
+            if api.find_child_by_name(drive_id, cid, MARKER) is not None
+        ]
+
+    if len(matches) == 1:
+        return (drive_id, matches[0], False), "원격 마커 발견 — 기존 동기화 폴더를 이어받습니다", []
+    if len(matches) > 1:
+        return None, "", (
+            ["같은 이름의 동기화 폴더(마커)가 원격에 여러 개 있어 자동 결합하지 않습니다:"]
+            + [f"  {m}" for m in matches]
+            + ["원격 경로를 직접 지정하세요:",
+               f'  dsync init -p <이름> --drive-id {drive_id} '
+               '--local-root "<로컬>" --remote-path "<원격/경로>"'])
+    hit = root_names.get(want)
+    if hit is not None:
+        return (drive_id, hit, False), "드라이브 최상위의 같은 이름 폴더에 결합합니다", []
+    return (drive_id, leaf, True), "원격에 같은 이름이 없어 드라이브 최상위에 새로 만듭니다", []
+
+
+def _register_and_sync(abs_root: str, profiles: dict[str, dict],
+                       drive_id: str, remote: str, create: bool,
+                       how: str, extra: list[str]) -> int:
+    """유도된 결합으로 등록(dsync init)하고 이어서 동기화한다. 공통 마무리 경로."""
+    leaf = to_nfc(os.path.basename(abs_root))
+    pname = _new_profile_name(leaf, profiles)
+    print("미등록 폴더입니다 — 동기화 대상으로 등록합니다:")
+    print(f"  로컬  {abs_root}")
+    print(f"  원격  {remote}   (프로파일 '{pname}')")
+    print(f"  근거  {how}")
+    print()
+    if "--dry-run" in extra:
+        print("dry-run — 등록·동기화 없이 계획만 보였습니다. 실행하면 위대로 등록 후 동기화합니다.")
+        return 0
+    cmd = [sys.executable, "-m", "dooray_sync.cli.main", "init", "-p", pname,
+           "--drive-id", drive_id, "--local-root", abs_root, "--remote-path", remote]
+    if create:
+        cmd.append("--create-remote")
+    rc = subprocess.call(cmd, cwd=str(REPO))
+    if rc != 0:
+        print(f"등록 실패(종료코드 {rc}) — 직접 확인이 필요합니다.")
+        return rc
+    _ensure_local_marker(abs_root)
+    print()
+    return _run_sync(pname, abs_root, extra)
+
+
 def _explain_skip(name: str, info: dict) -> None:
     mode, note = info["mode"], info["note"]
     if mode == "off" and note.startswith(AUTO_OFF_PREFIX):
@@ -263,10 +428,8 @@ def main(argv: list[str]) -> int:
         del args[i:i + 2]
     extra = args
 
+    # 설정이 아직 없어도 계속 간다 — 새 PC의 첫 등록이 설정을 만든다(자동 등록 경로).
     profiles = _load_profiles()
-    if not profiles:
-        print("설정 파일이 없습니다. 먼저 설치를 마쳐 주세요 (설치.bat 또는 dsync init).")
-        return 2
 
     # 정합 전용 모드 — SYNC.ps1 -Sync가 실행 전에 호출한다(규칙 구현은 이 파일 한 곳).
     # --emit-modes <파일>: 정합 후의 유효 mode를 "이름\t모드\t재등록예정(0|1)" 줄로
@@ -306,60 +469,44 @@ def main(argv: list[str]) -> int:
         targets = [(n, i) for n, i in profiles.items() if _under(_norm(i["root"]), base)]
 
     if not targets:
-        # 미등록 폴더 — **형제 유도 자동 등록**을 시도한다(2026-08-07 사용자 요구:
-        # "안내가 아니라 그냥 진행"). 같은 부모 폴더 아래 등록된 형제가 있으면
-        # 부모의 로컬↔원격 결합이 이미 확정돼 있으므로, 이 폴더의 원격 경로는
-        # 추정이 아니라 유도다(예: WORK\spri 2025 → WORK/spri 2025 가 등록돼
-        # 있으면 WORK\spri 2024 → WORK/spri 2024). 형제가 없으면 안내로 돌아간다
-        # — 임의 위치 자동 등록은 하지 않는다(오결합·거대 폴더 사고 방지).
+        # 미등록 폴더 — 자동 등록한다(모듈 docstring의 유도 사슬 1→4).
+        # 2026-08-10 사용자 요구: 대상 폴더를 설치 때 미리 정하지 않는다.
+        # synchere.bat를 폴더에 복사해 실행하는 것이 곧 등록이다.
         abs_root = os.path.abspath(str(root))
-        parent_key = _norm(os.path.dirname(abs_root))
         leaf = to_nfc(os.path.basename(abs_root))
-        sibling = None
-        for _n, info in profiles.items():
-            if info["remote"] and _norm(os.path.dirname(info["root"])) == parent_key:
-                sibling = info
-                break
-        if sibling is not None:
-            remote_parent = sibling["remote"].replace("\\", "/").rstrip("/").rpartition("/")[0]
-            candidate = f"{remote_parent}/{leaf}" if remote_parent else leaf
-            pname = "".join(c for c in leaf if c.isalnum() or c in "._-") or "folder"
-            n = 1
-            base_name = pname
-            while pname in profiles:
-                n += 1
-                pname = f"{base_name}{n}"
-            print("미등록 폴더입니다 — 형제 프로파일의 결합에서 유도해 자동 등록합니다:")
-            print(f"  로컬  {abs_root}")
-            print(f"  원격  {candidate}   (프로파일 '{pname}')")
-            print()
-            if "--dry-run" in extra:
-                print("dry-run — 등록·동기화 없이 계획만 보였습니다. 실행하면 위대로 등록 후 동기화합니다.")
-                return 0
-            rc = subprocess.call(
-                [sys.executable, "-m", "dooray_sync.cli.main", "init", "-p", pname,
-                 "--drive-id", sibling["drive_id"], "--local-root", abs_root,
-                 "--remote-path", candidate, "--create-remote"],
-                cwd=str(REPO))
-            if rc != 0:
-                print(f"등록 실패(종료코드 {rc}) — 직접 확인이 필요합니다.")
-                return rc
-            _ensure_local_marker(abs_root)
-            print()
-            rc = _run_sync(pname, abs_root, extra)
-            return rc
-        print(f"이 폴더는 동기화 대상이 아닙니다: {root}")
-        print()
-        print("등록된 동기화 폴더:")
-        for name, info in profiles.items():
-            mark = "" if info["mode"] == "sync" else f"  (sync 제외: {info['mode']})"
-            print(f"  {name:<10} {info['root']}{mark}")
-        print()
-        print("이 폴더를 새로 등록하려면 (원격 경로는 Dooray 웹에서 확인해 지정):")
-        print(f'  dsync init -p <프로파일이름> --local-root "{abs_root}" '
-              '--remote-path "<원격/경로>"')
-        print("  (원격에 아직 없는 폴더면 --create-remote 를 붙입니다)")
-        return 2
+
+        # 등록 금지 두 곳 — 프로그램 폴더 안의 원본(템플릿)과 드라이브 루트.
+        # 원본을 그 자리에서 더블클릭하면 프로그램 폴더 전체가 원격에 올라간다.
+        if _under(_norm(abs_root), _norm(REPO)):
+            print("이 synchere.bat 는 프로그램 폴더 안의 원본입니다 — 여기는 동기화 대상이 아닙니다.")
+            print("동기화할 폴더에 이 파일을 복사한 뒤, 복사본을 더블클릭하세요.")
+            return 2
+        if not leaf or os.path.dirname(abs_root) == abs_root:
+            print(f"드라이브 최상위({abs_root})는 동기화 대상으로 등록할 수 없습니다.")
+            print("하위 폴더에 synchere.bat 를 복사해 실행하세요.")
+            return 2
+
+        binding = _derive_from_sibling(abs_root, profiles)
+        how = "형제 프로파일의 결합에서 유도"
+        if binding is None:
+            try:
+                binding, how, why = _derive_from_drive(leaf, profiles)
+            except Exception as exc:  # noqa: BLE001 — 토큰 없음·통신 오류 모두 여기로
+                from dooray_sync.auth import TokenNotFound
+                if isinstance(exc, TokenNotFound):
+                    print("API 토큰이 등록되어 있지 않습니다. 먼저 설치(설치.bat)를 마쳐 주세요.")
+                    print(str(exc))
+                    return 2
+                print(f"원격 조회 실패 — {type(exc).__name__}: {exc}")
+                print("네트워크 문제일 수 있습니다. 잠시 후 다시 실행해 보세요.")
+                return 1
+            if binding is None:
+                print(f"이 폴더를 자동 등록하지 못했습니다: {abs_root}")
+                for line in why:
+                    print(line)
+                return 2
+        drive_id, remote, create = binding
+        return _register_and_sync(abs_root, profiles, drive_id, remote, create, how, extra)
 
     # 실행 전 마커↔config 정합 — 마커가 지워진 대상은 여기서 해제되어 빠지고,
     # 마커를 되살린(태그 off) 대상은 sync로 복귀해 아래 runnable에 잡힌다.
