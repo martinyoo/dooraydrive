@@ -86,6 +86,28 @@ if not defined TARGET set "TARGET=%DEFTARGET%"
 :have_target
 REM Paths pasted from Explorer arrive wrapped in quotes.
 set TARGET=%TARGET:"=%
+REM Spaces around what was typed. `set /p` keeps them verbatim, and a stray one
+REM used to break things quietly: "c: " skipped the bare-drive rule below (the
+REM last character is a space, not ":") yet still passed validation, so the
+REM install went to a folder literally named "c: ". Trim before anything reads
+REM the ends of the string. A real folder name cannot end in a space anyway.
+REM The `if not defined` guards are load-bearing, not decoration. Trimming an
+REM all-spaces entry empties TARGET, and %TARGET:~0,1% on an UNDEFINED variable
+REM does not yield "" - cmd re-pairs the surrounding %% signs and executes the
+REM wreckage. Measured: typing three spaces produced the literal command
+REM   if "~0,1TARGET:~1trim_lead
+REM and the installer died with "The syntax of the command is incorrect".
+REM So: never let a substring expansion see an undefined TARGET.
+:trim_lead
+if not defined TARGET goto :trim_done
+if "%TARGET:~0,1%"==" " set "TARGET=%TARGET:~1%"& goto :trim_lead
+:trim_trail
+if not defined TARGET goto :trim_done
+if "%TARGET:~-1%"==" " set "TARGET=%TARGET:~0,-1%"& goto :trim_trail
+:trim_done
+REM Nothing left means the same thing pressing ENTER means. Rejecting it would
+REM print "[STOP] Not a usable folder:" with a blank path, which explains nothing.
+if not defined TARGET set "TARGET=%DEFTARGET%"
 REM Trailing separator, but keep it for a drive root so "D:\" stays valid.
 if not "%TARGET:~-2%"==":\" if "%TARGET:~-1%"=="\" set "TARGET=%TARGET:~0,-1%"
 REM A bare drive means "the usual folder on that drive", not the drive root -
