@@ -60,7 +60,14 @@ class Profile:
     # 업무 폴더 하나만 지정하는 편이 현실적이다.
     remote_path: str = ""
     poll_interval_sec: int = 120
-    propagate_deletes: bool = False   # 초기 기본값: 삭제 미전파(안전)
+    # 2026-08-11 기본값 전환(False → True). 근거: 원격은 휴지통 이동만 하고 영구삭제
+    # API가 코드에 없으며, 로컬은 send2trash가 실패하면 os.remove로 대체하지 않고
+    # '실패'로 보고한다(util/trash.py). 되돌릴 수 없는 삭제 경로가 없다.
+    # 안전은 이 값이 아니라 세 장치가 지킨다 — 관측하지 않은 항목은 삭제 판정 금지,
+    # 대량 삭제 게이트(50건/20%), 그리고 휴지통 자체.
+    # **기존 config에는 영향이 없다** — save_config이 이 키를 항상 기록하므로 이미
+    # 설치된 PC는 자기 값을 유지한다. 이 기본값은 새로 만드는 프로파일에만 적용된다.
+    propagate_deletes: bool = True
     upload_conflict_copy: bool = True
     max_file_mb_warn: int = 400
     bulk_delete_abort_count: int = 50

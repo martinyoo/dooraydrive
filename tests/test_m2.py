@@ -939,6 +939,32 @@ def test_sync_follows_renamed_remote_root_and_updates_config(tmp_path: Path):
             os.environ.pop(k, None)
 
 
+def test_propagate_deletes_default_is_on_but_existing_config_wins(tmp_path: Path):
+    """삭제 전파 기본값은 `true`(2026-08-11 전환)이되, **이미 있는 설정을 뒤집지 않는다.**
+
+    save_config가 이 키를 항상 기록하므로 설치된 PC는 자기 값을 유지한다. 이 구분이
+    깨지면 기본값을 바꾼 릴리스가 동료 PC의 삭제 정책을 조용히 뒤집는다.
+    """
+    from dooray_sync import config as cfg
+
+    assert cfg.Profile(name="x").propagate_deletes is True, "기본값이 되돌아갔다"
+
+    os.environ[cfg.ENV_CONFIG_DIR] = str(tmp_path / "cfg")
+    try:
+        # 껐던 프로파일은 껐던 대로 남아야 한다
+        cfg.save_config(cfg.Profile(name="off", drive_id="d", local_root=r"C:\x",
+                                    propagate_deletes=False))
+        assert cfg.load_config("off").propagate_deletes is False, (
+            "저장된 false를 기본값이 덮어썼다 — 동료 PC의 정책이 조용히 뒤집힌다")
+
+        # 키가 없는 구버전 config만 새 기본값을 받는다
+        Path(cfg.config_path()).write_text(
+            "[profile.old]\ndrive_id = 'd'\nlocal_root = 'C:\\x'\n", encoding="utf-8")
+        assert cfg.load_config("old").propagate_deletes is True
+    finally:
+        os.environ.pop(cfg.ENV_CONFIG_DIR, None)
+
+
 def test_sync_mode_roundtrip_defaults_and_validation(tmp_path: Path):
     """sync 정책의 정본은 config다: 왕복 보존 / 구버전 config(키 없음)는 기본값
     'sync' / 잘못된 값은 load에서 ValueError(fail-closed)."""
