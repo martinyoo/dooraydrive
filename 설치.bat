@@ -124,7 +124,17 @@ echo.
 echo   Fetching the program into %TARGET%
 echo.
 
-if exist "%TARGET%\INSTALL.ps1" goto :have_repo
+REM  Refresh an existing install instead of silently reusing it. Reusing was the
+REM  old behaviour and it stranded PCs: a first run that failed left a stale copy
+REM  behind, and every later double-click ran that same stale copy - no download
+REM  lines, no explanation, no way for the user to tell. (measured 2026-08-07)
+REM  Program files live here; settings and state live in %APPDATA% and
+REM  %LOCALAPPDATA%, so replacing this folder loses nothing.
+set "REFRESH="
+if exist "%TARGET%\INSTALL.ps1" set "REFRESH=1"
+if defined REFRESH echo   Existing copy found at %TARGET%
+if defined REFRESH echo   Refreshing it to the latest version ...
+if defined REFRESH echo.
 
 REM curl and tar ship with Windows 10 1803+ / 1809+
 where curl >nul 2>&1
@@ -154,19 +164,37 @@ REM the run step below would then not find INSTALL.ps1. Pre-making the folder
 REM in Explorer is a normal thing to do now that the folder is chooseable, so
 REM handle it: plain rmdir removes it only if empty, which is exactly the test
 REM we want - a non-empty folder is someone else's data and must not be touched.
+REM  Swap, do not delete-then-move. Deleting the old copy first would leave the
+REM  PC with no installer at all if the move then failed (permission, file in
+REM  use). Rename it aside, move the new one in, and only then drop the old one.
+REM  This runs after the download and extract have already succeeded, so a
+REM  network failure never touches the copy that is already working.
+if defined REFRESH rmdir /S /Q "%TARGET%.old" >nul 2>&1
+if defined REFRESH move "%TARGET%" "%TARGET%.old" >nul 2>&1
+if defined REFRESH if exist "%TARGET%" goto :refresh_locked
+
 if exist "%TARGET%" rmdir "%TARGET%" 2>nul
 if exist "%TARGET%" goto :target_busy
 
 move "%EXDIR%\dooraydrive-main" "%TARGET%" >nul
 if errorlevel 1 goto :move_failed
+if defined REFRESH rmdir /S /Q "%TARGET%.old" >nul 2>&1
 rmdir /S /Q "%EXDIR%" >nul 2>&1
 del "%ZIPFILE%" >nul 2>&1
 echo       Done - %TARGET%
 goto :fetched
 
-:have_repo
-echo   Already present at %TARGET% - reusing it.
-echo   Delete that folder first if you want a clean copy.
+REM  Could not fetch, but a working copy is already here - use it rather than
+REM  dying, and say plainly that it may be out of date. Only reachable when
+REM  REFRESH is set, so this never runs on a first install.
+:stale_fallback
+echo.
+echo   WARNING: could not fetch the latest version.
+echo   Falling back to the existing copy at %TARGET% - it may be OUT OF DATE.
+echo   If the install fails again, delete that folder and retry on a
+echo   working internet connection.
+del "%ZIPFILE%" >nul 2>&1
+rmdir /S /Q "%EXDIR%" >nul 2>&1
 
 :fetched
 echo.
@@ -176,9 +204,22 @@ goto :run
 REM ===========================================================================
 REM  (B) In-repo
 REM ===========================================================================
+REM  This branch used to run in complete silence, so someone who double-clicked
+REM  a copy sitting inside the program folder saw the installer start with no
+REM  download lines and had no way to tell that nothing had been updated.
+REM  Say which copy is being run. (measured 2026-08-07)
 :in_repo
 set "RUNDIR=%~dp0"
 if "%RUNDIR:~-1%"=="\" set "RUNDIR=%RUNDIR:~0,-1%"
+echo.
+echo ============================================================
+echo   Dooray Drive sync - installer
+echo   Running the copy next to this file:
+echo   %RUNDIR%
+echo   (nothing is downloaded in this mode - to update, run the
+echo    downloaded installer instead)
+echo ============================================================
+echo.
 
 REM ===========================================================================
 REM  Run the real installer. INSTALL.ps1 holds all Korean text, all prompts
@@ -199,6 +240,7 @@ REM ===========================================================================
 REM  Errors (English - INSTALL.ps1 has not been reached yet)
 REM ===========================================================================
 :no_tools
+if defined REFRESH goto :stale_fallback
 echo.
 echo   [STOP] curl or tar is missing (needs Windows 10 1809 or later).
 echo          Download and unzip this into %TARGET% manually,
@@ -207,12 +249,14 @@ echo          %ZIPURL%
 goto :bail
 
 :dl_failed
+if defined REFRESH goto :stale_fallback
 echo.
 echo   [STOP] Download failed. Check your internet / corporate proxy,
 echo          then run this file again.
 goto :bail
 
 :size_failed
+if defined REFRESH goto :stale_fallback
 echo.
 echo   [STOP] Downloaded file is too small (%ZIPSIZE% bytes).
 echo          A proxy login page was probably returned instead.
@@ -221,12 +265,17 @@ del "%ZIPFILE%" >nul 2>&1
 goto :bail
 
 :extract_failed
+if defined REFRESH goto :stale_fallback
 echo.
 echo   [STOP] Extraction failed. Check free space in %TEMP%
 echo          and whether antivirus blocked it.
 goto :bail
 
 :move_failed
+REM  Put the old copy back. The refresh renamed it aside a moment ago, so
+REM  without this the PC is left with no installer at all.
+if defined REFRESH if not exist "%TARGET%" move "%TARGET%.old" "%TARGET%" >nul 2>&1
+if defined REFRESH if exist "%TARGET%\INSTALL.ps1" goto :stale_fallback
 echo.
 echo   [STOP] Could not create %TARGET%.
 echo          A folder with that name may already exist, or permission denied.
@@ -247,6 +296,14 @@ echo   [STOP] %TARGET% already exists and is not a dooraydrive install.
 echo          Nothing was changed. Empty that folder, or run this file
 echo          again and give another one, for example:
 echo            D:\dooraydrive2
+goto :bail
+
+:refresh_locked
+echo.
+echo   [STOP] Could not replace the existing copy at %TARGET%.
+echo          A file in that folder is probably open - close any window or
+echo          program using it (Explorer, an editor, a running sync) and
+echo          run this file again. Nothing was changed.
 goto :bail
 
 :bail
