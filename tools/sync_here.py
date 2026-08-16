@@ -55,8 +55,14 @@ import sys
 import tomllib
 from pathlib import Path
 
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+# pythonw(콘솔 없음)에서는 sys.stdout/stderr가 None이라 맨 reconfigure가
+# AttributeError로 죽는다(2026-08-16 실측) — cli/main.py:30-34와 같은 방어.
+# 무인 러너(M3)가 이 모듈의 함수를 임포트해 쓰므로 임포트 시점에 죽으면 안 된다.
+for _stream_name in ("stdout", "stderr"):
+    try:
+        getattr(sys, _stream_name).reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
@@ -67,6 +73,22 @@ MARKER = "synchere.bat"
 # 자동 해제를 사람의 결정(off)과 구분하는 태그 — sync_note 맨 앞에 붙는다.
 # 재등록 자동 복귀는 이 태그가 있는 off에만 적용된다.
 AUTO_OFF_PREFIX = "[synchere-off]"
+
+
+def _child_env() -> dict[str, str]:
+    """자식(python -m dooray_sync...)이 패키지를 찾도록 PYTHONPATH로 주입한다.
+
+    예전에는 cwd=REPO로 해결했는데, Windows에서 어떤 프로세스의 CWD인 폴더는
+    rename이 안 된다 — 설치.bat 갱신 모드(fca71ed)의 폴더 통째 교체가 동기화
+    도중이면 :refresh_locked로 막힌다(2026-08-16 실측, 설계 I-A8). CWD는 부모
+    것(사용자 폴더)을 물려받고 모듈 탐색만 환경변수로 해결한다. 자식 명령의
+    -P(sys.path[0] 미주입, Python 3.11+)와 짝이다 — 사용자 데이터 폴더에 우연히
+    있는 동명 모듈이 CWD 경유로 끼어드는 것을 막는다.
+    """
+    env = dict(os.environ)
+    prev = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = str(REPO) + (os.pathsep + prev if prev else "")
+    return env
 
 
 def _norm(p: str | Path) -> str:
@@ -358,14 +380,16 @@ def _register_and_sync(abs_root: str, profiles: dict[str, dict],
     if "--dry-run" in extra:
         print("dry-run — 등록·동기화 없이 계획만 보였습니다. 실행하면 위대로 등록 후 동기화합니다.")
         return 0
-    cmd = [sys.executable, "-m", "dooray_sync.cli.main", "init", "-p", pname,
+    cmd = [sys.executable, "-P", "-m", "dooray_sync.cli.main", "init", "-p", pname,
            "--drive-id", drive_id, "--local-root", abs_root, "--remote-path", remote]
     if create:
         cmd.append("--create-remote")
-    rc = subprocess.call(cmd, cwd=str(REPO))
+    rc = subprocess.call(cmd, env=_child_env())
     if rc != 0:
         print(f"등록 실패(종료코드 {rc}) — 직접 확인이 필요합니다.")
-        return rc
+        # 자식의 원시 종료코드를 그대로 흘리면 배치(synchere.bat:72-83)의 재시도
+        # 규약(1=키 입력 재시도, 2=안내 후 종료)이 깨진다 — 2만 보존, 나머지는 1.
+        return 2 if rc == 2 else 1
     _ensure_local_marker(abs_root)
     print()
     return _run_sync(pname, abs_root, extra)
@@ -409,11 +433,32 @@ def _ensure_marker(name: str) -> None:
 
 def _run_sync(name: str, root: str, extra: list[str]) -> int:
     print(f"[프로파일 '{name}'] {root}")
-    cmd = [sys.executable, "-m", "dooray_sync.cli.main", "sync", "-p", name, *extra]
-    rc = subprocess.call(cmd, cwd=str(REPO))
+    cmd = [sys.executable, "-P", "-m", "dooray_sync.cli.main", "sync", "-p", name, *extra]
+    rc = subprocess.call(cmd, env=_child_env())
     if rc == 0 and "--dry-run" not in extra:
         _ensure_marker(name)
     return rc
+
+
+def resolve_targets(root: str | Path, profiles: dict[str, dict]) -> list[tuple[str, dict]]:
+    """--root가 가리키는 실행 대상 집합(모듈 docstring의 상향/하향 규칙).
+
+    상향(품는 프로파일)이 있으면 최장 접두 일치 하나, 없으면 이 폴더 아래의
+    프로파일 전부. 하향 집합은 **이름순으로 정렬**한다 — dict 순서(=config 파일
+    순서)에 실행 순서를 묶으면 문서상 마지막 프로파일이 상습적으로 늦고, M3
+    러너와 사람 경로가 같은 입력에서 다른 순서로 돌게 된다(설계 §2.6).
+    """
+    base = _norm(root)
+    containing: tuple[str, dict] | None = None
+    for name, info in profiles.items():
+        lkey = _norm(info["root"])
+        if _under(base, lkey):
+            if containing is None or len(lkey) > len(_norm(containing[1]["root"])):
+                containing = (name, info)
+    if containing is not None:
+        return [containing]
+    down = [(n, i) for n, i in profiles.items() if _under(_norm(i["root"]), base)]
+    return sorted(down, key=lambda t: t[0].casefold())
 
 
 def main(argv: list[str]) -> int:
@@ -427,6 +472,14 @@ def main(argv: list[str]) -> int:
         root = args[i + 1]
         del args[i:i + 2]
     extra = args
+
+    # --auto <동사>는 이 파일(단일 접점)이 소비한다 — 자식(dsync sync)까지 흘러가면
+    # typer가 알 수 없는 인자로 exit 2를 내고, 그 전에 원시 종료코드가 배치의 30회
+    # 재시도 루프를 깨울 수 있다(설계 §2.5). 디스패치는 M3 단위 7에서 붙는다.
+    # 종료코드 계약(§2.4): --auto 경로는 0 또는 2만 — 1(재시도 유도)을 절대 내지 않는다.
+    if "--auto" in extra or "--auto-run" in extra:
+        print("--auto 는 아직 준비 중입니다(M3 자동 동기화). 지금은 인자 없이 실행하세요.")
+        return 2
 
     # 설정이 아직 없어도 계속 간다 — 새 PC의 첫 등록이 설정을 만든다(자동 등록 경로).
     profiles = _load_profiles()
@@ -454,19 +507,7 @@ def main(argv: list[str]) -> int:
         # 기록 실패 = config와 실제 마커 상태가 어긋난 채 남음 → 호출측이 중단하도록 1.
         return 1 if failed else 0
 
-    base = _norm(root)
-
-    containing: tuple[str, dict] | None = None
-    for name, info in profiles.items():
-        lkey = _norm(info["root"])
-        if _under(base, lkey):
-            if containing is None or len(lkey) > len(_norm(containing[1]["root"])):
-                containing = (name, info)
-
-    if containing is not None:
-        targets = [containing]
-    else:
-        targets = [(n, i) for n, i in profiles.items() if _under(_norm(i["root"]), base)]
+    targets = resolve_targets(root, profiles)
 
     if not targets:
         # 미등록 폴더 — 자동 등록한다(모듈 docstring의 유도 사슬 1→4).
