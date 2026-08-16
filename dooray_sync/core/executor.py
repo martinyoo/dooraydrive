@@ -294,6 +294,22 @@ class SyncExecutor:
                 rel, "원격 파일이 우리가 아는 것과 다릅니다(id 불일치) — 덮어쓰지 않았습니다"))
             self._mark(rel, False, "pending_upload", "원격 파일 id 불일치 — 대조 필요")
             return
+        # 두 PC 경합 방어(M3, 설계 §6.3): 기준선보다 원격 version이 이미 앞서 있으면
+        # 원격 관측(계획 수립)과 지금 사이에 **다른 PC가 새 버전을 올린 것**이다.
+        # 그대로 올리면 그쪽 내용이 조용히 묻힌다 — 이 도구의 최악 실패 유형이다
+        # (버전 이력에는 남지만 아무도 모른다). 덮지 않고 다음 패스로 넘기면 differ가
+        # '양쪽 변경'으로 판정해 충돌 보존한다. version이 안 실린 색인 항목(0)은
+        # 판정 불가라 통과시킨다 — id 가드와 아래 409 경로가 나머지를 막는다.
+        if (found is not None and rec is not None
+                and isinstance(rec.remote_version, int)
+                and found.version and found.version > rec.remote_version):
+            self.report.protected.append((
+                rel, f"원격 버전이 기준선보다 앞서 있습니다"
+                     f"(v{found.version} > v{rec.remote_version}) — 다른 PC가 올린 "
+                     f"것으로 보고 덮어쓰지 않았습니다(다음 동기화에서 내용 대조)"))
+            self._mark(rel, False, "pending_upload",
+                       f"원격 버전 선행(v{found.version}>v{rec.remote_version}) — 대조 필요")
+            return
 
         jid = self.journal.begin(action.kind, rel, file_id=(found.id if found else known_id),
                                  detail={"size": entry_local.size, "md5": entry_local.md5})
@@ -323,6 +339,18 @@ class SyncExecutor:
                     self.report.protected.append((
                         rel, "409 재조회 결과 원격 파일이 우리가 아는 것과 다릅니다 — 덮어쓰지 않았습니다"))
                     self._mark(rel, False, "pending_upload", "409 후 id 불일치 — 대조 필요")
+                    return
+                # 409 재조회 경로에도 같은 버전 선행 가드(위 주석 참조) — 색인이
+                # 비어 found=None으로 들어온 경합이 정확히 이 경로로 온다.
+                if (rec is not None and isinstance(rec.remote_version, int)
+                        and existing.version and existing.version > rec.remote_version):
+                    self.journal.fail(jid, "원격 버전 선행 — 덮어쓰지 않음")
+                    self.report.protected.append((
+                        rel, f"원격 버전이 기준선보다 앞서 있습니다"
+                             f"(v{existing.version} > v{rec.remote_version}) — 다른 PC가 "
+                             f"올린 것으로 보고 덮어쓰지 않았습니다"))
+                    self._mark(rel, False, "pending_upload",
+                               f"원격 버전 선행(v{existing.version}>v{rec.remote_version}) — 대조 필요")
                     return
                 res = self.drive.upload_version(self.drive_id, existing.id, name, src)
                 rf = RemoteFile(id=str(res.get("id") or existing.id), name=existing.name,
