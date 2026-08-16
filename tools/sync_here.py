@@ -176,6 +176,9 @@ def _set_mode(name: str, mode: str, note: str) -> bool:
 
 def reconcile_markers(
     profiles: dict[str, dict], *, dry_run: bool = False,
+    state_override: dict[str, bool | None] | None = None,
+    allow_reenable: bool = True,
+    max_disable: int | None = None,
 ) -> tuple[list[tuple[str, str]], list[str]]:
     """로컬 마커 ↔ config 정합. 마커 = 등록/해제 스위치(모듈 docstring의 규칙).
 
@@ -183,12 +186,42 @@ def reconcile_markers(
     이름 목록)을 돌려준다. dry_run이면 config를 쓰지 않는다 — 해제는 미리보기의
     일관성을 위해 메모리에서만 제외하고, 재등록은 하지 않는다(기록 없이 sync를
     돌리면 CLI 게이트가 off를 보고 거부하므로 예고만 한다).
+
+    무인 실행(M3)이 쓰는 세 파라미터 — 사람 경로의 기본값은 오늘과 동일하다:
+
+    state_override
+        마커 관측 결과를 호출측이 주입한다. 러너는 여기에 히스테리시스를 건다 —
+        연속 부재가 누적되기 전에는 None(판단 불가)을 넣어, GDrive 재동기화나
+        백신 격리로 마커가 잠깐 사라진 것을 '해제 의도'로 읽지 않게 한다.
+        판단 불가는 이미 config를 안 바꾸는 경로라 새 상태를 만들지 않는다.
+    allow_reenable
+        False면 자동 재등록을 하지 않는다(I-A3: 무인은 sync_mode를 올리지 않는다).
+        재등록 분기는 직전 모드를 복원하지 않고 **무조건 sync로** 보내므로, 사람이
+        내린 결정을 무인 실행이 뒤집는 경로가 된다.
+    max_disable
+        한 번에 해제할 수 있는 최대 개수(I-A4). 2개 이상이 동시에 조건을 만족하면
+        개별 삭제가 아니라 **공통 상위(드라이브 마운트)의 장애**로 보는 편이 맞다 —
+        GDrive 장애 한 번에 프로파일 정책이 통째로 소실되는 것을 막는다.
     """
     today = datetime.date.today().isoformat()
     changed: list[tuple[str, str]] = []
     failed: list[str] = []
+    overrides = state_override or {}
+
+    if max_disable is not None:
+        pending = [
+            n for n, i in profiles.items()
+            if i["mode"] == "sync"
+            and (overrides[n] if n in overrides else _marker_state(i["root"])) is False
+        ]
+        if len(pending) > max_disable:
+            print(f"[보류] 마커가 사라진 프로파일이 {len(pending)}개입니다 "
+                  f"({', '.join(pending)}) — 개별 해제가 아니라 상위 폴더·드라이브 "
+                  f"장애일 가능성이 큽니다. 아무것도 해제하지 않습니다.")
+            return changed, failed
+
     for name, info in profiles.items():
-        state = _marker_state(info["root"])
+        state = overrides[name] if name in overrides else _marker_state(info["root"])
         if state is None:
             # 판단 불가(권한·잠금)는 해제 근거가 아니다 — config를 바꾸지 않는다.
             print(f"[보류] '{name}' — 마커 상태를 확인할 수 없습니다(권한·잠금). "
@@ -222,6 +255,13 @@ def reconcile_markers(
             info["_reconcile_reported"] = True
         elif (info["mode"] == "off" and state
               and info["note"].startswith(AUTO_OFF_PREFIX)):
+            if not allow_reenable:
+                # 무인 경로(I-A3). 재등록은 사람이 그 폴더에서 실행할 때만 —
+                # 이 분기는 직전 모드를 복원하지 않고 무조건 sync로 보낸다.
+                print(f"[대기] '{name}' — {MARKER}가 돌아왔지만 자동 재등록은 하지 "
+                      f"않습니다. 그 폴더에서 synchere.bat을 한 번 실행하세요.")
+                info["_reconcile_reported"] = True
+                continue
             if dry_run:
                 print(f"[재등록 예정] '{name}' — {MARKER} 재확인 (dry-run: 기록 안 함. "
                       f"--dry-run 없이 실행하면 sync가 재개됩니다)")

@@ -57,7 +57,12 @@ def _parse(iso: str) -> _dt.datetime | None:
 
 
 def auto_profiles(only: list[str] | None = None) -> list[str]:
-    """auto_sync=true인 프로파일 이름(이름순). only가 있으면 그 교집합.
+    """자동 대상 프로파일 이름(이름순). only가 있으면 그 교집합.
+
+    조건은 `auto_sync=true` **AND** `sync_mode='sync'`다 — 두 값은 직교한다
+    (sync_mode='무엇을 하는가', auto_sync='누가 시키는가'). 마커 정합이
+    sync_mode를 껐는데 여기서 안 보면 매 틱 자식이 exit 2로 거부당하고,
+    그 거부가 로그를 채워 진짜 신호를 묻는다.
 
     이름순 고정이 중요하다 — config 파일 순서에 실행 순서를 묶으면 문서상
     마지막 프로파일이 상습적으로 굶는다.
@@ -71,6 +76,7 @@ def auto_profiles(only: list[str] | None = None) -> list[str]:
     names = [
         name for name, body in (doc.get("profile") or {}).items()
         if isinstance(body, dict) and body.get("auto_sync") is True
+        and str(body.get("sync_mode") or "sync").strip().lower() == "sync"
     ]
     if only is not None:
         allow = {n.casefold() for n in only}
@@ -220,9 +226,64 @@ def _apply_backoff(st: AutoState, name: str, kind: str) -> None:
         st.set_backoff_mult(name, max(1.0, cur * 0.75))
 
 
+# 마커가 연속 몇 틱 안 보여야 '지웠다'로 볼 것인가. 2분 틱 기준 3회 = 6분.
+# GDrive 재동기화·백신 격리·복원 진행 중에는 파일이 잠깐 사라진다 — 그 순간을
+# 해제 의도로 읽으면 프로파일 정책이 사고로 꺼진다.
+MARKER_ABSENT_TICKS = 3
+# 한 틱에 자동 해제할 수 있는 최대 개수(I-A4). 넘으면 공통 마운트 장애로 본다.
+MAX_AUTO_DISABLE = 1
+
+
+def _reconcile(st: AutoState, names: list[str]) -> None:
+    """마커 정합 — 무인 규칙으로 부른다(히스테리시스 + 재등록 금지 + 해제 상한).
+
+    규칙 구현은 tools/sync_here.py 한 곳뿐이다. 러너가 자기 판정을 새로 만들면
+    사람 경로와 무인 경로의 해석이 갈라진다.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_sync_here_for_runner", _REPO / "tools" / "sync_here.py")
+    if spec is None or spec.loader is None:
+        return
+    sh = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sh)
+
+    profiles = {n: i for n, i in sh._load_profiles().items() if n in names}
+    if not profiles:
+        return
+
+    override: dict[str, bool | None] = {}
+    for name, info in profiles.items():
+        observed = sh._marker_state(info["root"])
+        if observed is None:
+            override[name] = None
+            st.bump_marker_absent(name, absent=False)
+            continue
+        streak = st.bump_marker_absent(name, absent=not observed)
+        if observed:
+            override[name] = True
+        else:
+            # 아직 확신이 안 서면 '판단 불가'로 넘긴다 — config를 안 바꾸는
+            # 기존 경로에 그대로 사상되므로 새 상태를 만들지 않는다.
+            override[name] = False if streak >= MARKER_ABSENT_TICKS else None
+            if override[name] is None:
+                print(f"    (마커 없음 {streak}/{MARKER_ABSENT_TICKS}회 — "
+                      f"{name}: 아직 해제하지 않습니다)")
+
+    sh.reconcile_markers(profiles, state_override=override,
+                         allow_reenable=False, max_disable=MAX_AUTO_DISABLE)
+
+
 def _tick(st: AutoState, extra: list[str], only: list[str] | None) -> None:
     """틱 1회. 예외를 밖으로 내보내지 않는다 — 루프가 죽으면 안 된다."""
     auto = load_auto()
+    names = auto_profiles(only)
+    try:
+        _reconcile(st, names)
+    except Exception as exc:      # noqa: BLE001 — 정합 실패가 동기화를 막지 않는다
+        print(f"    (마커 정합 건너뜀 — {type(exc).__name__}: {exc})")
+    # 정합이 sync_mode를 껐을 수 있다 — 대상 목록을 다시 읽는다.
     names = auto_profiles(only)
     now = _now()
     last_sync = {n: _last_sync_at(n) for n in names}

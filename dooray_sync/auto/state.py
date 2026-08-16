@@ -94,6 +94,19 @@ class AutoState:
         entry = profiles.setdefault(name, {})
         return entry if isinstance(entry, dict) else profiles.setdefault(name, {})
 
+    def marker_absent_streak(self, name: str) -> int:
+        """마커가 연속으로 안 보인 틱 수. 히스테리시스의 상태 전부."""
+        try:
+            return int(self.profile(name).get("marker_absent", 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def bump_marker_absent(self, name: str, absent: bool) -> int:
+        entry = self.profile(name)
+        streak = self.marker_absent_streak(name) + 1 if absent else 0
+        entry["marker_absent"] = streak
+        return streak
+
     def backoff_mult(self, name: str) -> float:
         try:
             return max(1.0, min(8.0, float(self.profile(name).get("backoff_mult", 1.0))))
