@@ -155,6 +155,15 @@ class DoorayClient:
             "replenish": None,
             "requested": None,
         }
+        # M3 관측 카운터 — 기존 감속·재시도 로직은 그대로 두고 횟수만 센다.
+        # sync --report-json이 싣고, 무인 러너가 이 값으로 다음 주기를 조정한다
+        # (429 관측 → 주기 x2, 깨끗한 실행 → x0.75 감쇠. 설계 §3.5 적응형 승수).
+        self.counters: dict[str, int] = {
+            "rate_limited": 0,     # 429 응답 수신 횟수
+            "pace_events": 0,      # 선제 감속(_pace)이 실제로 쉰 횟수
+            "http_retries": 0,     # 429/5xx로 재시도한 횟수
+            "network_retries": 0,  # 전송 계층 오류로 재시도한 횟수
+        }
 
     # ------------------------------------------------------------------
     # 수명 주기
@@ -187,6 +196,8 @@ class DoorayClient:
 
     def _capture_rate_limit(self, resp: httpx.Response, label: str) -> None:
         h = resp.headers
+        if resp.status_code == 429:
+            self.counters["rate_limited"] += 1
         self.last_rate_limit = {
             "remaining": h.get("X-RateLimit-Remaining"),
             "burst": h.get("X-RateLimit-Burst-Capacity"),
@@ -215,6 +226,7 @@ class DoorayClient:
         if rate <= 0:
             rate = 5
         delay = 1.0 / rate
+        self.counters["pace_events"] += 1
         self.logger.debug("rate-limit 선제 감속: remaining=%s → %.2fs 대기", remaining, delay)
         time.sleep(delay)
 
@@ -328,6 +340,7 @@ class DoorayClient:
                         path=url,
                     ) from exc
                 delay = _BACKOFF_BASE * (attempt + 1)
+                self.counters["network_retries"] += 1
                 self.logger.warning(
                     "%s 네트워크 오류(%s) → %.1fs 대기 후 재시도 (%d/%d)",
                     lbl, type(exc).__name__, delay, attempt + 1, attempts,
@@ -337,6 +350,7 @@ class DoorayClient:
             self._capture_rate_limit(resp, lbl)
             if attempt < attempts and self._should_retry(resp.status_code):
                 delay = self._retry_delay(resp, attempt)
+                self.counters["http_retries"] += 1
                 self.logger.warning(
                     "%s HTTP %s → %.1fs 대기 후 재시도 (%d/%d)",
                     lbl, resp.status_code, delay, attempt + 1, attempts,

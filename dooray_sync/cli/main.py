@@ -10,11 +10,13 @@
 M1 범위이므로 삭제 전파는 어느 방향으로도 하지 않는다(구현계획서 §5 M1).
 로컬에서 사라진 항목·원격에서 사라진 항목은 **보고만** 한다.
 
-종료코드: 0 성공 / 1 실패 / 2 설정·토큰 문제 / 3 잠금 실패.
+종료코드: 0 성공 / 1 실패 / 2 설정·토큰 문제 / 3 잠금 실패 / 4 무인 보류(사람 확인 필요).
 """
 from __future__ import annotations
 
 import dataclasses
+import datetime as _dt
+import json
 import os
 import sqlite3
 import sys
@@ -56,10 +58,10 @@ from ..config import (
     save_config,
     state_dir,
 )
-from ..core.differ import DiffStats, diff
+from ..core.differ import KIND_CONFLICT, DiffStats, diff
 from ..core.executor import SyncExecutor
 from ..core.journal import SyncJournal, recover
-from ..core.planner import ACTION_LABEL, BulkDeleteAbort
+from ..core.planner import ACTION_LABEL, TRASH_KINDS, BulkDeleteAbort
 from ..core.planner import plan as build_plan
 from ..core.remote import (
     DEFAULT_PROBE_BUDGET,
@@ -100,6 +102,9 @@ EXIT_OK = 0
 EXIT_FAIL = 1
 EXIT_CONFIG = 2
 EXIT_LOCK = 3
+# 무인 실행(--unattended)이 위험 신호를 보고 **아무것도 하지 않고** 물러난 상태.
+# 실패(1)와 구분한다 — 재시도로 풀리지 않고 사람의 확인이 필요하다(설계 §5.3).
+EXIT_HELD = 4
 
 # status가 읽는 meta 키. db.py의 META_LAST_FULL_SCAN(init/전체 재조정)과 별개로
 # 명령별 마지막 수행 시각을 남긴다.
@@ -653,6 +658,25 @@ def init(
 # ---------------------------------------------------------------------------
 
 
+def _profile_health(store: Store, p: Profile) -> dict:
+    """상태 DB 요약의 단일 리더 — status 화면과 --auto status(M3)가 같은 값을
+    본다(설계 §4.3). SYNC.ps1이 last_sync를 따로 sqlite로 읽는 중복도 이것으로
+    수렴시킨다. 읽기 전용."""
+    cursor = store.get_cursor()
+    return {
+        "total": store.count_files(p.drive_id),
+        "counts": dict(store.count_by_status(p.drive_id)),
+        "cursor_revision": cursor.revision,
+        "cursor_file_id": cursor.file_id or "",
+        "last_full_scan": store.get_meta(META_LAST_FULL_SCAN) or "",
+        "last_sync": store.get_meta(META_LAST_SYNC_AT) or "",
+        "last_push": store.get_meta(META_LAST_PUSH_AT) or "",
+        "last_pull": store.get_meta(META_LAST_PULL_AT) or "",
+        "conflicts": list(store.iter_unresolved()),
+        "incomplete": list(store.iter_incomplete()),
+    }
+
+
 @app.command()
 def status(
     profile: str = typer.Option("default", "--profile", "-p", help="프로파일 이름"),
@@ -667,6 +691,7 @@ def status(
         _section(f"설정 (profile={p.name})")
         root_exists = os.path.isdir(ext_path(p.root_path)) if p.local_root else False
         _kv([
+            ("버전", f"dsync {__version__}"),
             ("base_url", p.base_url),
             ("drive_id", p.drive_id or "(미설정)"),
             ("local_root", f"{p.local_root or '(미설정)'}" + ("" if root_exists else "  ← 없음")),
@@ -690,14 +715,13 @@ def status(
             raise typer.Exit(EXIT_CONFIG)
 
         with Store(db) as store:
-            counts = store.count_by_status(p.drive_id)
-            total = store.count_files(p.drive_id)
-            cursor = store.get_cursor()
-            conflicts = list(store.iter_unresolved())
-            incomplete = list(store.iter_incomplete())
+            h = _profile_health(store, p)
+            counts = h["counts"]
+            conflicts = h["conflicts"]
+            incomplete = h["incomplete"]
 
             _section("상태 DB")
-            _kv([("경로", db), ("총 항목", f"{total}건")])
+            _kv([("경로", db), ("총 항목", f"{h['total']}건")])
             if counts:
                 _out("")
                 _table(
@@ -707,10 +731,12 @@ def status(
 
             _section("동기화 지점")
             _kv([
-                ("changes 커서", f"revision={cursor.revision} file_id={cursor.file_id or '-'}"),
-                ("마지막 전체 스캔", store.get_meta(META_LAST_FULL_SCAN) or "-"),
-                ("마지막 push", store.get_meta(META_LAST_PUSH_AT) or "-"),
-                ("마지막 pull", store.get_meta(META_LAST_PULL_AT) or "-"),
+                ("changes 커서",
+                 f"revision={h['cursor_revision']} file_id={h['cursor_file_id'] or '-'}"),
+                ("마지막 전체 스캔", h["last_full_scan"] or "-"),
+                ("마지막 sync", h["last_sync"] or "-"),
+                ("마지막 push", h["last_push"] or "-"),
+                ("마지막 pull", h["last_pull"] or "-"),
                 ("미해결 충돌", f"{len(conflicts)}건"),
                 ("미완료 저널", f"{len(incomplete)}건"),
             ])
@@ -1788,6 +1814,186 @@ def _print_sync_plan(pl, stats: DiffStats, view) -> None:
     _list_reasons("미룸", pl.deferred)
 
 
+# 로컬에서 사라진 항목의 원격 확인(전파 꺼짐/보류 시) 상한과 재확인 유예.
+# 전파되지 않는 '사라짐'은 해소되지 않고 남으므로, 유예 없이 매 실행 전량을
+# 조회하면 사라진 건수만큼 탐침 예산을 상시 점유한다(WRITING 실측 143건).
+GONE_PROBE_BUDGET = 100
+GONE_RECHECK_H = 24.0
+
+
+def _opt_int(value, default: int) -> int:
+    """typer 옵션의 함수 직접 호출(테스트) 방어 — OptionInfo면 기본값."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else default
+
+
+def _gone_probe_ids(base: dict, entries: dict, *, do_delete: bool) -> list[str]:
+    """로컬에서 사라진 항목 중 이번에 원격 메타를 확인할 file_id 목록.
+
+    사라진 항목은 원격에 아무 사건도 만들지 않아 changes에 나올 수 없다 — 지목
+    확인 없이는 델타가 영원히 '원격 상태 미확인'으로 남긴다(2026-08-10 사용자 보고).
+
+    - 삭제를 전파하는 실행: **전량** 확인(예전 동작 유지). 삭제가 base 레코드를
+      정리하므로 반복 비용이 없다.
+    - 전파하지 않는 실행(M3 단위 4): 예전에는 아예 확인하지 않았는데, 그러면
+      differ의 '삭제 전파가 꺼져 있어 보고만 합니다' 경로가 델타에서 도달 불가라
+      '삭제 대기 N건'이 구조적으로 0을 가리킨다(거짓 안전 신호, 설계 §0.6).
+      확인하되 (1) 상한 GONE_PROBE_BUDGET, (2) 오래 확인 안 된 것부터,
+      (3) GONE_RECHECK_H 안에 확인한 것은 건너뛴다 — 확인 시각은 touch_seen이
+      last_synced_at에 남기므로 회전이 실제로 돈다.
+    """
+    cand = [rec for key, rec in base.items()
+            if rec.file_id and key not in entries
+            and rec.sync_status not in ("unsyncable", "ignored")]
+    if do_delete:
+        return [rec.file_id for rec in cand]
+    cutoff = (_dt.datetime.now() - _dt.timedelta(hours=GONE_RECHECK_H)) \
+        .isoformat(timespec="seconds")
+    fresh = [rec for rec in cand if (rec.last_synced_at or "") < cutoff]
+    fresh.sort(key=lambda r: (r.last_synced_at or "", r.file_id or ""))
+    return [rec.file_id for rec in fresh[:GONE_PROBE_BUDGET]]
+
+
+def _delete_bytes(action, base: dict) -> int:
+    """삭제 1건이 없앨 바이트 수. 폴더는 base의 하위 항목을 합산한다 —
+    delete_count가 Action 수 대신 실제 항목 수를 세는 것과 같은 이유다."""
+    def _size(rec) -> int:
+        return int(rec.local_size or rec.remote_size or 0)
+    if not action.is_dir:
+        rec = base.get(action.key)
+        return _size(rec) if rec is not None else 0
+    prefix = action.key + "/"
+    return sum(_size(rec) for key, rec in base.items()
+               if key == action.key or key.startswith(prefix))
+
+
+def _apply_delete_grade(pl, base: dict, *, max_deletes: int, max_mb: int,
+                        base_count: int) -> tuple[int, str]:
+    """무인 삭제 등급화(설계 I-A1'). 임계 초과면 **삭제 동작만** 계획에서 떼어
+    deferred로 옮긴다 — 업로드/다운로드는 그대로 진행한다. 삭제는 되돌리기
+    어렵고(휴지통이라도 사람이 모르는 새 비워지면 같다) 사람이 더블클릭할 때
+    확인하는 편이 싸다. 기존 대량 삭제 게이트(bulk_delete_abort_*)는 바깥
+    그물로 그대로 둔다(이중 방어 — 이 함수는 그 안쪽에서만 동작한다).
+
+    허용 조건(전부 만족): 건수 <= max_deletes AND 용량 <= max_mb AND
+    건수 <= 기준선의 1%. 임계값 확정은 5영업일 관측 후(단위 14) — 초기값은
+    러너가 보수적으로 넘긴다.
+
+    반환: (보류한 삭제 항목 수, 사유). 임계 이하면 (0, "").
+    """
+    dels = [a for a in pl.actions if a.kind in TRASH_KINDS]
+    if not dels or pl.delete_count <= 0:
+        return 0, ""
+    over: list[str] = []
+    if max_deletes >= 0 and pl.delete_count > max_deletes:
+        over.append(f"건수 {pl.delete_count} > {max_deletes}")
+    if max_mb >= 0:
+        total = sum(_delete_bytes(a, base) for a in dels)
+        if total > max_mb * 1024 * 1024:
+            over.append(f"용량 {_human_size(total)} > {max_mb}MB")
+    ratio_cap = max(1, base_count // 100)
+    if base_count and pl.delete_count > ratio_cap:
+        over.append(f"기준선 {base_count}건의 1%({ratio_cap}건) 초과")
+    if not over:
+        return 0, ""
+    deferred = pl.delete_count
+    reason = "무인 삭제 임계 초과(" + ", ".join(over) + ") - 사람 실행에서 처리"
+    for a in dels:
+        pl.deferred.append((a.rel_path, reason))
+    pl.actions = [a for a in pl.actions if a.kind not in TRASH_KINDS]
+    for k in TRASH_KINDS:
+        pl.counts.pop(k, None)
+    pl.delete_count = 0
+    pl.delete_actions = 0
+    return deferred, reason
+
+
+def _demote_conflicts(pl) -> int:
+    """--unattended: 충돌 결정을 실행 전에 보류로 강등한다(설계 I-A2).
+
+    충돌 실행의 첫 동작이 로컬 원본 개명(executor.conflict의 os.replace)인데,
+    로컬 루트가 Google Drive 미러 폴더라 다른 복제기가 방금 쓴 파일이 충돌로
+    보이는 일이 구조적으로 잦다(설계 §0.2). 원본 개명은 사람이 보는 실행에서만
+    한다 — 같은 계획을 사람이 더블클릭하면 그대로 실행된다. md5 대조 예산
+    초과분이 충돌로 처리되는 경로(md5_probe_skipped)도 이 강등이 함께 막는다.
+    """
+    confs = [a for a in pl.actions if a.kind == KIND_CONFLICT]
+    if not confs:
+        return 0
+    for a in confs:
+        pl.deferred.append(
+            (a.rel_path, "무인 실행은 충돌을 처리하지 않음 - 사람 실행에서 처리"))
+        pl.bytes_down -= (a.decision.size if a.decision else 0) or 0
+    pl.actions = [a for a in pl.actions if a.kind != KIND_CONFLICT]
+    pl.counts.pop(KIND_CONFLICT, None)
+    return len(confs)
+
+
+def _write_report_json(path: str, data: dict) -> None:
+    """실행 보고 JSON(임시파일 → 원자 교체, UTF-8). 실패해도 sync 결과를 바꾸지
+    않는다 — 보고는 관측 수단이지 실행의 일부가 아니다(무인 러너가 소비, 설계 §4.2).
+    """
+    # 테스트가 sync()를 함수로 직접 부르면 typer 기본값이 OptionInfo 객체로
+    # 들어온다(다른 옵션은 전부 명시 전달하는 관례지만 새 옵션까지 강제할 수 없다).
+    # 문자열 경로가 아니면 '보고 요청 없음'이다.
+    if not path or not isinstance(path, str):
+        return
+    try:
+        dest = Path(path)
+        if str(dest.parent):
+            os.makedirs(ext_path(dest.parent), exist_ok=True)
+        tmp = dest.with_name(f"{dest.name}.{uuid.uuid4().hex}.tmp")
+        with open(ext_path(tmp), "w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1, default=str)
+        os.replace(ext_path(tmp), ext_path(dest))
+    except OSError as exc:
+        _err(f"  (보고 JSON 기록 실패 — 무시함: {type(exc).__name__}: {exc})")
+
+
+def _plan_report(pl, stats: DiffStats, view, *, cursor_before: int,
+                 cursor_after: int, use_full: bool, why_full: str) -> dict:
+    """계획·관측 수치의 JSON 표현. 화면(_print_sync_plan)과 **같은 객체**
+    (pl/stats/view)에서 나오므로 두 표면의 숫자가 어긋날 수 없다(설계 I-A10)."""
+    return {
+        "mode": "full" if use_full else "delta",
+        "why_full": why_full or "",
+        "remote": {
+            "observed": len(view.entries),
+            "deleted": len(view.deleted_keys),
+            "moved_out": len(view.moved_out_keys),
+            "changes_seen": view.changes_seen,
+            "subtrees_relisted": view.subtrees_relisted,
+            "truncated": bool(getattr(view, "truncated", False)),
+        },
+        "cursor": {
+            "before": cursor_before,
+            "after": cursor_after,
+            # 델타가 changes를 봤는데 커서가 안 전진하면 R11 계열(커서 갇힘) 신호다.
+            # 판정은 러너가 연속 관측으로 한다 — 1회는 정상일 수 있다(설계 §4.4).
+            "advanced": cursor_after > cursor_before,
+        },
+        "plan": {
+            "actions": len(pl.actions),
+            "counts": dict(pl.counts),
+            "delete_count": pl.delete_count,
+            "delete_actions": pl.delete_actions,
+            "bytes_up": pl.bytes_up,
+            "bytes_down": pl.bytes_down,
+            "reports": len(pl.reports),
+            "protected": len(pl.protected),
+            "unsyncable": len(pl.unsyncable),
+            "deferred": len(pl.deferred),
+        },
+        "stats": {
+            "unchanged": stats.unchanged,
+            "skipped_unobserved": stats.skipped_unobserved,
+            "skipped_local_unobserved": stats.skipped_local_unobserved,
+            "md5_probes": stats.md5_probes,
+            "md5_probe_skipped": stats.md5_probe_skipped,
+            "hash_failures": len(stats.hash_failures),
+        },
+    }
+
+
 @app.command()
 def sync(
     profile: str = typer.Option("default", "--profile", "-p", help="프로파일 이름"),
@@ -1800,10 +2006,23 @@ def sync(
         False, "--allow-bulk-delete", help="대량 삭제 임계를 넘겨 진행"),
     md5_probes: int = typer.Option(
         200, "--md5-probes", help="내용 대조를 위해 원격을 받아 볼 최대 건수"),
+    report_json: str = typer.Option(
+        "", "--report-json",
+        help="실행 보고를 JSON으로 기록할 경로(무인 러너용 — 화면과 같은 계산에서 나옴)"),
+    max_auto_deletes: int = typer.Option(
+        -1, "--max-auto-deletes",
+        help="무인 실행용: 삭제 계획이 이 건수를 넘으면 삭제만 보류(-1=게이트 없음)"),
+    max_auto_delete_mb: int = typer.Option(
+        -1, "--max-auto-delete-mb",
+        help="무인 실행용: 삭제 계획 총량 상한 MB(-1=용량 기준 없음)"),
+    unattended: bool = typer.Option(
+        False, "--unattended",
+        help="무인 실행 강등 모드: 충돌 미처리(보류), 로컬 붕괴 시 통째 보류(exit 4)"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="상세 로그"),
 ) -> None:
     """양방향 동기화 1회. 충돌은 양쪽을 모두 보존하고, 삭제는 어떤 충돌에서도 이기지 않습니다."""
     log = setup_logging(profile, verbose=verbose)
+    unattended = unattended is True   # 함수 직접 호출(테스트)의 OptionInfo 방어
     with _error_boundary(log):
         p = _load_profile(profile)
         _require_ready(p)
@@ -1825,6 +2044,20 @@ def sync(
                 + f"  전환하려면: python tools\\set_sync_mode.py {p.name} sync",
                 EXIT_CONFIG)
         do_delete = bool(propagate_deletes or p.propagate_deletes)
+
+        # 무인 러너가 소비하는 실행 보고(--report-json). 화면과 같은 객체에서
+        # 값을 뽑으므로(I-A10) 여기 담기는 숫자는 화면과 다를 수 없다.
+        # 비정상 종료(크래시)면 파일이 안 남는다 — 러너는 '보고 없음 + rc!=0'을
+        # 크래시로 분류한다(설계 §4.5). 그래서 일부러 finally로 감싸지 않는다.
+        run_report: dict = {
+            "schema": 1,
+            "version": __version__,
+            "profile": p.name,
+            "command": "sync",
+            "dry_run": bool(dry_run),
+            "propagate_deletes": do_delete,
+            "started_at": now_iso(),
+        }
 
         with _instance_lock(p.name):
             # 실제 모드는 DB(커서·백로그)를 열어 봐야 정해진다(_decide_full_pass).
@@ -1869,6 +2102,29 @@ def sync(
                 ])
                 for s in scanner.skipped[:10]:
                     _err(f"  건너뜀: {s.rel_path} — {s.reason}")
+                run_report["local"] = {
+                    "entries": len(entries),
+                    "base": len(base),
+                    "skipped": len(scanner.skipped),
+                }
+
+                # 무인 로컬 붕괴 방어(I-A5) — 드라이브 미마운트·GDrive 오프라인·백신
+                # 격리·복원 진행 중이면 로컬이 '대량 삭제'처럼 보인다. 그 방향의
+                # 오판은 원격을 비우므로, 스캔이 기준선의 절반 미만이면 이번 실행을
+                # **통째로** 보류한다(부분 진행 없음). 원격 연결 전에 판정한다.
+                # 대량 삭제 게이트보다 앞선 방어선이다 — 그 게이트는 삭제 계획이 선
+                # 뒤에 걸리지만, 이 상태에서는 업로드·충돌 판정 자체가 이미 오염돼 있다.
+                if unattended and base and len(entries) < len(base) * 0.5:
+                    msg = (f"로컬 스캔 {len(entries)}건 < 기준선 {len(base)}건의 50% — "
+                           f"로컬이 일시적으로 무너진 상태일 수 있어 무인 실행을 "
+                           f"보류합니다. 폴더를 확인한 뒤 synchere.bat 더블클릭으로 "
+                           f"직접 실행하세요.")
+                    run_report["outcome"] = "held"
+                    run_report["held_reason"] = "local_collapse"
+                    run_report["finished_at"] = now_iso()
+                    _write_report_json(report_json, run_report)
+                    log.warning("무인 보류(local_collapse): %s", msg)
+                    _fail(msg, EXIT_HELD)
 
                 with _drive_api(p, log) as drive:
                     root_id, prefix = _resolve_remote_root(
@@ -1880,17 +2136,9 @@ def sync(
                     # dirty 목록은 전환 판정과 델타 수집이 **같은 값**을 봐야 한다.
                     # 따로 조회하면 그 사이에 상태가 바뀌어 판정과 실제가 어긋난다.
                     dirty = store.dirty_file_ids(p.drive_id)
-                    # 로컬에서 사라진 항목은 원격에 **아무 사건도 만들지 않는다** — changes에
-                    # 나올 수가 없어 델타로는 영원히 '원격 상태 미확인'으로 남는다. 그래서
-                    # 삭제 전파를 켜도 사용자가 'sync --full'을 직접 치기 전에는 아무 일도
-                    # 일어나지 않았다(2026-08-10 사용자 보고). 그 항목의 원격 메타만 콕 집어
-                    # 확인한다 — 비용은 사라진 건수에 비례하고 드라이브 크기와 무관하다.
-                    #
-                    # 삭제를 전파할 때만 지목한다. 전파가 꺼져 있으면 판정이 '보고'로 끝나
-                    # base 레코드가 그대로 남으므로, 매 실행 같은 항목을 영원히 재조회하게 된다.
-                    gone_ids = [rec.file_id for key, rec in base.items()
-                                if do_delete and rec.file_id and key not in entries
-                                and rec.sync_status not in ("unsyncable", "ignored")]
+                    # 로컬에서 사라진 항목의 원격 메타 지목 확인 — 규칙·상한·회전은
+                    # _gone_probe_ids docstring 참조(전파 여부로 전량/유예가 갈린다).
+                    gone_ids = _gone_probe_ids(base, entries, do_delete=do_delete)
                     use_full, why_full = _decide_full_pass(
                         forced=full,
                         cursor_revision=cursor.revision,
@@ -1950,6 +2198,22 @@ def sync(
                         local_unobserved=[s.rel_path for s in scanner.skipped],
                     )
 
+                    def _finish_report(outcome: str, *, result: dict | None = None,
+                                       error: str = "") -> None:
+                        """종료 시점의 보고 완성 + 기록. rate 카운터는 마지막에
+                        스냅샷한다 — 실행 단계에서도 계속 증가하기 때문이다."""
+                        run_report["outcome"] = outcome
+                        run_report["finished_at"] = now_iso()
+                        # 페이크 클라이언트(테스트)는 counters가 없다 — 보고는 관측
+                        # 수단이므로 없으면 빈 dict로 넘어간다(실행에 영향 금지).
+                        run_report["rate"] = dict(
+                            getattr(getattr(drive, "client", None), "counters", None) or {})
+                        if result is not None:
+                            run_report["result"] = result
+                        if error:
+                            run_report["error"] = error
+                        _write_report_json(report_json, run_report)
+
                     # 4) 계획 + 안전 게이트
                     trash_why = trash_unavailable_reason()
                     try:
@@ -1960,9 +2224,43 @@ def sync(
                                         # 폴더 삭제가 실제로 몇 건을 지우는지 환산하는 근거
                                         base_keys=tuple(base.keys()))
                     except BulkDeleteAbort as exc:
+                        _finish_report("aborted_bulk_delete", error=str(exc))
                         _fail(str(exc), EXIT_FAIL)
                         raise AssertionError("도달 불가")
+
+                    # 무인 삭제 등급화(I-A1') — 대량 게이트 통과분 중에서도 임계를
+                    # 넘는 삭제는 떼어 보류한다. 화면 출력 **전에** 적용해, 사람이
+                    # 보는 계획과 실행되는 계획이 같게 한다(I-A10).
+                    planned_deletes = pl.delete_count
+                    deferred_deletes, defer_why = 0, ""
+                    _max_del = _opt_int(max_auto_deletes, -1)
+                    _max_del_mb = _opt_int(max_auto_delete_mb, -1)
+                    if _max_del >= 0:
+                        deferred_deletes, defer_why = _apply_delete_grade(
+                            pl, base, max_deletes=_max_del, max_mb=_max_del_mb,
+                            base_count=len(base))
+                    conflicts_deferred = _demote_conflicts(pl) if unattended else 0
+
                     _print_sync_plan(pl, stats, view)
+                    if deferred_deletes:
+                        _err(f"  무인 삭제 보류 {deferred_deletes}건 — {defer_why}")
+                        log.warning("무인 삭제 보류 %d건 — %s", deferred_deletes, defer_why)
+                    if conflicts_deferred:
+                        _err(f"  무인 충돌 보류 {conflicts_deferred}건 — 로컬 원본을 "
+                             f"개명하지 않고 사람 실행으로 미룹니다")
+                        log.warning("무인 충돌 보류 %d건", conflicts_deferred)
+                    run_report.update(_plan_report(
+                        pl, stats, view,
+                        cursor_before=cursor.revision,
+                        cursor_after=next_cursor.revision,
+                        use_full=use_full, why_full=why_full))
+                    run_report["unattended"] = unattended
+                    run_report["deletes"] = {
+                        "planned": planned_deletes,
+                        "deferred": deferred_deletes,
+                        "gone_probed": len(gone_ids),
+                    }
+                    run_report["conflicts_deferred"] = conflicts_deferred
 
                     # 보호·보고 판정을 파일 로그에도 남긴다. 화면에만 나오면 창을 닫는
                     # 순간 증거가 사라져, 일시 상태('기준선 없음' 등)의 사후 진단이
@@ -1973,6 +2271,7 @@ def sync(
                         log.info("보고: %s — %s", _rel, _why)
 
                     if dry_run:
+                        _finish_report("dry_run")
                         _out("")
                         _out("dry-run — 아무것도 변경하지 않았습니다.")
                         raise typer.Exit(EXIT_OK)
@@ -1984,6 +2283,7 @@ def sync(
                     if not pl.actions:
                         store.set_meta(META_LAST_SYNC_AT, now_iso())
                         _save_cursor(store, next_cursor, use_full)
+                        _finish_report("partial" if stats.hash_failures else "no_changes")
                         _out("")
                         _out("변경 없음.")
                         raise typer.Exit(EXIT_FAIL if stats.hash_failures else EXIT_OK)
@@ -2010,6 +2310,17 @@ def sync(
                     # 'synced'가 아니므로 다음 실행의 dirty 조회가 반드시 다시 확인한다.
                     _save_cursor(store, next_cursor, use_full)
                     _sync_summary(report, pl)
+                    _finish_report(
+                        "partial" if (report.failures or stats.hash_failures) else "ok",
+                        result={
+                            "done": dict(report.done),
+                            "bytes_up": report.bytes_up,
+                            "bytes_down": report.bytes_down,
+                            "conflicts": len(report.conflicts),
+                            "protected": len(report.protected),
+                            "failures": len(report.failures),
+                            "renamed_by_server": len(report.renamed_by_server),
+                        })
 
                     if report.failures or stats.hash_failures:
                         raise typer.Exit(EXIT_FAIL)
