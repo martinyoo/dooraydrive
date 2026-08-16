@@ -220,6 +220,14 @@ def _status(names: list[str], all_: bool) -> int:
             r = check_profile(p)
             mark = "자동" if r.ok else "자동(주의)"
             extra = "" if r.ok else f" — {r.reasons[0]}"
+            if p.sync_mode != "sync":
+                extra += f"  [sync_mode={p.sync_mode} — 실제로는 돌지 않습니다]"
+            mult = st.backoff_mult(name)
+            if mult > 1.0:
+                extra += f"  [주기 x{mult:g}]"
+            last = _last_outcome(name)
+            if last:
+                extra += f"  마지막 {last}"
         else:
             mark = "수동"
             extra = ""
@@ -231,10 +239,35 @@ def _status(names: list[str], all_: bool) -> int:
             _out(f"  {name.ljust(width)}  {note}")
     else:
         _out("  (해당 프로파일 없음)")
+
+    # 통지 — 자동 실행이 사람 손을 기다리는 것들.
+    from . import notify
+    block = notify.format_block()
+    if block:
+        _out("")
+        _out(block)
+
     if not all_:
         _out("")
         _out("  전체를 보려면: synchere.bat --auto status --all")
     return EXIT_OK
+
+
+def _last_outcome(name: str) -> str:
+    """자식이 남긴 마지막 보고의 결과. 창이 닫혀 있어도 답할 수 있는 근거다."""
+    import json
+
+    from ..util.paths import ext_path
+    try:
+        with open(ext_path(auto_dir() / "last" / f"{name}.json"), "rb") as f:
+            data = json.loads(f.read().decode("utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    outcome = str(data.get("outcome") or "")
+    when = str(data.get("finished_at") or "")[5:16].replace("T", " ")
+    return f"{outcome}({when})" if outcome else ""
 
 
 def _eod_at(day_start_iso: str, work_hours: float) -> _dt.datetime | None:

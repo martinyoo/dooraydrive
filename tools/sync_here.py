@@ -480,6 +480,47 @@ def _run_sync(name: str, root: str, extra: list[str]) -> int:
     return rc
 
 
+def _print_auto_notices() -> None:
+    """무인 실행이 남긴 통지를 맨 앞에 찍는다(있을 때만). 실패해도 무시한다 —
+    통지 때문에 동기화가 안 되면 본말전도다."""
+    try:
+        from dooray_sync.auto import notify
+        block = notify.format_block()
+    except Exception:  # noqa: BLE001 — 자동 동기화를 안 쓰는 PC도 있다
+        return
+    if block:
+        print(block)
+        print()
+
+
+def _clear_auto_notices(name: str) -> None:
+    """사람이 그 폴더를 직접 성공적으로 돌렸으면 통지를 지운다 — '확인' 버튼을
+    누르게 하면 아무도 안 눌러서 목록이 노이즈가 된다. 원인 해소가 곧 확인이다."""
+    try:
+        from dooray_sync.auto import notify
+        notify.clear(name)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _print_auto_footer(targets: list[tuple[str, dict]]) -> None:
+    """끝에 자동 동기화 상태 한 줄. 이 폴더가 자동 대상인지 사람이 알아야
+    "왜 안 올라가지"를 스스로 답할 수 있다."""
+    try:
+        from dooray_sync.config import load_config
+        names = [n for n, _ in targets]
+        on = [n for n in names if getattr(load_config(n), "auto_sync", False)]
+    except Exception:  # noqa: BLE001
+        return
+    if not names:
+        return
+    print()
+    if on:
+        print(f"자동 동기화: 켜짐 ({', '.join(on)}) — 끄려면 synchere.bat --auto off")
+    else:
+        print("자동 동기화: 꺼짐 — 켜려면 synchere.bat --auto on")
+
+
 def resolve_targets(root: str | Path, profiles: dict[str, dict]) -> list[tuple[str, dict]]:
     """--root가 가리키는 실행 대상 집합(모듈 docstring의 상향/하향 규칙).
 
@@ -569,6 +610,11 @@ def main(argv: list[str]) -> int:
         # 기록 실패 = config와 실제 마커 상태가 어긋난 채 남음 → 호출측이 중단하도록 1.
         return 1 if failed else 0
 
+    # 통지 0단계 — **사람이 이미 보는 화면**에 무인 실행이 남긴 말을 먼저 찍는다.
+    # 새 UI를 만들지 않는 것이 요점이다. 자동 실행이 보류한 것을 아는 유일한
+    # 순간이 사람이 이 파일을 실행할 때이므로, 아무것도 하기 전에 꺼내 보인다.
+    _print_auto_notices()
+
     targets = resolve_targets(root, profiles)
 
     if not targets:
@@ -646,7 +692,13 @@ def main(argv: list[str]) -> int:
         rc = _run_sync(name, info["root"], extra)
         if rc != 0:
             failed.append(name)
+        else:
+            # 사람이 직접 돌려 성공했으면 그 프로파일의 자동 통지는 해소된 것으로
+            # 본다 — 보류·충돌은 방금 이 실행이 계획을 보여 주고 처리했다.
+            _clear_auto_notices(name)
         print()
+
+    _print_auto_footer(targets)
 
     if failed:
         print(f"실패한 프로파일: {', '.join(failed)} — 다시 실행하면 실패분만 재시도됩니다.")

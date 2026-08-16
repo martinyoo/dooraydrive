@@ -19,12 +19,13 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 from .. import __version__
-from ..config import config_path, db_path, load_auto, load_config
-from ..store.db import Store
+from ..config import config_path, db_path, load_auto
 from ..util.paths import ext_path
+from . import notify
 from .state import AutoState, auto_dir
 
 __all__ = ["run_loop", "run_once", "decide", "Decision"]
@@ -205,25 +206,160 @@ def _classify(rc: int) -> tuple[str, str]:
     }.get(rc, ("error", f"종료코드 {rc}"))
 
 
-def _apply_backoff(st: AutoState, name: str, kind: str) -> None:
-    """rate limit 관측이 있으면 주기를 늘리고, 깨끗하면 서서히 되돌린다."""
-    report = auto_dir() / "last" / f"{name}.json"
-    limited = 0
+def _read_report(name: str) -> dict:
+    """자식이 남긴 실행 보고. 없거나 깨졌으면 빈 dict — 보고가 없다는 것 자체가
+    '자식이 보고를 쓰기 전에 죽었다'는 신호라서 호출측이 그렇게 다룬다."""
+    import json
     try:
-        import json
-        with open(ext_path(report), "rb") as f:
+        with open(ext_path(auto_dir() / "last" / f"{name}.json"), "rb") as f:
             data = json.loads(f.read().decode("utf-8"))
-        rate = data.get("rate") or {}
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _apply_backoff(st: AutoState, name: str, kind: str, report: dict) -> None:
+    """주기 승수 조정. 두 가지 입력이 있다.
+
+    - rate limit 관측(429): 서버가 밀어내고 있다 → 즉시 2배.
+    - 연속 실패: 원인이 무엇이든 같은 실패를 2분마다 반복하는 것은 서버에도
+      로그에도 해롭다 → 3회 연속부터 2배씩.
+    깨끗한 실행은 서서히 되돌린다(x0.75, 하한 1.0).
+    """
+    rate = report.get("rate") or {}
+    try:
         limited = int(rate.get("rate_limited") or 0)
-    except (OSError, ValueError, TypeError):
-        pass
+    except (TypeError, ValueError):
+        limited = 0
+
+    entry = st.profile(name)
+    streak = int(entry.get("fail_streak") or 0)
+    streak = streak + 1 if kind in ("error", "partial", "held") else 0
+    entry["fail_streak"] = streak
+
     cur = st.backoff_mult(name)
     if limited > 0:
         st.set_backoff_mult(name, cur * 2)
         print(f"    (rate limit {limited}회 관측 — 이 폴더 주기를 "
               f"{st.backoff_mult(name):g}배로 늘립니다)")
-    elif kind in ("ok", "partial") and cur > 1.0:
+    elif streak >= 3:
+        st.set_backoff_mult(name, cur * 2)
+        print(f"    (연속 {streak}회 같은 결과 — 주기를 "
+              f"{st.backoff_mult(name):g}배로 늘립니다)")
+    elif kind == "ok" and cur > 1.0:
         st.set_backoff_mult(name, max(1.0, cur * 0.75))
+
+
+def _config_mtime() -> float:
+    try:
+        return os.path.getmtime(ext_path(config_path()))
+    except OSError:
+        return 0.0
+
+
+def _note_outcome(st: AutoState, name: str, kind: str, msg: str,
+                  report: dict, now: _dt.datetime) -> None:
+    """실행 결과를 통지로 옮긴다. 원인이 해소되면 스스로 지워진다."""
+    ts = now.isoformat(timespec="seconds")
+    entry = st.profile(name)
+
+    if kind == "config":
+        # 같은 거부를 2분마다 영원히 반복하지 않는다. config가 바뀌거나 사람이
+        # 그 폴더에서 실행하기 전까지 이 프로파일의 자동 실행을 쉰다.
+        entry["config_error_mtime"] = _config_mtime()
+        notify.add(name, "config", "설정 문제로 자동 실행을 멈췄습니다 - "
+                                   "그 폴더에서 synchere.bat을 한 번 실행하세요", ts=ts)
+        return
+    entry.pop("config_error_mtime", None)
+
+    if kind == "held":
+        why = str(report.get("held_reason") or "")
+        detail = {"local_collapse": "로컬 폴더가 비어 보입니다(드라이브·백신 확인)"}.get(
+            why, "무인 실행이 보류했습니다")
+        notify.add(name, "held", f"{detail} - 폴더에서 직접 실행해 확인하세요", ts=ts)
+        return
+    notify.clear(name, "held")
+
+    if kind == "error":
+        notify.add(name, "error", msg, ts=ts)
+        return
+    notify.clear(name, "error")
+
+    deletes = report.get("deletes") or {}
+    deferred = int(deletes.get("deferred") or 0)
+    if deferred:
+        notify.add(name, "deletes",
+                   f"삭제 {deferred}건이 임계를 넘어 보류됐습니다 - "
+                   f"폴더에서 직접 실행하면 계획을 보고 처리할 수 있습니다", ts=ts)
+    else:
+        notify.clear(name, "deletes")
+
+    conflicts = int(report.get("conflicts_deferred") or 0)
+    if conflicts:
+        notify.add(name, "conflicts",
+                   f"충돌 {conflicts}건이 대기 중입니다 - 무인 실행은 로컬 원본을 "
+                   f"개명하지 않습니다", ts=ts)
+    else:
+        notify.clear(name, "conflicts")
+
+
+def _skipped_by_config_error(st: AutoState, name: str) -> bool:
+    """설정 오류로 쉬는 중인가. config 파일이 바뀌면 자동으로 풀린다."""
+    stamp = st.profile(name).get("config_error_mtime")
+    if stamp is None:
+        return False
+    try:
+        return float(stamp) == _config_mtime()
+    except (TypeError, ValueError):
+        return False
+
+
+def _write_status(st: AutoState, auto: dict, names: list[str],
+                  now: _dt.datetime) -> None:
+    """status.txt — **창이 닫혀 있을 때의 유일한 근거.**
+
+    `--auto status`가 이걸 읽어 "마지막으로 무슨 일이 있었나"를 답한다.
+    사람이 읽는 평문이고 기계 판독은 보고 JSON이 담당한다(두 역할을 한 파일에
+    섞으면 둘 다 어중간해진다).
+    """
+    lines = [
+        f"dsync {__version__} 자동 동기화 상태",
+        f"갱신     : {now:%Y-%m-%d %H:%M:%S}",
+        f"프로그램 : {_REPO}",
+    ]
+    start = _parse(st.day_start)
+    if start is not None:
+        eod = start + _dt.timedelta(hours=float(auto["work_hours"])) - EOD_LEAD
+        done = st.last_eod_date == now.date().isoformat()
+        lines.append(f"오늘 기동: {start:%H:%M}")
+        lines.append(f"퇴근 스윕: {eod:%H:%M} " + ("(완료)" if done else "(예정)"))
+    lines.append("")
+    lines.append("프로파일:")
+    for name in names:
+        rep = _read_report(name)
+        seen = _last_sync_at(name)
+        mark = str(rep.get("outcome") or "-")
+        extra = ""
+        if _skipped_by_config_error(st, name):
+            extra = "  [설정 오류로 쉬는 중]"
+        mult = st.backoff_mult(name)
+        if mult > 1.0:
+            extra += f"  [주기 x{mult:g}]"
+        when = f"{seen:%m-%d %H:%M}" if seen else "-"
+        lines.append(f"  {name:12} 마지막 {when}  결과 {mark}{extra}")
+    block = notify.format_block()
+    if block:
+        lines.append("")
+        lines.append(block)
+    try:
+        dest = auto_dir() / "status.txt"
+        os.makedirs(ext_path(dest.parent), exist_ok=True)
+        tmp = dest.with_name(f"{dest.name}.{uuid.uuid4().hex}.tmp")
+        with open(ext_path(tmp), "w", encoding="utf-8", newline="\n") as f:
+            f.write("\n".join(lines) + "\n")
+        os.replace(ext_path(tmp), ext_path(dest))
+    except OSError:
+        pass
 
 
 # 마커가 연속 몇 틱 안 보여야 '지웠다'로 볼 것인가. 2분 틱 기준 3회 = 6분.
@@ -304,14 +440,20 @@ def _tick(st: AutoState, extra: list[str], only: list[str] | None) -> None:
         st.last_eod_date = now.date().isoformat()
 
     for name in d.names:
+        if _skipped_by_config_error(st, name):
+            print(f"  - {name}: 설정 문제로 쉬는 중(config가 바뀌면 자동 재개)")
+            continue
         print(f"  - {name} 동기화 중...")
         rc = _run_child(name, auto, extra)
         kind, msg = _classify(rc)
         print(f"    {name}: {msg}")
-        _apply_backoff(st, name, kind)
+        report = _read_report(name)
+        _apply_backoff(st, name, kind, report)
+        _note_outcome(st, name, kind, msg, report, now)
 
     st.last_tick = now.isoformat(timespec="seconds")
     st.save()
+    _write_status(st, auto, names, now)
 
 
 def run_once(*, only: list[str] | None = None, extra: list[str] | None = None) -> int:
@@ -333,16 +475,20 @@ def run_once(*, only: list[str] | None = None, extra: list[str] | None = None) -
     st = AutoState()
     print(f"== 자동 동기화 1회 (dsync {__version__})")
     print(f"   프로그램 폴더: {_REPO}")
+    now = _now()
     for name in names:
         print(f"  - {name} 동기화 중...")
         rc = _run_child(name, auto, extra or [])
         _kind, msg = _classify(rc)
         print(f"    {name}: {msg}")
-        _apply_backoff(st, name, _kind)
+        report = _read_report(name)
+        _apply_backoff(st, name, _kind, report)
+        _note_outcome(st, name, _kind, msg, report, now)
     # last_tick은 쓰지 않는다 — 이건 틱이 아니라 진단용 1회 실행이다. 여기서
     # 시각을 남기면 루프가 '방금 틱이 있었다'고 보고 기동 스윕을 건너뛴다.
     # 다음 실행 시각 판단은 상태 DB의 last_sync_at이 하므로 잃는 정보도 없다.
     st.save()
+    _write_status(st, auto, names, now)
     return 0
 
 
