@@ -129,6 +129,16 @@ def test_never_synced_profile_is_due_immediately():
     assert d.kind == "due" and d.names == ["fresh"]
 
 
+def test_missing_day_start_forces_start_sweep():
+    """day_start가 없으면 기동으로 친다 — 없으면 퇴근 스윕의 기준점이 없어
+    그날 퇴근 스윕이 영영 안 뜬다. '--auto now'가 last_tick만 남기거나 상태
+    파일이 지워진 경우가 정확히 그 상태다(자기 치유)."""
+    st = _st(last_tick=(MON.replace(hour=10)).isoformat())   # day_start 없음
+    d = decide(st, AUTO, ["a"], now=MON.replace(hour=10, minute=2),
+               last_sync={"a": MON.replace(hour=10)})
+    assert d.kind == "sweep_start"
+
+
 def test_no_auto_profiles_is_idle():
     d = decide(_st(), AUTO, [], now=MON, last_sync={})
     assert d.kind == "idle"

@@ -110,12 +110,15 @@ def decide(st: AutoState, auto: dict, names: list[str], *, now: _dt.datetime,
         return Decision("idle", [], "자동 대상 프로파일이 없습니다")
 
     prev = _parse(st.last_tick)
-    gap = _dt.timedelta(hours=float(auto["day_gap_hours"]))
-    if prev is None or now - prev >= gap:
-        return Decision("sweep_start", list(names),
-                        "기동(직전 틱과 간격이 벌어짐) — 전체 한 바퀴")
-
     start = _parse(st.day_start)
+    gap = _dt.timedelta(hours=float(auto["day_gap_hours"]))
+    # day_start가 없으면 무조건 기동으로 친다. 없으면 퇴근 스윕의 기준점이 없어
+    # **그날 퇴근 스윕이 영영 안 뜬다** — 상태 파일이 지워졌거나 --auto now가
+    # last_tick만 남긴 경우가 실제로 그렇게 된다. 자기 치유 경로.
+    if prev is None or start is None or now - prev >= gap:
+        return Decision("sweep_start", list(names),
+                        "기동(첫 틱 또는 간격이 벌어짐) — 전체 한 바퀴")
+
     if (start is not None and now.weekday() < 5
             and st.last_eod_date != now.date().isoformat()):
         eod = start + _dt.timedelta(hours=float(auto["work_hours"])) - EOD_LEAD
@@ -254,6 +257,13 @@ def run_once(*, only: list[str] | None = None, extra: list[str] | None = None) -
     """`--auto now` — 판정을 무시하고 대상 전부를 한 바퀴 돈다(진단용)."""
     from .launcher import disable_quickedit
     disable_quickedit()
+    # run_loop과 같은 이유 + 하나 더: 자식이 부모의 stdout 핸들을 물려받으므로,
+    # 부모 출력이 버퍼에 남아 있으면 자식 출력이 **먼저** 찍혀 순서가 뒤집힌다
+    # (파이프로 캡처할 때 실제로 그렇게 나온다).
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError, OSError):
+        pass
     auto = load_auto()
     names = auto_profiles(only)
     if not names:
@@ -268,7 +278,9 @@ def run_once(*, only: list[str] | None = None, extra: list[str] | None = None) -
         _kind, msg = _classify(rc)
         print(f"    {name}: {msg}")
         _apply_backoff(st, name, _kind)
-    st.last_tick = _now().isoformat(timespec="seconds")
+    # last_tick은 쓰지 않는다 — 이건 틱이 아니라 진단용 1회 실행이다. 여기서
+    # 시각을 남기면 루프가 '방금 틱이 있었다'고 보고 기동 스윕을 건너뛴다.
+    # 다음 실행 시각 판단은 상태 DB의 last_sync_at이 하므로 잃는 정보도 없다.
     st.save()
     return 0
 
