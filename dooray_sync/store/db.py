@@ -40,6 +40,21 @@ _ENTRY_KEY = "_entry"
 _SCHEMA_FILE = "schema.sql"
 _ITER_CHUNK = 1000
 
+# DB 스키마 버전(PRAGMA user_version). 컬럼·테이블을 바꾸는 릴리스마다 올리고
+# _MIGRATIONS에 그 버전으로 가는 마이그레이션을 등록한다.
+# 도입 전(user_version=0) DB는 스키마가 지금과 동일하므로 1로 승격만 한다 —
+# schema.sql이 CREATE IF NOT EXISTS 멱등이라 별도 변환이 없다.
+# 이것이 없으면 컬럼을 추가하는 릴리스가 기존 PC에서 "no such column"으로
+# 조용히 깨진다(배포 전략 항목 D). 무인 상시 실행(M3)은 그 사고를 상시화한다.
+SCHEMA_VERSION = 1
+_MIGRATIONS: dict[int, tuple[str, ...]] = {
+    # 예: 2: ("ALTER TABLE files ADD COLUMN ...",),
+}
+
+
+class SchemaVersionError(RuntimeError):
+    """DB가 코드보다 새 스키마다 — 구버전 코드로 열면 오해석하므로 fail-stop."""
+
 _FILE_COLUMNS = (
     "drive_id", "file_id", "parent_id", "rel_path", "rel_path_key", "server_name",
     "is_dir", "local_mtime_ns", "local_size", "local_md5", "remote_revision",
@@ -167,9 +182,32 @@ class Store:
 
     # ---------- 수명주기 ----------
     def init_schema(self) -> None:
-        """스키마 생성(멱등). schema.sql은 패키지 데이터로 읽는다."""
+        """스키마 생성/승격(멱등). schema.sql은 패키지 데이터로 읽는다.
+
+        user_version 규약:
+          0                = 버전 도입 전 DB 또는 신규 — 멱등 생성 후 현재 버전 스탬프
+          < SCHEMA_VERSION = 구버전 — _MIGRATIONS를 순서대로 적용해 승격
+          = SCHEMA_VERSION = 현재 — 멱등 생성만(비용 무시 가능)
+          > SCHEMA_VERSION = **코드보다 새 DB** — 즉시 중단. 구버전 코드가 새
+                             스키마를 오해석해 기준선을 망가뜨리는 쪽이 훨씬 나쁘다
+                             (갱신 실패로 프로그램만 롤백된 PC에서 실제로 가능한 상태).
+        """
         with self._lock:
+            found = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+            if found > SCHEMA_VERSION:
+                raise SchemaVersionError(
+                    f"상태 DB의 스키마(v{found})가 이 프로그램(v{SCHEMA_VERSION})보다 "
+                    f"새 버전입니다: {self.db_path}\n"
+                    f"  프로그램을 최신으로 갱신한 뒤 다시 실행하세요(설치.bat 재실행)."
+                )
             self._conn.executescript(_read_schema())
+            if found < SCHEMA_VERSION:
+                with self.transaction():
+                    for target in range(found + 1, SCHEMA_VERSION + 1):
+                        for stmt in _MIGRATIONS.get(target, ()):
+                            self._conn.execute(stmt)
+                    # PRAGMA는 파라미터 바인딩이 안 된다 — 정수 상수라 안전.
+                    self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION:d}")
 
     def close(self) -> None:
         with self._lock:

@@ -126,6 +126,10 @@ def setup_logging(
             _log_path = path
 
     logger.addHandler(_console_handler(console_level, masker))
+    # 실행 첫 줄에 버전을 남긴다 — 사후 진단에서 "어느 버전이 낸 로그인가"가
+    # 첫 질문이다(배포 전략 항목 A). 파일 핸들러 기준 INFO라 항상 기록된다.
+    from . import __version__
+    logger.info("dsync %s 시작 (profile=%s)", __version__, profile)
     return logger
 
 
