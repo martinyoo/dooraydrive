@@ -119,12 +119,16 @@ class DoorayApiError(RuntimeError):
         result_code: int | None = None,
         result_message: str | None = None,
         path: str | None = None,
+        cause: BaseException | None = None,
     ) -> None:
         super().__init__(message)
         self.status = status
         self.result_code = result_code
         self.result_message = result_message
         self.path = path
+        # 전송 계층 원인(ConnectError/ReadTimeout/RemoteProtocolError…).
+        # 메시지 문자열을 다시 파싱해 원인을 추측하지 않기 위해 객체를 들고 있는다.
+        self.cause = cause
 
 
 class DoorayClient:
@@ -338,6 +342,7 @@ class DoorayClient:
                         f"{lbl} 네트워크 오류로 실패({attempts + 1}회 시도): "
                         f"{type(exc).__name__}: {exc}",
                         path=url,
+                        cause=exc,
                     ) from exc
                 delay = _BACKOFF_BASE * (attempt + 1)
                 self.counters["network_retries"] += 1

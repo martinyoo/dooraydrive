@@ -85,29 +85,53 @@ def auto_profiles(only: list[str] | None = None) -> list[str]:
     return sorted(names, key=str.casefold)
 
 
+def _ro_uri(path: Path) -> str:
+    r"""읽기 전용 SQLite URI.
+
+    **ext_path를 쓰면 안 된다.** 확장 길이 접두(\\?\)를 URI에 넣으면 '//?/…'가
+    되고, 그 '?'를 퍼센트 인코딩하면 authority가 '%3f'로 잡혀
+    `invalid uri authority`로 연결 자체가 실패한다. 2026-08-16 실측: 그 실패를
+    None(한 번도 동기화 안 함)으로 읽어 30분 주기가 통째로 무력해졌고 매 틱
+    동기화가 돌았다. URI에는 평범한 경로를 쓰고 '?'·'#'만 인코딩한다.
+    """
+    text = str(path).replace("\\", "/").replace("?", "%3F").replace("#", "%23")
+    return f"file:{text}?mode=ro"
+
+
 def _last_sync_at(name: str) -> _dt.datetime | None:
     """상태 DB의 마지막 sync 시각. **프로세스를 띄우지 않고** 읽기 전용으로 연다.
 
     일반 connect는 DB가 없을 때 빈 파일을 만든다 — 그러면 편입 게이트의
     '상태 DB 없음' 판정이 다음부터 통과해 버린다. mode=ro로 막는다.
+
+    읽기에 실패하면 **None이 아니라 예외**를 올린다. None은 '한 번도 동기화한
+    적 없음'이라는 뜻이고, 그건 '즉시 실행'으로 이어진다 — 조회 실패를 그렇게
+    읽으면 고장이 폭주로 바뀐다(위 실측 사고).
     """
     import sqlite3
     path = db_path(name)
     if not os.path.exists(ext_path(path)):
         return None
-    uri = "file:" + str(ext_path(path)).replace("\\", "/").replace("?", "%3f") + "?mode=ro"
-    try:
-        conn = sqlite3.connect(uri, uri=True, timeout=2.0)
-    except sqlite3.Error:
-        return None
+    conn = sqlite3.connect(_ro_uri(path), uri=True, timeout=2.0)
     try:
         row = conn.execute(
             "SELECT value FROM meta WHERE key = 'last_sync_at'").fetchone()
-    except sqlite3.Error:
-        return None
     finally:
         conn.close()
     return _parse(row[0]) if row and row[0] else None
+
+
+def _last_sync_map(names: list[str]) -> dict[str, _dt.datetime | None]:
+    """프로파일별 마지막 sync 시각. 조회가 실패한 프로파일은 **이번 틱에서
+    제외**한다 — 모른다는 이유로 실행하면 고장이 곧 폭주다(fail-closed)."""
+    out: dict[str, _dt.datetime | None] = {}
+    for name in names:
+        try:
+            out[name] = _last_sync_at(name)
+        except Exception as exc:      # noqa: BLE001 — sqlite·OS 오류 전부
+            print(f"    ({name}: 마지막 동기화 시각을 읽지 못해 이번 틱은 "
+                  f"건너뜁니다 — {type(exc).__name__}: {exc})")
+    return out
 
 
 def decide(st: AutoState, auto: dict, names: list[str], *, now: _dt.datetime,
@@ -194,16 +218,27 @@ def _run_child(name: str, auto: dict, extra: list[str]) -> int:
         return 1
 
 
-def _classify(rc: int) -> tuple[str, str]:
-    """종료코드 → (분류, 사람이 읽는 말). exit 1은 고장이 아니다(I-A11) —
-    일부 파일 실패는 정상 운용에서 늘 생기고, 다음 실행이 재시도한다."""
-    return {
-        0: ("ok", "완료"),
-        1: ("partial", "일부 실패(다음 주기에 재시도)"),
-        2: ("config", "설정 문제 — 자동 대상에서 건너뜁니다"),
-        3: ("locked", "다른 실행이 사용 중 — 다음 틱에"),
-        4: ("held", "보류(사람 확인 필요)"),
-    }.get(rc, ("error", f"종료코드 {rc}"))
+def _classify(rc: int, report: dict) -> tuple[str, str]:
+    """(fault, 사람이 읽는 말). **종료코드가 아니라 보고의 fault가 정본이다** —
+    exit 1 하나에 와이파이 끊김·Dooray 장애·일부 파일 실패가 전부 들어 있어
+    구분이 안 된다. 셋은 사람이 할 일이 완전히 다르다.
+
+    exit 1이 곧 고장은 아니다(I-A11). 보고가 없으면(자식이 쓰기 전에 죽었으면)
+    종료코드로 떨어뜨린다.
+    """
+    from ..api.faults import ADVICE, LABEL, Fault
+
+    fault = str(report.get("fault") or "")
+    if not fault:
+        fault = {
+            0: Fault.OK, 1: Fault.PARTIAL, 2: Fault.CONFIG,
+            3: "locked", 4: Fault.HELD,
+        }.get(rc, Fault.UNKNOWN)
+    if fault == "locked":
+        return "locked", "다른 실행이 사용 중 — 다음 틱에"
+    label = LABEL.get(fault, fault)
+    advice = ADVICE.get(fault, "")
+    return fault, f"{label}" + (f" — {advice}" if advice else "")
 
 
 def _read_report(name: str) -> dict:
@@ -232,9 +267,13 @@ def _apply_backoff(st: AutoState, name: str, kind: str, report: dict) -> None:
     except (TypeError, ValueError):
         limited = 0
 
+    from ..api.faults import Fault
+
     entry = st.profile(name)
     streak = int(entry.get("fail_streak") or 0)
-    streak = streak + 1 if kind in ("error", "partial", "held") else 0
+    # OK가 아닌 모든 결과가 연속 회수를 올린다 — 원인이 무엇이든 같은 결과를
+    # 2분마다 반복하는 것은 서버에도 로그에도 해롭다. locked는 정상 경합이라 뺀다.
+    streak = 0 if kind in (Fault.OK, "locked") else streak + 1
     entry["fail_streak"] = streak
 
     cur = st.backoff_mult(name)
@@ -272,7 +311,9 @@ def _note_outcome(st: AutoState, name: str, kind: str, msg: str,
         return
     entry.pop("config_error_mtime", None)
 
-    if kind == "held":
+    from ..api.faults import ADVICE, LABEL, Fault, is_transient
+
+    if kind == Fault.HELD:
         why = str(report.get("held_reason") or "")
         detail = {"local_collapse": "로컬 폴더가 비어 보입니다(드라이브·백신 확인)"}.get(
             why, "무인 실행이 보류했습니다")
@@ -280,10 +321,26 @@ def _note_outcome(st: AutoState, name: str, kind: str, msg: str,
         return
     notify.clear(name, "held")
 
-    if kind == "error":
-        notify.add(name, "error", msg, ts=ts)
+    if kind in (Fault.OK, Fault.PARTIAL):
+        # 일부 파일 실패는 정상 운용에서 늘 생긴다 — 사람을 부르지 않는다(I-A11).
+        notify.clear(name, "error")
+    elif is_transient(kind):
+        # 와이파이 끊김·Dooray 장애·한도 초과는 기다리면 풀린다. 사람을 부르는
+        # 대신 연속 실패 회수를 세고, 오래 이어질 때만 알린다 — 잠깐 끊길 때마다
+        # 알림이 뜨면 알림 자체가 무시된다.
+        streak = int(entry.get("fail_streak") or 0)
+        if streak >= 5:
+            notify.add(name, "error",
+                       f"{LABEL.get(kind, kind)}이(가) {streak}회 이어집니다 - "
+                       f"{ADVICE.get(kind, '')}", ts=ts)
+        else:
+            notify.clear(name, "error")
         return
-    notify.clear(name, "error")
+    else:
+        # auth·service_error·local·unknown — 기다려도 안 풀린다. 즉시 알린다.
+        notify.add(name, "error",
+                   f"{LABEL.get(kind, kind)} - {ADVICE.get(kind, msg)}", ts=ts)
+        return
 
     deletes = report.get("deletes") or {}
     deferred = int(deletes.get("deferred") or 0)
@@ -328,8 +385,8 @@ def _write_status(st: AutoState, auto: dict, names: list[str],
         f"프로그램 : {_REPO}",
     ]
     start = _parse(st.day_start)
-    if start is not None:
-        eod = start + _dt.timedelta(hours=float(auto["work_hours"])) - EOD_LEAD
+    eod = _eod_time(st, auto)
+    if start is not None and eod is not None:
         done = st.last_eod_date == now.date().isoformat()
         lines.append(f"오늘 기동: {start:%H:%M}")
         lines.append(f"퇴근 스윕: {eod:%H:%M} " + ("(완료)" if done else "(예정)"))
@@ -337,7 +394,10 @@ def _write_status(st: AutoState, auto: dict, names: list[str],
     lines.append("프로파일:")
     for name in names:
         rep = _read_report(name)
-        seen = _last_sync_at(name)
+        try:
+            seen = _last_sync_at(name)
+        except Exception:      # noqa: BLE001 — 상태 표시가 루프를 죽이지 않는다
+            seen = None
         mark = str(rep.get("outcome") or "-")
         extra = ""
         if _skipped_by_config_error(st, name):
@@ -411,6 +471,62 @@ def _reconcile(st: AutoState, names: list[str]) -> None:
                          allow_reenable=False, max_disable=MAX_AUTO_DISABLE)
 
 
+_idle_open = False
+
+
+def _print_idle(text: str) -> None:
+    """대기 줄을 제자리에서 갱신. 이전 줄이 더 길었을 때 잔상이 남지 않게 채운다."""
+    global _idle_open
+    sys.stdout.write("\r" + text.ljust(78))
+    sys.stdout.flush()
+    _idle_open = True
+
+
+def _end_idle() -> None:
+    """제자리 갱신 중이던 줄을 확정하고 다음 출력을 새 줄에서 시작한다."""
+    global _idle_open
+    if _idle_open:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        _idle_open = False
+
+
+def _eod_time(st: AutoState, auto: dict) -> _dt.datetime | None:
+    """오늘의 퇴근 스윕 시각. 기동 시각 + 근무시간 - 15분."""
+    start = _parse(st.day_start)
+    if start is None:
+        return None
+    return start + _dt.timedelta(hours=float(auto["work_hours"])) - EOD_LEAD
+
+
+def _next_event(st: AutoState, auto: dict, names: list[str],
+                now: _dt.datetime) -> str:
+    """대기 줄에 붙일 '다음에 무슨 일이 언제'. 기다리는 사람에게 필요한 정보다."""
+    eod = _eod_time(st, auto)
+    if (eod is not None and now < eod and now.weekday() < 5
+            and st.last_eod_date != now.date().isoformat()):
+        return f"  다음 동기화 {_next_due(st, auto, names, now)} · 퇴근 스윕 {eod:%H:%M}"
+    return f"  다음 동기화 {_next_due(st, auto, names, now)}"
+
+
+def _next_due(st: AutoState, auto: dict, names: list[str],
+              now: _dt.datetime) -> str:
+    """가장 먼저 차례가 오는 시각(HH:MM). 못 구하면 '-'."""
+    interval = float(auto["min_interval_sec"])
+    soonest: _dt.datetime | None = None
+    for name in names:
+        try:
+            seen = _last_sync_at(name)
+        except Exception:      # noqa: BLE001
+            continue
+        if seen is None:
+            return "곧"
+        when = seen + _dt.timedelta(seconds=interval * st.backoff_mult(name))
+        if soonest is None or when < soonest:
+            soonest = when
+    return f"{soonest:%H:%M}" if soonest else "-"
+
+
 def _tick(st: AutoState, extra: list[str], only: list[str] | None) -> None:
     """틱 1회. 예외를 밖으로 내보내지 않는다 — 루프가 죽으면 안 된다."""
     auto = load_auto()
@@ -420,18 +536,22 @@ def _tick(st: AutoState, extra: list[str], only: list[str] | None) -> None:
     except Exception as exc:      # noqa: BLE001 — 정합 실패가 동기화를 막지 않는다
         print(f"    (마커 정합 건너뜀 — {type(exc).__name__}: {exc})")
     # 정합이 sync_mode를 껐을 수 있다 — 대상 목록을 다시 읽는다.
-    names = auto_profiles(only)
     now = _now()
-    last_sync = {n: _last_sync_at(n) for n in names}
+    last_sync = _last_sync_map(names)
+    # 조회에 실패한 프로파일은 이번 틱 대상에서 뺀다(fail-closed).
+    names = [n for n in names if n in last_sync]
     d = decide(st, auto, names, now=now, last_sync=last_sync)
 
     stamp = f"{now:%H:%M:%S}"
     if d.kind == "idle":
-        # 시각이 계속 갱신되는 것이 '멈춘 창'과 '조용한 창'을 구분한다
-        # (QuickEdit 정지가 정확히 이렇게 드러난다).
-        nxt = "" if not names else "  다음 차례를 기다리는 중"
-        print(f"[{stamp}] 대기{nxt}")
+        # 대기 줄은 **제자리에서 갱신**한다(줄바꿈 없이 \r). 2분마다 새 줄을
+        # 쌓으면 8시간에 240줄이 흐르고 그 속에서 진짜 사건을 놓친다.
+        # 시각이 계속 변하는 것 자체가 '멈춘 창'과 '조용한 창'을 구분하는
+        # 신호이므로(QuickEdit 정지가 정확히 이렇게 드러난다) 지우지는 않는다.
+        nxt = _next_event(st, auto, names, now)
+        _print_idle(f"[{stamp}] 대기 중{nxt}")
     else:
+        _end_idle()
         print(f"[{stamp}] {d.why}")
 
     if d.kind == "sweep_start":
@@ -445,9 +565,9 @@ def _tick(st: AutoState, extra: list[str], only: list[str] | None) -> None:
             continue
         print(f"  - {name} 동기화 중...")
         rc = _run_child(name, auto, extra)
-        kind, msg = _classify(rc)
-        print(f"    {name}: {msg}")
         report = _read_report(name)
+        kind, msg = _classify(rc, report)
+        print(f"    {name}: {msg}")
         _apply_backoff(st, name, kind, report)
         _note_outcome(st, name, kind, msg, report, now)
 
@@ -479,9 +599,9 @@ def run_once(*, only: list[str] | None = None, extra: list[str] | None = None) -
     for name in names:
         print(f"  - {name} 동기화 중...")
         rc = _run_child(name, auto, extra or [])
-        _kind, msg = _classify(rc)
-        print(f"    {name}: {msg}")
         report = _read_report(name)
+        _kind, msg = _classify(rc, report)
+        print(f"    {name}: {msg}")
         _apply_backoff(st, name, _kind, report)
         _note_outcome(st, name, _kind, msg, report, now)
     # last_tick은 쓰지 않는다 — 이건 틱이 아니라 진단용 1회 실행이다. 여기서
@@ -515,8 +635,20 @@ def run_loop(*, only: list[str] | None = None, extra: list[str] | None = None) -
     print(f" 프로그램 폴더 : {_REPO}")
     print(f" 설정          : {config_path()}")
     print(f" 상태          : {auto_dir()}")
-    print(f" 근무시간      : {auto['work_hours']:g}시간 "
-          f"(퇴근 스윕 = 기동 + {auto['work_hours']:g}h - 15분, 평일만)")
+    # 퇴근 스윕은 기동 시각에 따라 매일 달라진다 — 공식이 아니라 **오늘 몇 시인지**를
+    # 보여 준다. 사람이 알고 싶은 것은 규칙이 아니라 시각이다.
+    st_preview = AutoState()
+    eod_today = _eod_time(st_preview, auto)
+    if eod_today is None:
+        # 아직 기동 판정 전(첫 틱에서 정해진다) — 지금 켠 것으로 가정해 미리 보인다.
+        eod_guess = (_now() + _dt.timedelta(hours=float(auto["work_hours"]))
+                     - EOD_LEAD)
+        eod_text = f"{eod_guess:%H:%M} 예정(첫 틱에 확정)"
+    else:
+        eod_text = f"{eod_today:%H:%M}"
+        if _now().weekday() >= 5:
+            eod_text += " (주말이라 건너뜀)"
+    print(f" 근무시간      : {auto['work_hours']:g}시간 → 퇴근 스윕 {eod_text}")
     print(f" 평시 주기     : {int(auto['min_interval_sec']) // 60}분 · 틱 {tick_sec}초")
     if not quickedit:
         print(" [주의] QuickEdit을 끄지 못했습니다 — 창 안을 클릭하면 동기화가")
@@ -556,6 +688,7 @@ def run_loop(*, only: list[str] | None = None, extra: list[str] | None = None) -
     except KeyboardInterrupt:
         pass
 
+    _end_idle()
     print()
     print("자동 동기화를 멈췄습니다. 다시 켜려면 이 창을 닫고 다음 로그온을")
     print("기다리거나, synchere.bat --auto loop 를 실행하세요.")

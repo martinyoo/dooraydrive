@@ -217,6 +217,32 @@ def _fail(message: str, code: int = EXIT_FAIL) -> None:
     raise typer.Exit(code)
 
 
+# 실행 중인 명령의 보고 슬롯. sync가 채우고 _error_boundary가 예외 경로에서
+# 집어간다. 명령 하나가 프로세스 하나이므로 전역이어도 경합이 없다 — 대안은
+# sync 본문 전체를 try로 감싸는 재들여쓰기인데, 그쪽이 훨씬 위험하다.
+_ACTIVE_REPORT: dict | None = None
+_ACTIVE_REPORT_PATH: str = ""
+
+
+def _fail_report(exc: BaseException) -> None:
+    """예외로 끝나는 실행의 보고를 남긴다(설정돼 있을 때만).
+
+    안 남기면 무인 러너에게는 '종료코드 1'만 보이고, 그것으로는 와이파이가
+    끊긴 것과 Dooray가 아픈 것과 토큰이 만료된 것을 구분할 수 없다 — 셋은
+    사람이 할 일이 완전히 다르다(기다린다 / 문의한다 / 토큰을 다시 넣는다).
+    """
+    from ..api.faults import classify
+
+    report, path = _ACTIVE_REPORT, _ACTIVE_REPORT_PATH
+    if report is None or not path:
+        return
+    report.setdefault("outcome", "failed")
+    report["fault"] = classify(exc)
+    report["error"] = f"{type(exc).__name__}: {exc}"
+    report["finished_at"] = now_iso()
+    _write_report_json(path, report)
+
+
 @contextmanager
 def _error_boundary(log) -> Iterator[None]:
     """명령 본문의 예외를 사용자 메시지 + 종료코드로 옮긴다.
@@ -239,12 +265,20 @@ def _error_boundary(log) -> Iterator[None]:
     except AlreadyRunning as exc:
         _fail(str(exc), EXIT_LOCK)
     except TokenNotFound as exc:
+        _fail_report(exc)
         _fail(str(exc), EXIT_CONFIG)
     except DoorayApiError as exc:
-        log.error("API 오류: %s", exc)
+        from ..api.faults import ADVICE, LABEL, classify
+        fault = classify(exc)
+        _fail_report(exc)
+        log.error("API 오류(%s): %s", fault, exc)
         log.debug("API 오류 상세", exc_info=True)
+        # 사람에게는 분류와 다음 행동을 먼저 보인다 — 원문은 그 아래.
+        _err("")
+        _err(f"  [{LABEL.get(fault, fault)}] {ADVICE.get(fault, '')}")
         _fail(f"API 오류: {exc}", EXIT_FAIL)
     except Exception as exc:  # noqa: BLE001 — 최상위 경계
+        _fail_report(exc)
         log.exception("명령 실행 실패")
         _fail(f"실패: {type(exc).__name__}: {exc}", EXIT_FAIL)
 
@@ -2058,6 +2092,10 @@ def sync(
             "propagate_deletes": do_delete,
             "started_at": now_iso(),
         }
+        # 예외로 끝나도 보고가 남도록 경계에 넘겨 둔다(_fail_report).
+        global _ACTIVE_REPORT, _ACTIVE_REPORT_PATH
+        _ACTIVE_REPORT = run_report
+        _ACTIVE_REPORT_PATH = report_json if isinstance(report_json, str) else ""
 
         with _instance_lock(p.name):
             # 실제 모드는 DB(커서·백로그)를 열어 봐야 정해진다(_decide_full_pass).
@@ -2119,7 +2157,9 @@ def sync(
                            f"로컬이 일시적으로 무너진 상태일 수 있어 무인 실행을 "
                            f"보류합니다. 폴더를 확인한 뒤 synchere.bat 더블클릭으로 "
                            f"직접 실행하세요.")
+                    from ..api.faults import Fault
                     run_report["outcome"] = "held"
+                    run_report["fault"] = Fault.HELD
                     run_report["held_reason"] = "local_collapse"
                     run_report["finished_at"] = now_iso()
                     _write_report_json(report_json, run_report)
@@ -2202,7 +2242,13 @@ def sync(
                                        error: str = "") -> None:
                         """종료 시점의 보고 완성 + 기록. rate 카운터는 마지막에
                         스냅샷한다 — 실행 단계에서도 계속 증가하기 때문이다."""
+                        from ..api.faults import Fault
                         run_report["outcome"] = outcome
+                        run_report["fault"] = {
+                            "ok": Fault.OK, "no_changes": Fault.OK,
+                            "dry_run": Fault.OK, "partial": Fault.PARTIAL,
+                            "aborted_bulk_delete": Fault.HELD,
+                        }.get(outcome, Fault.UNKNOWN)
                         run_report["finished_at"] = now_iso()
                         # 페이크 클라이언트(테스트)는 counters가 없다 — 보고는 관측
                         # 수단이므로 없으면 빈 dict로 넘어간다(실행에 영향 금지).
