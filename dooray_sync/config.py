@@ -22,8 +22,11 @@ from .util.paths import ext_path
 
 __all__ = [
     "APP_NAME",
+    "AUTO_DEFAULTS",
     "DEFAULT_EXCLUDE",
     "Profile",
+    "load_auto",
+    "save_auto",
     "config_path",
     "state_dir",
     "db_path",
@@ -77,6 +80,13 @@ class Profile:
     # 'sync'(양방향) | 'push'(올리기 전용) | 'pull'(받기 전용) | 'off'(수동 push/pull만)
     sync_mode: str = "sync"
     sync_note: str = ""               # 결정 사유(사람이 읽는 문장) — 래퍼가 제외 사유로 출력
+    # 사람 없이 도는 자동 루프(M3)가 이 프로파일을 건드려도 되는가. **opt-in**이다.
+    # sync_mode와 AND로 걸린다 — sync_mode는 '무엇을 하는가', 이 값은 '누가 시키는가'.
+    # 켜는 창구는 synchere.bat --auto on(편입 게이트 통과 시)뿐이다.
+    auto_sync: bool = False
+    # 자동 해제가 sync_note를 덮기 전의 '사람이 쓴 사유'. 자동 복원은 하지 않는다 —
+    # 재등록 화면에 후보로 보여 주기만 한다(사람의 결정을 기계가 되살리지 않는다).
+    sync_note_prev: str = ""
     exclude: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDE))
 
     @property
@@ -446,3 +456,86 @@ def save_config(p: Profile) -> None:
 def config_exists(profile: str = "default") -> bool:
     name = _check_profile_name(profile)
     return isinstance(_profiles(_read_doc()).get(name), dict)
+
+
+# --------------------------------------------------------------------------
+# [auto] — 자동 동기화 루프의 전역 설정 (M3)
+# --------------------------------------------------------------------------
+# 프로파일별 값이 아니라 PC 단위 정책이라 최상위 테이블에 둔다. save_config이
+# 미지 최상위 테이블을 보존하므로(_read_doc → _dumps 왕복) 호환이 유지된다.
+AUTO_DEFAULTS: dict[str, Any] = {
+    # 출근(첫 틱)으로부터 몇 시간 뒤를 퇴근으로 볼 것인가. 퇴근 스윕은 그 15분 전.
+    # 07시 기동이면 15:45 스윕(퇴근 16시). 러너가 매 틱 읽으므로 값 변경은
+    # 재등록 없이 즉시 반영된다.
+    "work_hours": 9.0,
+    # 틱 간격(초). 창 안 루프가 이 간격으로 깨어난다.
+    "tick_sec": 120,
+    # 프로파일당 최소 동기화 간격(초). 사용자 결정(2026-08-16): 30분.
+    "min_interval_sec": 1800,
+    # 직전 틱과 이만큼 벌어졌으면 '출근'으로 본다(부팅·절전 복귀 포괄, 밤샘 가동
+    # PC의 자정 틱 오인 방지).
+    "day_gap_hours": 6.0,
+    # 무인 실행이 자동으로 허용하는 삭제 상한. 5영업일 관측 후 조정(단위 14).
+    "max_auto_deletes": 5,
+    "max_auto_delete_mb": 50,
+}
+
+
+def load_auto() -> dict[str, Any]:
+    """config의 [auto] 테이블 + 기본값. 손편집 오타는 기본값으로 떨어뜨린다 —
+    자동 루프가 설정 한 글자 때문에 안 도는 것이 더 나쁘다(보고는 한다)."""
+    doc = _read_doc()
+    raw = doc.get("auto")
+    raw = raw if isinstance(raw, dict) else {}
+    out: dict[str, Any] = dict(AUTO_DEFAULTS)
+    for key, default in AUTO_DEFAULTS.items():
+        if key not in raw:
+            continue
+        try:
+            out[key] = type(default)(raw[key])
+        except (TypeError, ValueError):
+            pass          # 기본값 유지
+    return out
+
+
+def save_auto(values: dict[str, Any]) -> None:
+    """[auto] 테이블의 일부 키를 갱신한다(나머지 키·프로파일은 그대로 보존).
+
+    save_config과 같은 왕복을 쓰지 않고 직접 쓰는 이유: save_config은 Profile
+    하나를 인자로 받는 함수라 프로파일 없는 갱신을 표현할 수 없다. 원자 교체와
+    '빈 문서면 쓰지 않는다' 방어는 동일하게 적용한다.
+    """
+    doc = _read_doc()
+    dest_probe = ext_path(config_path())
+    if not doc:
+        try:
+            with open(dest_probe, "rb") as f:
+                nonempty = bool(f.read(1))
+        except OSError:
+            nonempty = False
+        if nonempty:
+            raise RuntimeError(
+                f"설정 파일이 존재하는데 내용을 읽지 못했습니다: {config_path()}\n"
+                f"  덮어쓰면 다른 설정이 사라지므로 중단합니다.")
+    table = doc.get("auto")
+    table = dict(table) if isinstance(table, dict) else {}
+    table.update(values)
+    doc["auto"] = table
+
+    text = _dumps(doc)
+    dest = config_path()
+    os.makedirs(ext_path(dest.parent), exist_ok=True)
+    tmp = dest.with_name(f"{dest.name}.{uuid.uuid4().hex}.tmp")
+    ep_tmp = ext_path(tmp)
+    try:
+        with open(ep_tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(ep_tmp, ext_path(dest))
+    except BaseException:
+        try:
+            os.remove(ep_tmp)
+        except OSError:
+            pass
+        raise

@@ -474,15 +474,37 @@ def main(argv: list[str]) -> int:
     extra = args
 
     # --auto <동사>는 이 파일(단일 접점)이 소비한다 — 자식(dsync sync)까지 흘러가면
-    # typer가 알 수 없는 인자로 exit 2를 내고, 그 전에 원시 종료코드가 배치의 30회
-    # 재시도 루프를 깨울 수 있다(설계 §2.5). 디스패치는 M3 단위 7에서 붙는다.
+    # typer가 알 수 없는 인자로 죽고, 그 원시 종료코드가 배치의 30회 재시도 루프를
+    # 깨울 수 있다(설계 §2.5).
     # 종료코드 계약(§2.4): --auto 경로는 0 또는 2만 — 1(재시도 유도)을 절대 내지 않는다.
-    if "--auto" in extra or "--auto-run" in extra:
-        print("--auto 는 아직 준비 중입니다(M3 자동 동기화). 지금은 인자 없이 실행하세요.")
-        return 2
+    auto_verb: str | None = None
+    auto_all = False
+    if "--auto" in extra:
+        i = extra.index("--auto")
+        if i + 1 >= len(extra):
+            print("사용법: synchere.bat --auto <on|off|status|now|loop> [--all]")
+            return 2
+        auto_verb = extra[i + 1]
+        del extra[i:i + 2]
+        if "--all" in extra:
+            auto_all = True
+            extra.remove("--all")
 
     # 설정이 아직 없어도 계속 간다 — 새 PC의 첫 등록이 설정을 만든다(자동 등록 경로).
     profiles = _load_profiles()
+
+    if auto_verb is not None:
+        from dooray_sync.auto.cli import dispatch
+        # 대상 해석은 사람 경로와 **같은 함수**를 쓴다 — 상향/하향 규칙이 갈라지면
+        # "이 폴더에서 켰는데 다른 게 켜졌다"가 된다.
+        targets = resolve_targets(root, profiles)
+        try:
+            return dispatch(auto_verb, profiles=profiles, targets=targets,
+                            all_=auto_all, extra=extra)
+        except KeyboardInterrupt:
+            print()
+            print("중단했습니다.")
+            return 0
 
     # 정합 전용 모드 — SYNC.ps1 -Sync가 실행 전에 호출한다(규칙 구현은 이 파일 한 곳).
     # --emit-modes <파일>: 정합 후의 유효 mode를 "이름\t모드\t재등록예정(0|1)" 줄로
