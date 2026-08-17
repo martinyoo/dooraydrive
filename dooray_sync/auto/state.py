@@ -56,7 +56,13 @@ class AutoState:
     """state.json의 얇은 래퍼. 키를 문자열로 흩뿌리지 않기 위한 것뿐이다."""
 
     def __init__(self, data: dict[str, Any] | None = None) -> None:
-        self.data: dict[str, Any] = dict(data) if data else load_state()
+        # `data`가 진짜 없을 때만(=None) 디스크를 읽는다. `if data`(진리값)로
+        # 판정하면 빈 dict({})가 falsy라 "명시적으로 빈 상태로 시작"과
+        # "인자 생략 = 디스크에서 읽어라"를 구분하지 못한다. 실측 2026-08-18:
+        # 테스트가 AutoState({})로 빈 상태를 요청했는데 이 PC에서 실제로 도는
+        # 루프의 진짜 state.json을 몰래 읽어, 날짜가 지나며 값이 쌓이자
+        # 결정론적이어야 할 판정 테스트가 실제 기기 상태에 따라 흔들렸다.
+        self.data: dict[str, Any] = load_state() if data is None else dict(data)
 
     # ---------- 하루 경계 ----------
     @property
