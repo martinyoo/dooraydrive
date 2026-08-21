@@ -681,3 +681,243 @@ def test_korean_folder_registers_end_to_end(cfgdir, monkeypatch):
     assert sh.main(["--root", str(target)]) == 0
     cfg._check_profile_name(seen[0][seen[0].index("-p") + 1])
     assert seen[0][seen[0].index("--remote-path") + 1] == "근무환경"
+
+
+# ---------------------------------------------------------------------------
+# 미해결 충돌 안내 · 대화식 resolve 결선
+#
+# 이 절이 없으면 호출 지점(_run_sync 안의 _note_conflicts, main·_register_and_sync
+# 안의 _offer_resolve)을 지우는 mutation이 그대로 생존한다 — 이 저장소가 반복해
+# 겪은 '결선 공백' 유형이다(test_sibling_registration_places_marker와 같은 사유).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clear_pending():
+    """_PENDING_CONFLICTS는 모듈 전역이다 — 테스트 간에 새면 판정이 섞인다."""
+    sh = _sync_here()
+    sh._PENDING_CONFLICTS.clear()
+    yield
+    sh._PENDING_CONFLICTS.clear()
+
+
+def _mk_state_db(name: str, unresolved: int, *, resolved: int = 0) -> Path:
+    """conflicts 테이블만 가진 최소 상태 DB — _unresolved_count의 질의만 검증한다."""
+    import sqlite3
+
+    path = Path(cfg.db_path(name))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("CREATE TABLE conflicts (id INTEGER PRIMARY KEY, resolved INTEGER)")
+        conn.executemany("INSERT INTO conflicts (resolved) VALUES (?)",
+                         [(0,)] * unresolved + [(1,)] * resolved)
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+def test_unresolved_count_missing_db_is_zero_and_creates_nothing(cfgdir):
+    """DB가 없으면 0. **파일을 만들면 안 된다** — 빈 DB가 생기면 무인 편입 게이트의
+    '상태 DB 없음' 판정(auto/gate.py)이 다음부터 통과해 버린다."""
+    sh = _sync_here()
+    assert sh._unresolved_count("nodb") == 0
+    assert not Path(cfg.db_path("nodb")).exists()
+
+
+def test_unresolved_count_counts_only_unresolved(cfgdir):
+    sh = _sync_here()
+    _mk_state_db("a", 3, resolved=2)
+    assert sh._unresolved_count("a") == 3
+
+
+def test_unresolved_count_swallows_any_failure(cfgdir):
+    """손상된 DB든 스키마 불일치든 0으로 떨어져야 한다 — 안내는 부수 기능이고,
+    여기서 예외가 나면 성공한 동기화가 rc 1이 되어 배치의 30회 재시도 루프가
+    성공한 실행에 대해 돈다."""
+    sh = _sync_here()
+    path = Path(cfg.db_path("broken"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"this is not a sqlite file")
+    assert sh._unresolved_count("broken") == 0
+
+
+def test_note_conflicts_records_only_when_positive(cfgdir):
+    sh = _sync_here()
+    _mk_state_db("zero", 0)
+    _mk_state_db("some", 2)
+    sh._note_conflicts("zero", "C:\\zero")
+    assert sh._PENDING_CONFLICTS == []
+    sh._note_conflicts("some", "C:\\some")
+    assert sh._PENDING_CONFLICTS == [("some", "C:\\some", 2)]
+
+
+@pytest.mark.parametrize("answer,expected", [
+    ("y", True), ("Y", True), ("yes", True), ("YES", True),
+    ("n", False), ("", False), ("아니오", False), ("both", False),
+])
+def test_ask_yes_no_only_yes_means_yes(monkeypatch, answer, expected):
+    sh = _sync_here()
+    monkeypatch.setattr("builtins.input", lambda *a, **k: answer)
+    assert sh._ask_yes_no("? ") is expected
+
+
+@pytest.mark.parametrize("exc", [EOFError, KeyboardInterrupt, OSError, ValueError])
+def test_ask_yes_no_treats_every_failure_as_no(monkeypatch, exc):
+    """EOF·Ctrl+C는 '아니오'다. 여기서 예외가 새면 성공한 동기화가 뒤집힌다."""
+    sh = _sync_here()
+
+    def _boom(*a, **k):
+        raise exc()
+
+    monkeypatch.setattr("builtins.input", _boom)
+    assert sh._ask_yes_no("? ") is False
+
+
+def test_ask_yes_no_survives_none_streams(monkeypatch):
+    """pythonw(콘솔 없음)에서는 sys.stdin/stdout이 None이다 — 맨몸 isatty()는
+    AttributeError로 죽는다(이 파일이 stdout/stderr를 방어하는 것과 같은 사유)."""
+    sh = _sync_here()
+    monkeypatch.setattr(sys, "stdin", None)
+    assert sh._ask_yes_no("? ") is False
+
+
+def test_offer_resolve_is_noop_when_nothing_pending(monkeypatch):
+    sh = _sync_here()
+    asked = []
+    monkeypatch.setattr(sh, "_ask_yes_no", lambda q: asked.append(q) or False)
+    sh._offer_resolve([])
+    assert asked == []
+
+
+@pytest.mark.parametrize("flag", ["--dry-run", "--unattended"])
+def test_offer_resolve_reports_without_asking_when_not_interactive(monkeypatch, capsys, flag):
+    """dry-run은 아무것도 바꾸지 않고, --unattended는 사람이 없다 — 둘 다 묻지 않는다."""
+    sh = _sync_here()
+    asked, ran = [], []
+    monkeypatch.setattr(sh, "_ask_yes_no", lambda q: asked.append(q) or True)
+    monkeypatch.setattr(sh, "_run_resolve", lambda n: ran.append(n) or 0)
+    sh._PENDING_CONFLICTS.append(("a", "C:\\a", 2))
+
+    sh._offer_resolve([flag])
+
+    assert asked == [] and ran == []
+    assert "미해결 충돌 2건" in capsys.readouterr().out
+
+
+def test_offer_resolve_answer_no_does_not_launch(monkeypatch, capsys):
+    sh = _sync_here()
+    ran = []
+    monkeypatch.setattr(sh, "_ask_yes_no", lambda q: False)
+    monkeypatch.setattr(sh, "_run_resolve", lambda n: ran.append(n) or 0)
+    sh._PENDING_CONFLICTS.append(("a", "C:\\a", 1))
+
+    sh._offer_resolve([])
+
+    assert ran == []
+    assert "dsync resolve -p a" in capsys.readouterr().out
+
+
+def test_offer_resolve_answer_yes_launches_and_reports_remaining(monkeypatch, capsys):
+    """resolve의 종료코드는 수렴의 증거가 아니다 — **다시 센 건수**로 말해야 한다."""
+    sh = _sync_here()
+    ran = []
+    monkeypatch.setattr(sh, "_ask_yes_no", lambda q: True)
+    monkeypatch.setattr(sh, "_run_resolve", lambda n: ran.append(n) or 0)
+    monkeypatch.setattr(sh, "_unresolved_count", lambda n: 1)   # 처리 후에도 남았다
+    sh._PENDING_CONFLICTS.append(("a", "C:\\a", 3))
+
+    sh._offer_resolve([])
+
+    assert ran == ["a"]
+    assert "남은 충돌 1건" in capsys.readouterr().out
+
+
+def test_offer_resolve_never_raises(monkeypatch, capsys):
+    """자식이 어떤 식으로 죽어도 종료코드를 오염시키지 않는다."""
+    sh = _sync_here()
+
+    def _boom(_name):
+        raise RuntimeError("자식 폭발")
+
+    monkeypatch.setattr(sh, "_ask_yes_no", lambda q: True)
+    monkeypatch.setattr(sh, "_run_resolve", _boom)
+    sh._PENDING_CONFLICTS.append(("a", "C:\\a", 1))
+
+    sh._offer_resolve([])     # 예외가 새면 이 줄에서 테스트가 깨진다
+
+    assert "영향 없음" in capsys.readouterr().out
+
+
+def test_offer_resolve_drains_pending(monkeypatch):
+    """두 번 불러도 두 번 묻지 않는다 — _register_and_sync와 main이 둘 다 부른다."""
+    sh = _sync_here()
+    asked = []
+    monkeypatch.setattr(sh, "_ask_yes_no", lambda q: asked.append(q) or False)
+    sh._PENDING_CONFLICTS.append(("a", "C:\\a", 1))
+
+    sh._offer_resolve([])
+    sh._offer_resolve([])
+
+    assert len(asked) == 1
+
+
+@pytest.mark.parametrize("rc,extra,expected", [
+    (0, [], ["a"]),                 # 성공 → 센다
+    (1, [], []),                    # 실패한 sync 뒤에는 아무 안내도 하지 않는다
+    (0, ["--dry-run"], []),         # dry-run은 세지도 않는다
+])
+def test_run_sync_notes_conflicts_only_on_real_success(monkeypatch, rc, extra, expected):
+    """결선: _run_sync 안의 _note_conflicts 호출을 지우면 이 테스트가 깨진다."""
+    import types
+    sh = _sync_here()
+    noted = []
+    monkeypatch.setattr(sh, "subprocess",
+                        types.SimpleNamespace(call=lambda *a, **k: rc))
+    monkeypatch.setattr(sh, "_ensure_marker", lambda n: None)
+    monkeypatch.setattr(sh, "_note_conflicts", lambda n, r: noted.append(n))
+
+    assert sh._run_sync("a", "C:\\a", list(extra)) == rc
+    assert noted == expected
+
+
+def test_main_offers_resolve_after_the_loop(cfgdir, monkeypatch):
+    """결선: main()의 _offer_resolve 호출을 지우면 이 테스트가 깨진다."""
+    sh = _sync_here()
+    root = _root(cfgdir, "folder", marker=True)
+    _mk_profile("a", root, "sync")
+    offered = []
+    monkeypatch.setattr(sh, "_run_sync", lambda n, r, e: 0)
+    monkeypatch.setattr(sh, "_offer_resolve", lambda e: offered.append(tuple(e)))
+
+    assert sh.main(["--root", str(root)]) == 0
+    assert offered == [()]
+
+
+def test_resolve_flag_resolves_without_syncing(cfgdir, monkeypatch, capsys):
+    """`synchere.bat --resolve` — 동기화는 하지 않고 충돌만 처리한다."""
+    sh = _sync_here()
+    root = _root(cfgdir, "folder", marker=True)
+    _mk_profile("a", root, "sync")
+    synced, resolved = [], []
+    monkeypatch.setattr(sh, "_run_sync", lambda n, r, e: synced.append(n) or 0)
+    monkeypatch.setattr(sh, "_run_resolve", lambda n: resolved.append(n) or 0)
+    monkeypatch.setattr(sh, "_unresolved_count", lambda n: 2)
+
+    assert sh.main(["--root", str(root), "--resolve"]) == 0
+    assert synced == [] and resolved == ["a"]
+    assert "미해결 충돌 2건" in capsys.readouterr().out
+
+
+def test_resolve_flag_says_nothing_to_do_when_clean(cfgdir, monkeypatch, capsys):
+    sh = _sync_here()
+    root = _root(cfgdir, "folder", marker=True)
+    _mk_profile("a", root, "sync")
+    resolved = []
+    monkeypatch.setattr(sh, "_run_resolve", lambda n: resolved.append(n) or 0)
+    monkeypatch.setattr(sh, "_unresolved_count", lambda n: 0)
+
+    assert sh.main(["--root", str(root), "--resolve"]) == 0
+    assert resolved == []
+    assert "처리할 충돌이 없습니다" in capsys.readouterr().out

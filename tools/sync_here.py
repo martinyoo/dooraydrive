@@ -43,8 +43,13 @@ sync 실행 여부는 config.toml의 **sync_mode**가 정한다(단일 정본 �
 ALWAYS_EXCLUDE). 해제 시에도 원격 마커는 지우지 않는다(삭제 무전파 + 다른 PC의
 발견 힌트 — 정리는 tools/trash_toolfile.py 수동). dry-run에서는 아무것도 쓰지 않는다.
 
+동기화가 충돌을 남기면 그 자리에서 이어 처리할 수 있다 — 프로파일 루프가 전부
+끝난 뒤 건수를 모아 보여 주고, **동의할 때만**(기본값 아니오) 같은 창에서
+`dsync resolve`를 띄운다. 자세한 사유는 `_offer_resolve` 위 주석 참조.
+
 실행:  python tools\\sync_here.py [--root <폴더>] [dsync sync 추가 인자...]
        python tools\\sync_here.py --check-markers [--dry-run]   (정합만, sync 없음)
+       python tools\\sync_here.py --resolve                     (충돌 해결만, sync 없음)
 """
 from __future__ import annotations
 
@@ -432,7 +437,11 @@ def _register_and_sync(abs_root: str, profiles: dict[str, dict],
         return 2 if rc == 2 else 1
     _ensure_local_marker(abs_root)
     print()
-    return _run_sync(pname, abs_root, extra)
+    rc = _run_sync(pname, abs_root, extra)
+    # 자동 등록 직후의 첫 동기화가 바로 대량 충돌이 나는 지점이다 — main()의
+    # 결선만으로는 이 경로가 빠지므로 여기서도 부른다.
+    _offer_resolve(extra)
+    return rc
 
 
 def _explain_skip(name: str, info: dict) -> None:
@@ -477,7 +486,143 @@ def _run_sync(name: str, root: str, extra: list[str]) -> int:
     rc = subprocess.call(cmd, env=_child_env())
     if rc == 0 and "--dry-run" not in extra:
         _ensure_marker(name)
+        # 묻는 것은 여기가 아니다 — 건수만 적어 둔다(아래 _offer_resolve 주석 참조).
+        _note_conflicts(name, root)
     return rc
+
+
+# --------------------------------------------------------------------------
+# 미해결 충돌 — 같은 터미널에서 이어서 처리하기
+# --------------------------------------------------------------------------
+# sync가 만든 충돌은 `dsync resolve`로만 풀린다. 예전에는 배치 창이 닫히기 전에
+# 사용자가 그 안내문을 읽고 따로 명령을 쳐야 했다. 이제 성공한 동기화 뒤에
+# 건수를 모아 보여 주고, **사람이 명시적으로 동의할 때만** 같은 창에서 띄운다.
+#
+# 왜 '자동으로 바로 띄우기'가 아닌가 — 적대 검증(2026-08-21)이 잡아낸 것들:
+#  1. resolve는 충돌 1건마다 프롬프트를 띄우고 중도 이탈 수단이 없다. 프로파일
+#     루프 **안에서** 띄우면, 하향 실행(WORK 등 상위 폴더)의 뒤쪽 프로파일이
+#     사람이 답할 때까지 통째로 멈춘다 — 오늘 되던 일이 안 되는 순수 회귀다.
+#     그래서 루프가 **전부 끝난 뒤** 한 번만 묻는다.
+#  2. 프롬프트에서 Ctrl+C를 누르면 Windows 콘솔은 같은 콘솔의 부모까지 죽인다.
+#     그러면 성공한 동기화가 비정상 종료코드로 끝나 synchere.bat의 30회 재시도
+#     루프를 깨운다. 그래서 '아니오'라는 답을 먼저 주고(기본값), 모든 경로를
+#     KeyboardInterrupt까지 삼킨다.
+#  3. resolve는 사람이 답하는 내내 프로파일 인스턴스 락을 쥔다 — 그동안 그
+#     프로파일의 자동 동기화가 막힌다. 묻기 전에 그 사실을 알린다.
+#  4. **Windows에서 NUL은 문자 장치라 stdin=DEVNULL에서도 isatty()가 True다**
+#     (2026-08-21 실측). isatty만으로는 '사람이 보고 있다'를 판정할 수 없다.
+#     그래서 판정을 isatty에 걸지 않고, 기본값이 '아니오'인 질문 하나로 거른다 —
+#     EOF·None 스트림·잘못된 입력은 전부 '아니오'로 읽힌다.
+#
+# 이 절의 어떤 것도 종료코드를 바꾸지 않는다. 동기화는 이미 끝났고, 여기서
+# 무슨 일이 일어나도 그 결과를 뒤집지 않는다.
+
+# (프로파일, 로컬 루트, 건수) — _run_sync가 적고 _offer_resolve가 비운다.
+_PENDING_CONFLICTS: list[tuple[str, str, int]] = []
+
+
+def _unresolved_count(name: str) -> int:
+    """미해결 충돌 건수. **읽기 전용**이며 어떤 실패도 삼킨다(0으로 떨어뜨린다).
+
+    Store를 쓰지 않는다 — Store는 없는 DB를 **새로 만들고** 스키마를 올린다.
+    빈 DB가 생기면 무인 편입 게이트의 '상태 DB 없음' 판정(auto/gate.py:61-63)이
+    다음부터 통과해 버린다. runner._last_sync_at과 같은 mode=ro URI로 연다.
+    """
+    try:
+        import sqlite3
+
+        from dooray_sync.config import db_path
+
+        path = db_path(name)
+        if not os.path.exists(ext_path(path)):
+            return 0
+        text = str(path).replace("\\", "/").replace("?", "%3F").replace("#", "%23")
+        conn = sqlite3.connect(f"file:{text}?mode=ro", uri=True, timeout=2.0)
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM conflicts WHERE resolved = 0").fetchone()
+        finally:
+            conn.close()
+        return int(row[0]) if row else 0
+    except Exception:   # noqa: BLE001 — 안내는 부수 기능이다. 종료코드를 건드리면 안 된다.
+        return 0
+
+
+def _note_conflicts(name: str, root: str) -> None:
+    """성공한 sync 뒤 호출 — 건수만 적어 둔다. 여기서 묻지 않는다(위 사유 1)."""
+    n = _unresolved_count(name)
+    if n > 0:
+        _PENDING_CONFLICTS.append((name, root, n))
+
+
+def _ask_yes_no(question: str) -> bool:
+    """기본값 '아니오'인 단일 질문. EOF·Ctrl+C·None 스트림은 전부 '아니오'.
+
+    배치 UI가 사용자에게 ANY-KEY를 훈련시켜 두었으므로, 타입어헤드가 그대로
+    답이 되어도 안전한 쪽(아무것도 하지 않음)으로 떨어지게 만든다.
+    """
+    if sys.stdin is None or sys.stdout is None:
+        return False
+    try:
+        ans = input(question).strip().lower()
+    except (EOFError, KeyboardInterrupt, OSError, ValueError):
+        print()
+        return False
+    return ans in ("y", "yes")
+
+
+def _run_resolve(name: str) -> int:
+    """`dsync resolve -p <name>`를 같은 콘솔에서 띄운다(대화식)."""
+    print(f"[프로파일 '{name}'] 충돌 해결")
+    cmd = [sys.executable, "-P", "-m", "dooray_sync.cli.main", "resolve", "-p", name]
+    try:
+        return subprocess.call(cmd, env=_child_env())
+    except KeyboardInterrupt:
+        # 같은 콘솔의 Ctrl+C는 부모에게도 온다 — 여기서 삼켜야 종료코드 계약이 산다.
+        print()
+        print("  중단했습니다 — 해결하지 않은 충돌은 그대로 남습니다.")
+        return 1
+
+
+def _offer_resolve(extra: list[str]) -> None:
+    """모아 둔 미해결 충돌을 알리고, 동의하면 이어서 처리한다. rc에 영향 없음."""
+    pending = list(_PENDING_CONFLICTS)
+    _PENDING_CONFLICTS.clear()
+    if not pending:
+        return
+    try:
+        total = sum(n for _, _, n in pending)
+        print()
+        print("=" * 70)
+        print(f"미해결 충돌 {total}건 — 양쪽이 다르게 바뀌어 로컬 원본을 사본으로 보존했습니다.")
+        for name, root, n in pending:
+            # 프로파일 이름이 아니라 **로컬 루트**를 함께 찍는다 — 자동 등록이 만든
+            # 이름은 한글 폴더에서 folder/folder2가 되어 어느 폴더인지 알 수 없다.
+            print(f"  [{name}] {n}건   {root}")
+            print(f"          dsync resolve -p {name}")
+        if "--dry-run" in extra or "--unattended" in extra:
+            return
+        print()
+        print("지금 처리하면 충돌마다 어느 쪽을 살릴지 하나씩 묻습니다.")
+        print("처리하는 동안 그 프로파일의 자동 동기화는 대기합니다(잠금을 쥡니다).")
+        if not _ask_yes_no("지금 처리하시겠습니까? [y/N]: "):
+            print("나중에 하려면 위 명령 또는 `synchere.bat --resolve` 를 실행하세요.")
+            return
+        for name, _root, _n in pending:
+            print()
+            rc = _run_resolve(name)
+            left = _unresolved_count(name)
+            if left:
+                # resolve의 exit 0은 수렴의 증거가 아니다(토큰 실패 시 강등되고,
+                # 락 경합은 3으로 끝난다). 종료코드가 아니라 **다시 센 건수**로 말한다.
+                print(f"  [{name}] 남은 충돌 {left}건 (resolve 종료코드 {rc}) — "
+                      f"다시 하려면: dsync resolve -p {name}")
+            else:
+                print(f"  [{name}] 충돌을 모두 처리했습니다. 다음 동기화에 반영됩니다.")
+    except (Exception, KeyboardInterrupt) as exc:   # noqa: BLE001
+        print()
+        print(f"(충돌 안내를 마치지 못했습니다 — 동기화 결과에는 영향 없음: "
+              f"{type(exc).__name__}: {exc})")
 
 
 def _print_auto_notices() -> None:
@@ -586,6 +731,32 @@ def main(argv: list[str]) -> int:
             print()
             print("중단했습니다.")
             return 0
+
+    # 충돌 해결 전용 모드 — `synchere.bat --resolve`. 동기화는 하지 않는다.
+    # 동기화 뒤 물음에 '아니오'로 답했거나, 창을 닫았다가 나중에 처리하려는 경우의
+    # 명시적 입구다. --auto와 같은 이유로 이 파일이 인자를 소비한다(자식까지
+    # 흘러가면 typer가 알 수 없는 인자로 죽는다).
+    if "--resolve" in extra:
+        extra.remove("--resolve")
+        targets = resolve_targets(root, profiles)
+        if not targets:
+            print(f"이 폴더에 등록된 동기화 대상이 없습니다: {root}")
+            return 2
+        any_left = False
+        for name, info in targets:
+            n = _unresolved_count(name)
+            if n == 0:
+                print(f"[{name}] 미해결 충돌 없음")
+                continue
+            any_left = True
+            print(f"[{name}] 미해결 충돌 {n}건   {info['root']}")
+            _run_resolve(name)
+            left = _unresolved_count(name)
+            print(f"  → 남은 충돌 {left}건")
+            print()
+        if not any_left:
+            print("처리할 충돌이 없습니다.")
+        return 0
 
     # 정합 전용 모드 — SYNC.ps1 -Sync가 실행 전에 호출한다(규칙 구현은 이 파일 한 곳).
     # --emit-modes <파일>: 정합 후의 유효 mode를 "이름\t모드\t재등록예정(0|1)" 줄로
@@ -697,6 +868,10 @@ def main(argv: list[str]) -> int:
             # 본다 — 보류·충돌은 방금 이 실행이 계획을 보여 주고 처리했다.
             _clear_auto_notices(name)
         print()
+
+    # 프로파일 루프가 **전부 끝난 뒤** 한 번만 묻는다 — 루프 안에서 물으면
+    # 하향 실행의 뒤쪽 프로파일이 사람 대기에 인질이 된다(설계 사유 1).
+    _offer_resolve(extra)
 
     _print_auto_footer(targets)
 
