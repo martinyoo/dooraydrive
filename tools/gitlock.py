@@ -71,33 +71,67 @@ class Action:
 
 
 # ---------------------------------------------------------------- 판정
-# BASELINE: lib.ps1:110 과 같은 결함을 의도적으로 유지한다.
-# `index.lock` 만 본다 — HEAD.lock / refs/*.lock / config.lock / shallow.lock 을
-# 놓친다. 하버스의 R8 이 이것을 잡는다.
-_LOCK_PATTERNS = (
-    r"index\.lock",
-)
+# 잠금 종류를 **열거하지 않는다.** git 이 잠금 오류를 낼 때 대부분 잠금 파일의
+# 경로를 문구에 그대로 싣기 때문이다(2026-08-30 실측):
+#
+#   index    fatal: Unable to create '<repo>/.git/index.lock': File exists.
+#   HEAD     fatal: cannot lock ref 'HEAD': Unable to create '<repo>/.git/HEAD.lock': ...
+#   refs     fatal: cannot lock ref 'HEAD': Unable to create '<repo>/.git/refs/heads/main.lock': ...
+#   config   error: could not lock config file .git/config: File exists   <- 경로에 .lock 이 없다
+#
+# 이름 목록을 쓰면 새 잠금 종류가 생길 때마다 목록이 낡는다 — 그것이
+# lib.ps1:110 과 capture.py:133 이 함께 앓던 병이다. 경로를 뽑아내면
+# 목록을 유지할 필요가 없다.
+_LOCK_PATH = re.compile(r"['\"]([^'\"]*\.lock)['\"]")
+# config 만 예외 — 경로에 .lock 이 안 붙는다. 이것만 별도로 잡는다.
+# `[^:\s]+` 인 이유: 문구가 "...config file .git/config: File exists" 라
+# `\S+` 로 받으면 뒤따르는 콜론까지 삼켜 'config:.lock' 이 된다(실측).
+_CONFIG_LOCK = re.compile(r"could not lock config file\s+([^:\s]+)", re.IGNORECASE)
+# 마지막 그물: 경로를 못 뽑아도 '잠금 실패'라는 것은 알 수 있다.
+_LOCK_HINT = re.compile(
+    r"cannot lock ref|could not lock|Unable to create.*File exists|"
+    r"index\.lock|another git process", re.IGNORECASE)
 
 
 def classify(stderr: str, repo: Path | str) -> LockState:
-    """git stderr 를 보고 잠금 오류인지, 어떤 잠금인지, 산 것인지 판정한다."""
+    """git stderr 를 보고 잠금 오류인지, 어떤 잠금인지, 산 것인지 판정한다.
+
+    판정 순서가 중요하다. **경로를 먼저 뽑고, 못 뽑으면 힌트로 떨어진다.**
+    경로를 얻으면 그 파일을 직접 조사할 수 있고(살아있음·크기), 못 얻으면
+    '잠금 문제인 건 알지만 어느 것인지 모른다' = 판단 불가 = 멈춤이다.
+    """
     repo = Path(repo)
     state = LockState(raw=stderr or "")
+    text = state.raw
 
-    name = None
-    for pattern in _LOCK_PATTERNS:
-        if re.search(pattern, state.raw, re.IGNORECASE):
-            name = re.search(pattern, state.raw, re.IGNORECASE).group(0)
-            break
-    if not name:
+    path: Path | None = None
+    m = _LOCK_PATH.search(text)
+    if m:
+        path = Path(m.group(1))
+    else:
+        mc = _CONFIG_LOCK.search(text)
+        if mc:
+            # '.git/config' 를 가리키므로 실제 잠금은 그 옆의 config.lock 이다
+            raw = mc.group(1)
+            cand = Path(raw) if Path(raw).is_absolute() else repo / raw
+            path = cand.with_name(cand.name + ".lock")
+
+    if path is None:
+        if not _LOCK_HINT.search(text):
+            return state                      # 잠금 오류가 아니다
+        # 잠금 문제인 건 아는데 대상을 모른다 — 진행하지 않는다.
+        state.is_lock_error = True
+        state.name = "(경로 불명)"
+        state.live = None
         return state
 
+    if not path.is_absolute():
+        path = repo / path
     state.is_lock_error = True
-    state.name = name
-
-    path = _find_lock_file(repo, name)
+    state.name = path.name
     state.path = path
-    if path is None or not path.exists():
+
+    if not path.exists():
         # 오류는 났는데 파일이 없다 — 그 사이 누가 치웠다. 판단 불가.
         state.live = None
         return state
@@ -105,17 +139,6 @@ def classify(stderr: str, repo: Path | str) -> LockState:
     state.empty = path.stat().st_size == 0
     state.live = _is_held(path)
     return state
-
-
-def _find_lock_file(repo: Path, name: str) -> Path | None:
-    direct = repo / ".git" / name
-    if direct.exists():
-        return direct
-    gitdir = repo / ".git"
-    if gitdir.is_dir():
-        for candidate in gitdir.rglob(name):
-            return candidate
-    return None
 
 
 def _is_held(path: Path) -> bool | None:

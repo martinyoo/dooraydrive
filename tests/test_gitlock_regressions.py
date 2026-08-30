@@ -29,13 +29,11 @@ def scn(tmp_path):
 
 
 # ---------------------------------------------------------------- R8 (baseline 결함)
-@pytest.mark.xfail(strict=True, reason=(
-    "baseline: lib.ps1:110 의 index.lock 전용 정규식을 그대로 옮겼다. "
-    "HEAD.lock 을 못 잡는 것이 현재 상태이고, 이것이 개선 대상 1번이다."))
 def test_R8_head_lock_is_recognized(scn):
-    """R8 — `index.lock` 재시도는 되는데 `HEAD.lock` 은 정규식에 안 걸린다.
+    """R8 — `index.lock` 재시도는 되는데 `HEAD.lock` 은 정규식에 안 걸렸다.
 
     2026-08-30 실패가 정확히 이것이었다. git 이 낸 오류 문구를 그대로 쓴다.
+    baseline(이름 열거 방식)에서 실패했고, 경로 추출 방식으로 바꿔 통과한다.
     """
     scn.make_lock(sc.LockSpec(".git/HEAD.lock", "dead-empty"))
     stderr = ("fatal: cannot lock ref 'HEAD': Unable to create "
@@ -44,15 +42,62 @@ def test_R8_head_lock_is_recognized(scn):
     state = gitlock.classify(stderr, scn.work)
 
     assert state.is_lock_error, "HEAD.lock 을 잠금 오류로 인식하지 못했다"
+    assert state.name == "HEAD.lock"
+    assert state.live is False and state.empty is True
 
 
-@pytest.mark.xfail(strict=True, reason="baseline: refs/*.lock 도 같은 이유로 미포착")
 def test_R8b_ref_lock_is_recognized(scn):
     scn.make_lock(sc.LockSpec(".git/refs/heads/main.lock", "dead-empty"))
-    stderr = ("error: cannot lock ref 'refs/heads/main': Unable to create "
+    stderr = ("fatal: cannot lock ref 'HEAD': Unable to create "
               f"'{scn.work}/.git/refs/heads/main.lock': File exists.")
 
-    assert gitlock.classify(stderr, scn.work).is_lock_error
+    state = gitlock.classify(stderr, scn.work)
+    assert state.is_lock_error and state.name == "main.lock"
+
+
+def test_R8c_config_lock_is_recognized(scn):
+    """config 만 문구 형태가 다르다 — 경로에 `.lock` 이 안 붙는다.
+
+        error: could not lock config file .git/config: File exists
+
+    이름 열거 방식이든 경로 추출 방식이든 이것만은 특수 처리가 필요하다.
+    실측으로 확인한 유일한 예외라 테스트로 못 박는다.
+    """
+    scn.make_lock(sc.LockSpec(".git/config.lock", "dead-empty"))
+    stderr = "error: could not lock config file .git/config: File exists"
+
+    state = gitlock.classify(stderr, scn.work)
+
+    assert state.is_lock_error, "config.lock 을 인식하지 못했다"
+    assert state.name == "config.lock"
+
+
+def test_unknown_lock_type_is_still_caught(scn):
+    """**이름 목록을 쓰지 않는 것의 값** — 처음 보는 잠금도 잡힌다.
+
+    git 이 새 잠금을 도입해도, 목록을 갱신하지 않아도 걸린다. 이것이
+    lib.ps1:110 과 capture.py:133 이 함께 앓던 병의 구조적 해법이다.
+    """
+    scn.make_lock(sc.LockSpec(".git/shallow.lock", "dead-empty"))
+    stderr = f"fatal: Unable to create '{scn.work}/.git/shallow.lock': File exists."
+
+    state = gitlock.classify(stderr, scn.work)
+    assert state.is_lock_error and state.name == "shallow.lock"
+
+
+def test_lock_error_without_path_stops(scn):
+    """경로를 못 뽑으면 '잠금인 건 알지만 대상을 모른다' = 멈춤.
+
+    모르는 채 진행하는 것이 이 프로젝트에서 반복된 사고의 형태다.
+    """
+    stderr = ("Another git process seems to be running in this repository. "
+              "Please make sure all processes are terminated then try again.")
+
+    state = gitlock.classify(stderr, scn.work)
+
+    assert state.is_lock_error
+    assert state.live is None
+    assert gitlock.decide(state) == gitlock.Action.STOP
 
 
 # ---------------------------------------------------------------- 지금도 통과해야 하는 것
