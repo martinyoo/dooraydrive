@@ -13,6 +13,8 @@
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from tests.gitlock_harness import scenario as sc
@@ -165,9 +167,36 @@ def test_dead_remnant_is_quarantined_not_deleted(scn):
 
     assert result["action"] == gitlock.Action.QUARANTINE
     assert result["quarantined"], "격리 경로가 비었다"
-    moved = scn.root / "work" / "_to_delete" / "locks"
+    moved = gitlock.quarantine_dir(scn.work)
     assert list(moved.glob("*.quarantine")), "격리 폴더에 파일이 없다"
     assert not (scn.work / ".git" / "index.lock").exists()
+
+
+def test_R12_quarantine_stays_outside_the_repository(scn):
+    """R12 — 격리가 저장소를 오염시키면 안 된다.
+
+    실측 2026-08-31: 처음에는 `<repo>/_to_delete/locks/` 에 격리했다(사람이
+    손으로 하던 선례를 따랐다). 그 경로가 git 추적 대상이라 격리한 잠금이
+    **커밋되어 origin 으로 나갔다** — knowledge_base 에서 13건을 확인했다.
+    `sync.ps1` 의 `add -A` 가 쓸어 담는다.
+
+    그러면 그 파일들이 다른 PC 로 pull 되어 내려간다. **잔해가 PC 사이를
+    옮겨 다니는 것을 막으려던 작업이 정확히 그 일을 하고 있었다.**
+    """
+    from tools import gitlock
+
+    scn.make_lock(sc.LockSpec(".git/index.lock", "dead-empty"))
+    stderr = f"fatal: Unable to create '{scn.work}/.git/index.lock': File exists."
+
+    result = gitlock.handle(stderr, scn.work)
+
+    assert result["quarantined"]
+    for p in result["quarantined"]:
+        moved = Path(p).resolve()
+        assert not str(moved).startswith(str(scn.work.resolve())), (
+            f"격리 파일이 저장소 안에 있다: {moved}")
+    # 저장소 안에 새 파일이 생기지 않았는지도 확인 — untracked 도 안 된다
+    assert not (scn.work / "_to_delete").exists()
 
 
 def test_partial_write_remnant_stops(scn):

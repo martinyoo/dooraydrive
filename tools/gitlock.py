@@ -41,6 +41,22 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+# 이 파일은 CLI 진입점이다 — lib.ps1 의 Invoke-LockPolicy 가 파이프로 부른다.
+# 한국어 Windows 에서 파이프 stdout 은 cp949 로 열리고, 판정 문구에 한글이
+# 들어간다("죽은 잔해" 등). 그대로 쓰면 UnicodeEncodeError 로 죽고, 그러면
+# 잠금 판정 자체가 실패해 **잠금을 처리하려던 코드가 잠금 때문에 죽는다.**
+#
+# 호출측(lib.ps1)이 PYTHONUTF8=1 을 넘기고 있어 지금은 우연히 피하고 있다.
+# 그러나 vault 의 이식성 테스트가 그 의존을 명시적으로 금지한다 —
+# "텔레그램 봇은 PYTHONUTF8=1 을 넘겨서 우연히 피해 갔을 뿐. 호출자 방어에
+# 기대면 안 된다"(scripts/tests/test_portability.py:86).
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
 __all__ = ["LockState", "Action", "classify", "decide", "quarantine", "handle"]
 
 
@@ -235,16 +251,42 @@ def decide(state: LockState) -> str:
 
 
 # ---------------------------------------------------------------- 격리
+def quarantine_dir(repo: Path | str) -> Path:
+    """격리 폴더 — **저장소 바깥**이다.
+
+    처음에는 `<repo>/_to_delete/locks/` 에 뒀다(사람이 손으로 하던 선례를
+    따랐다). 실측 2026-08-31: 그 경로가 git 추적 대상이라 격리한 잠금이
+    **커밋되어 origin 으로 나갔다**(13건 확인). `sync.ps1` 의 `add -A` 가
+    쓸어 담는다.
+
+    잠금을 치우는 일이 저장소를 오염시키면 안 된다. 게다가 그 파일들이 다른
+    PC 로 pull 되어 내려간다 — 잔해가 PC 사이를 옮겨 다니는 것을 막으려던
+    작업이 정확히 그 일을 하고 있었다.
+
+    그래서 `%LOCALAPPDATA%\\gitlock\\quarantine\\<저장소이름>\\` 으로 옮긴다.
+    저장소 이름을 붙이는 이유: 여러 저장소의 잔해가 한 폴더에 섞이면 어느
+    것이 어디서 왔는지 알 수 없다.
+    """
+    repo = Path(repo)
+    base = os.environ.get("GITLOCK_QUARANTINE_DIR")
+    if base:
+        root = Path(base)
+    else:
+        local = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or "."
+        root = Path(local) / "gitlock" / "quarantine"
+    return root / (repo.resolve().name or "repo")
+
+
 def quarantine(path: Path, repo: Path | str) -> Path:
     """잠금을 지우지 않고 옆으로 옮긴다.
 
-    이름 규칙: `<태그>.<원래mtime>.quarantine`
+    이름 규칙: `<원래이름>.<원래mtime>.quarantine`
     기존 `_to_delete/locks/` 의 10건은 규칙이 셋으로 갈려 있었고
     (`HEAD.lock.11674` / `20312.lock` / `.-2103.lock`) 숫자가 Windows PID 도
     아니었다(PID 는 4의 배수). 재사용할 규칙이 없어 새로 정했다.
     """
     repo = Path(repo)
-    dest_dir = repo / "_to_delete" / "locks"
+    dest_dir = quarantine_dir(repo)
     dest_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y%m%d-%H%M%S")
     dest = dest_dir / f"{path.name}.{stamp}.quarantine"

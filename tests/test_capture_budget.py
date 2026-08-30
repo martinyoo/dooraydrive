@@ -115,6 +115,33 @@ def test_T1_2_insufficient_budget_defers_without_touching_git(
     assert not list((repo / ".git").glob("*.lock"))
 
 
+def test_deferred_file_survives_and_next_run_commits(capture_mod, repo, monkeypatch):
+    """**"다음 실행이 커밋한다"는 주장을 실제로 증명한다.**
+
+    deferred 는 add 조차 하지 않으므로 파일이 untracked 로 남는다. 그 상태가
+    안전하다는 근거는 두 가지여야 한다 — 내용이 살아 있을 것, 그리고 다음
+    실행이 정말 주워 갈 것. 주장만 하고 검증하지 않으면 "파일은 저장됐습니다"
+    라는 안내가 거짓말이 될 수 있다.
+    """
+    import subprocess
+
+    monkeypatch.setenv("CAPTURE_GIT_DEADLINE", str(time.time() + 5))
+    (repo / "note.md").write_text("중요한 캡처", encoding="utf-8")
+
+    state, _ = capture_mod.commit_push(str(repo), ["note.md"], "first")
+    assert state == "deferred"
+    assert (repo / "note.md").read_text(encoding="utf-8") == "중요한 캡처"
+
+    # 다음 실행 — 예산이 넉넉하다
+    monkeypatch.setenv("CAPTURE_GIT_DEADLINE", str(time.time() + 300))
+    state2, _ = capture_mod.commit_push(str(repo), ["note.md"], "second")
+
+    assert state2 != "deferred"
+    tracked = subprocess.run(["git", "ls-files", "note.md"], cwd=str(repo),
+                             capture_output=True, text=True).stdout.strip()
+    assert tracked == "note.md", "다음 실행이 파일을 주워 가지 못했다"
+
+
 def test_T1_3_budget_exactly_at_threshold_proceeds(capture_mod, repo, monkeypatch):
     """경계는 포함한다 — 경계에서 물러나면 예산이 딱 맞는 정상 실행이 막힌다."""
     monkeypatch.setenv(
@@ -159,6 +186,35 @@ def test_backoff_unclipped_without_budget(capture_mod, monkeypatch):
         capture_mod.PUSH_BACKOFF
 
 
+@pytest.mark.parametrize("left,expected_total", [
+    (300, 30),   # 넉넉 — 자르지 않는다
+    (45, 30),
+    (20, 6),
+    (12, 2),
+    (10, 0),     # 여유 10초를 빼면 0 — 백오프 없이 한 번만
+    (5, 0),
+    (0, 0),
+    (-30, 0),    # **음수** — 이미 마감 지남
+])
+def test_backoff_boundaries(capture_mod, monkeypatch, left, expected_total):
+    """경계 전부를 표로 고정한다 — 특히 음수.
+
+    예산이 음수인데 백오프를 태우면 이미 지난 마감시한 위에서 더 기다리는
+    것이고, 그 대기 중에 부모가 죽인다. 그 죽음이 잔해를 만든다.
+    빈 리스트여도 push 는 한 번 시도한다(루프가 len+1 회 돈다) — 커밋은
+    이미 됐으므로 한 번은 해 볼 가치가 있다.
+    """
+    monkeypatch.setenv("CAPTURE_GIT_DEADLINE", str(time.time() + left))
+    clipped = capture_mod._clip_backoff(capture_mod.PUSH_BACKOFF)
+    assert sum(clipped) == expected_total, f"남은 {left}초 -> {clipped}"
+
+
+def test_negative_budget_never_sleeps(capture_mod, monkeypatch):
+    """음수 예산에서 sleep 이 한 번도 불리면 안 된다."""
+    monkeypatch.setenv("CAPTURE_GIT_DEADLINE", str(time.time() - 100))
+    assert capture_mod._clip_backoff(capture_mod.PUSH_BACKOFF) == []
+
+
 # ---------------------------------------------------------------- 상태 전파
 def test_T1_6_deferred_is_not_success(capture_mod):
     """`deferred` 는 호출측의 성공 필터를 통과해 경고로 올라가야 한다.
@@ -195,6 +251,65 @@ def test_caller_passes_a_deadline():
     wired = src.count("env=_budget_env()")
     assert wired == spawns, f"capture.py 호출 {spawns}곳 중 {wired}곳만 결선됨"
     assert "timeout=300" not in src, "하드코딩된 300 이 남아 있다"
+
+
+def test_push_failures_go_through_lock_handling(capture_mod):
+    """push 실패도 잠금 판정을 거쳐야 한다.
+
+    적대적 검증이 잡은 구멍(2026-08-31). `push -u` 는 `config.lock` 을 쓰고
+    fetch 단계는 `refs/remotes/origin/*.lock` 을 쓴다. 판정이 add·commit 에만
+    있으면 **2026-08-30 사고의 나머지 절반이 push 로 옮겨갈 뿐이다** —
+    그날 실패도 add 가 아닌 다음 단계(commit)였고, 그때도 검사는 add 에만 있었다.
+
+    소스에서 확인한다: push 루프 안에 `_handle_lock` 호출이 있어야 한다.
+    """
+    import inspect
+
+    src = inspect.getsource(capture_mod.commit_push)
+    push_section = src[src.index("push -u") if "push -u" in src else 0:]
+    assert "_handle_lock" in push_section, (
+        "push 실패 경로가 잠금 판정을 거치지 않는다")
+    # add · commit · push 세 단계 모두에 있어야 한다
+    assert src.count("_handle_lock(") >= 3, (
+        f"_handle_lock 호출이 {src.count('_handle_lock(')}곳뿐이다 "
+        "— add·commit·push 셋 다 필요하다")
+
+
+EXTRACT_PY = CAPTURE_PY.parent / "telegram_bot" / "extract.py"
+
+
+@pytest.mark.skipif(not EXTRACT_PY.exists(), reason="extract.py 없음")
+def test_extract_paths_do_not_need_a_deadline():
+    """`extract.py` 도 capture.py 를 띄우지만 예산이 필요 없다 — 확인해 둔다.
+
+    `_run_capture` 가 부르는 것은 `fetch-youtube`·`extract-pdf` 이고, 이들은
+    stdout 으로 텍스트만 낸다. `commit_push` 를 부르는 것은 `save`·`augment`·
+    `delete` 셋뿐이다(capture.py:400,403,406,458,488).
+
+    "여기는 결선이 필요 없다"는 판단을 **근거와 함께 고정**한다. 안 그러면
+    다음 사람이 미결선으로 오해해 넣거나, 반대로 진짜 미결선을 못 본다.
+    이 파일에서 git 하위명령을 부르기 시작하면 이 테스트가 빨간불이 된다.
+    """
+    src = EXTRACT_PY.read_text(encoding="utf-8")
+    git_subcommands = ("\"save\"", "'save'", "\"augment\"", "'augment'",
+                       "\"delete\"", "'delete'")
+    used = [s for s in git_subcommands if s in src]
+    assert not used, (
+        f"extract.py 가 git 을 쓰는 하위명령을 부른다: {used} — 예산 결선 필요")
+
+
+@pytest.mark.skipif(not CAPTURE_PY.exists(), reason="capture.py 없음")
+def test_only_three_subcommands_touch_git(capture_mod):
+    """`commit_push` 호출 지점이 셋이라는 전제를 고정한다.
+
+    넷째가 생기면 그 경로도 예산 판정을 거쳐야 하는데, `commit_push` 안에
+    판정이 있으므로 자동으로 적용된다. 그래도 개수가 변한 사실은 알아야 한다 —
+    새 경로가 예산이 없는 호출측에서 불릴 수 있기 때문이다.
+    """
+    src = CAPTURE_PY.read_text(encoding="utf-8")
+    calls = src.count("commit_push(")
+    # 정의 1 + docstring 언급 1 + 실제 호출 5(save 3 · augment 1 · delete 1)
+    assert calls <= 8, f"commit_push 호출이 {calls}곳으로 늘었다 — 결선을 다시 보라"
 
 
 @pytest.mark.skipif(not CAPTURE_IO.exists(), reason="capture_io.py 없음")

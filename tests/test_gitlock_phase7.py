@@ -56,6 +56,26 @@ def test_T2_2_bootstrap_cmd_is_ascii_only():
 
 
 @needs_vault
+def test_T2_2b_batch_files_are_crlf():
+    r"""`.cmd`·`.bat` 은 CRLF 여야 한다.
+
+    vault 의 `.gitattributes:7-9` 가 `*.cmd text eol=crlf` 를 강제하고 이유까지
+    적어 뒀다 — *"cmd.exe 는 LF 배치 파일에서 라벨·goto·복합 구문이 어긋나고,
+    **실패가 조용하다**"*.
+
+    실측 2026-08-30: `bootstrap.cmd` 를 고쳐 쓰면서 LF 로 저장했고
+    (CRLF 0 / LF 19), git 이 계속 dirty 로 봤다. 편집 도구가 LF 로 쓰는 것이
+    기본이라 **이 파일을 손댈 때마다 재발한다.** goto 가 어긋나도 조용하니
+    사람이 알아채지 못한다.
+    """
+    raw = BOOTSTRAP_CMD.read_bytes()
+    crlf = raw.count(b"\r\n")
+    lone_lf = raw.count(b"\n") - crlf
+    assert crlf > 0, "CRLF 가 하나도 없다 — cmd.exe 가 조용히 깨진다"
+    assert lone_lf == 0, f"단독 LF {lone_lf}개 — .gitattributes 규칙 위반"
+
+
+@needs_vault
 def test_T2_3_synchere_wrapper_delegates_its_pause():
     """계획 원문의 지적을 정정한 근거를 고정한다.
 

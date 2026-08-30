@@ -18,6 +18,9 @@ vault 안에 있어야 한다. import 로 공유할 수 없다.
 from __future__ import annotations
 
 import hashlib
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -75,3 +78,49 @@ def test_canonical_has_no_repo_specific_imports():
     src = CANON.read_text(encoding="utf-8")
     for forbidden in ("dooray_sync", "from tests"):
         assert forbidden not in src, f"정본이 {forbidden!r} 에 의존한다"
+
+
+def test_cli_fixes_its_own_stream_encoding():
+    r"""`gitlock.py` 는 CLI 진입점이다 — stdout 인코딩을 스스로 고정해야 한다.
+
+    `lib.ps1` 의 `Invoke-LockPolicy` 가 파이프로 부르고, 판정 문구에 한글이
+    들어간다("죽은 잔해" 등). 한국어 Windows 에서 파이프 stdout 은 cp949 라
+    그대로 쓰면 `UnicodeEncodeError` 로 죽는다 — 그러면 **잠금을 처리하려던
+    코드가 잠금 때문에 죽는다.**
+
+    호출측이 `PYTHONUTF8=1` 을 넘기고 있어 지금은 우연히 피하고 있다.
+    vault 의 이식성 테스트가 그 의존을 명시적으로 금지한다:
+    *"텔레그램 봇은 PYTHONUTF8=1 을 넘겨서 우연히 피해 갔을 뿐 — 호출자
+    방어에 기대면 안 된다"* (`scripts/tests/test_portability.py:86`).
+    """
+    src = CANON.read_text(encoding="utf-8")
+    assert "reconfigure" in src, "stdout 인코딩을 고정하지 않는다"
+    assert "sys.stdout" in src
+
+
+def test_cli_emits_utf8_korean_through_a_pipe(tmp_path):
+    """말이 아니라 **실제로 파이프에 흘려 본다.**
+
+    `reconfigure` 문자열이 있는지 보는 것만으로는 부족하다 — 그것이 실제
+    stdout 에 걸리는지, 한글이 깨지지 않는지는 돌려 봐야 안다. cp949 환경을
+    강제해 그 조건에서 시험한다(안전장치는 그것이 필요한 조건에서 검증한다).
+    """
+    repo = tmp_path / "r"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".git" / "index.lock").touch()
+    err = tmp_path / "e.txt"
+    err.write_text(
+        f"fatal: Unable to create '{repo}/.git/index.lock': File exists.",
+        encoding="utf-8")
+
+    env = {**os.environ}
+    env.pop("PYTHONUTF8", None)          # 호출자 방어를 걷어낸다
+    env.pop("PYTHONIOENCODING", None)
+    r = subprocess.run(
+        [sys.executable, str(CANON), "--repo", str(repo),
+         "--stderr-file", str(err)],
+        capture_output=True, env=env)
+
+    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
+    out = r.stdout.decode("utf-8")       # UTF-8 로 나와야 한다
+    assert "죽은 잔해" in out, f"한글이 깨졌다: {out!r}"
