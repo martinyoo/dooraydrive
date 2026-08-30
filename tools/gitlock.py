@@ -93,6 +93,40 @@ _LOCK_HINT = re.compile(
     r"index\.lock|another git process", re.IGNORECASE)
 
 
+def _unwrap(text: str) -> str:
+    r"""콘솔 너비로 접힌 줄을 되편다.
+
+    Windows PowerShell 5.1 이 네이티브 명령의 stderr 를 수집할 때 **콘솔 너비에서
+    줄을 접는다**(실측 2026-08-30). 그래서 경로가 이렇게 쪼개진다:
+
+        ...Temp/diag_917809740/.gi
+        t/HEAD.lock': File exists.
+
+    이 상태로는 경로 정규식이 줄바꿈을 넘지 못해 판정이 '판단 불가'로 떨어지고,
+    죽은 잔해를 격리하지 못한다. PowerShell 7 에서는 접지 않아 잘 되므로
+    **5.1 에서만 조용히 실패하는** 종류의 결함이다 — lib.ps1 이 5.1 호환을
+    요구하니(lib.ps1:3) 반드시 다뤄야 한다.
+
+    되펴는 규칙: 줄이 따옴표를 닫지 못한 채 끝나면 다음 줄과 붙인다. 접힘은
+    공백 없이 일어나므로 그대로 이어 붙이면 원문이 복원된다.
+    """
+    if "\n" not in text:
+        return text
+    out: list[str] = []
+    pending = ""
+    for line in text.split("\n"):
+        merged = pending + line
+        # 따옴표가 홀수 개면 아직 경로가 닫히지 않았다 = 접힌 줄이다
+        if merged.count("'") % 2 == 1:
+            pending = merged
+            continue
+        out.append(merged)
+        pending = ""
+    if pending:
+        out.append(pending)
+    return "\n".join(out)
+
+
 def classify(stderr: str, repo: Path | str) -> LockState:
     """git stderr 를 보고 잠금 오류인지, 어떤 잠금인지, 산 것인지 판정한다.
 
@@ -102,7 +136,7 @@ def classify(stderr: str, repo: Path | str) -> LockState:
     """
     repo = Path(repo)
     state = LockState(raw=stderr or "")
-    text = state.raw
+    text = _unwrap(state.raw)
 
     path: Path | None = None
     m = _LOCK_PATH.search(text)

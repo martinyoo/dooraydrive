@@ -85,6 +85,37 @@ def test_unknown_lock_type_is_still_caught(scn):
     assert state.is_lock_error and state.name == "shallow.lock"
 
 
+def test_R11_powershell51_wrapped_path(scn):
+    """R11 — Windows PowerShell 5.1 이 stderr 를 콘솔 너비에서 접는다.
+
+    2026-08-30 실측. lib.ps1 결선을 5.1 에서 시험하자 '판단 불가'로 떨어졌다.
+    PowerShell 7 에서는 잘 됐다 — **5.1 에서만 조용히 실패**하는 종류다.
+    lib.ps1:3 이 5.1 호환을 요구하므로 이것을 놓치면 실제 운용에서 죽는다.
+
+    접힌 실제 출력을 그대로 쓴다.
+    """
+    scn.make_lock(sc.LockSpec(".git/HEAD.lock", "dead-empty"))
+    wrapped = (
+        "fatal: cannot lock ref 'HEAD': Unable to create "
+        f"'{scn.work}/.gi\nt/HEAD.lock': File exists.")
+
+    state = gitlock.classify(wrapped, scn.work)
+
+    assert state.is_lock_error, "접힌 줄 때문에 잠금을 인식하지 못했다"
+    assert state.name == "HEAD.lock"
+    assert state.live is False
+
+
+def test_unwrapping_does_not_break_normal_output(scn):
+    """되펴기가 멀쩡한 여러 줄 출력을 망가뜨리면 안 된다."""
+    scn.make_lock(sc.LockSpec(".git/index.lock", "dead-empty"))
+    normal = (f"fatal: Unable to create '{scn.work}/.git/index.lock': "
+              "File exists.\n\nAnother git process seems to be running.")
+
+    state = gitlock.classify(normal, scn.work)
+    assert state.name == "index.lock"
+
+
 def test_lock_error_without_path_stops(scn):
     """경로를 못 뽑으면 '잠금인 건 알지만 대상을 모른다' = 멈춤.
 
