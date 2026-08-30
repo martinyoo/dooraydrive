@@ -41,7 +41,22 @@ _TAG_SYMLINK = 0xA000000C
 # — 2026-08-07 사용자 요구. 원격 축은 RemoteCollector가 이 튜플을 가져다 쓴다.
 # '.dooraysync_tmp'는 원자적 다운로드(C1)가 대상 폴더마다 만드는 임시 디렉터리다 —
 # 스캔에 잡히면 다음 push에서 원격으로 역류한다.
-ALWAYS_EXCLUDE: tuple[str, ...] = (".dooraysync/", ".dooraysync_tmp/", "synchere.bat")
+#
+# '.git'은 2026-08-30에 추가했다. 동기화 대상 폴더가 git 저장소이기도 한 구성이
+# 실재하고(Obsidian vault), 그때 `.git` 내부가 실려 가면 **잠금 파일이 원격에
+# 올라갔다가 다음 pull 때 되살아난다** — 잔해가 PC 사이를 옮겨 다니는 최악의
+# 경로다. 게다가 두 PC가 각자의 `.git`을 양방향 동기화하면 저장소가 깨진다.
+#
+# 이것을 exclude 설정이 아니라 여기(코드)에 두는 이유: **설정은 PC마다 다르고
+# 사라진다.** 2026-08-18에 knowledge_base 프로파일에 `.git/`을 신중히 넣었는데
+# 그 config가 뒤에 옛 버전으로 되돌아가며 통째로 없어졌다. 그 사이 누가
+# synchere.bat(등록 스위치)을 실행하면 바로 발동한다.
+#
+# 두 패턴인 이유: '.git/'은 디렉터리, '.git'은 **파일**인 경우를 잡는다 —
+# worktree와 submodule의 .git은 파일이고, 그 안의 절대경로가 다른 PC로 건너가면
+# 저장소를 깨뜨린다.
+ALWAYS_EXCLUDE: tuple[str, ...] = (
+    ".dooraysync/", ".dooraysync_tmp/", "synchere.bat", ".git/", ".git")
 
 
 @dataclass
