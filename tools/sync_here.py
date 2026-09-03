@@ -482,12 +482,32 @@ def _ensure_marker(name: str) -> None:
 
 def _run_sync(name: str, root: str, extra: list[str]) -> int:
     print(f"[프로파일 '{name}'] {root}")
-    cmd = [sys.executable, "-P", "-m", "dooray_sync.cli.main", "sync", "-p", name, *extra]
+    # 실패 사유를 화면에서 읽지 않고 --report-json의 outcome으로 판정한다.
+    # 사용자가 직접 --report-json을 준 경우에는 건드리지 않는다(그쪽이 정본).
+    report = ""
+    if "--report-json" not in extra:
+        try:
+            import tempfile
+            fd, report = tempfile.mkstemp(prefix="dsync-report-", suffix=".json")
+            os.close(fd)
+        except Exception:   # noqa: BLE001 — 보고서는 부수 기능이다
+            report = ""
+    tail = ["--report-json", report] if report else []
+    cmd = [sys.executable, "-P", "-m", "dooray_sync.cli.main",
+           "sync", "-p", name, *extra, *tail]
     rc = subprocess.call(cmd, env=_child_env())
     if rc == 0 and "--dry-run" not in extra:
         _ensure_marker(name)
         # 묻는 것은 여기가 아니다 — 건수만 적어 둔다(아래 _offer_resolve 주석 참조).
         _note_conflicts(name, root)
+        _note_baseline(name, root)
+    if rc != 0 and report and "--dry-run" not in extra:
+        _note_bulk_delete(name, root, report)
+    if report:
+        try:
+            os.unlink(report)
+        except OSError:
+            pass
     return rc
 
 
@@ -519,6 +539,74 @@ def _run_sync(name: str, root: str, extra: list[str]) -> int:
 
 # (프로파일, 로컬 루트, 건수) — _run_sync가 적고 _offer_resolve가 비운다.
 _PENDING_CONFLICTS: list[tuple[str, str, int]] = []
+
+# (프로파일, 로컬 루트, 중단 사유) — 대량 삭제 게이트가 sync를 통째로 막은 경우.
+# 감지는 --report-json의 outcome이다(화면 파싱 금지 — 문구가 바뀌면 조용히 깨진다).
+_PENDING_DELETES: list[tuple[str, str, str]] = []
+
+# (프로파일, 로컬 루트, 건수) — 원격에는 있는데 로컬 기준선이 없어 sync가 '보호'로
+# 건너뛴 것들. reconcile로만 풀린다.
+_PENDING_BASELINE: list[tuple[str, str, int]] = []
+
+
+def _read_only_conn(name: str):
+    """프로파일 DB의 읽기 전용 연결. 없으면 None.
+
+    Store를 쓰지 않는 이유는 _unresolved_count와 같다 — Store는 없는 DB를 새로
+    만들어 무인 편입 게이트의 '상태 DB 없음' 판정을 무력화한다.
+    """
+    import sqlite3
+
+    from dooray_sync.config import db_path
+
+    path = db_path(name)
+    if not os.path.exists(ext_path(path)):
+        return None
+    text = str(path).replace("\\", "/").replace("?", "%3F").replace("#", "%23")
+    return sqlite3.connect(f"file:{text}?mode=ro", uri=True, timeout=2.0)
+
+
+def _baseline_missing_count(name: str) -> int:
+    """기준선 없는 파일 수. 술어는 differ._has_baseline과 같다(폴더 제외, local_md5 없음).
+
+    **읽기 전용이며 어떤 실패도 0으로 떨어뜨린다** — 안내는 부수 기능이라
+    종료코드를 건드리면 안 된다.
+    """
+    try:
+        conn = _read_only_conn(name)
+        if conn is None:
+            return 0
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM files WHERE is_dir = 0 "
+                "AND file_id IS NOT NULL AND file_id <> '' "
+                "AND (local_md5 IS NULL OR local_md5 = '')").fetchone()
+        finally:
+            conn.close()
+        return int(row[0]) if row else 0
+    except Exception:   # noqa: BLE001
+        return 0
+
+
+def _note_baseline(name: str, root: str) -> None:
+    n = _baseline_missing_count(name)
+    if n > 0:
+        _PENDING_BASELINE.append((name, root, n))
+
+
+def _note_bulk_delete(name: str, root: str, report_path: str) -> None:
+    """실패한 sync가 '대량 삭제 게이트' 때문이었는지 보고서로 판정한다."""
+    try:
+        import json
+
+        with open(report_path, encoding="utf-8") as f:
+            rep = json.load(f)
+        if str(rep.get("outcome") or "") != "aborted_bulk_delete":
+            return
+        why = str(rep.get("error") or "").strip().splitlines()
+        _PENDING_DELETES.append((name, root, why[0] if why else "대량 삭제로 판단해 중단"))
+    except Exception:   # noqa: BLE001
+        return
 
 
 def _unresolved_count(name: str) -> int:
@@ -622,6 +710,98 @@ def _offer_resolve(extra: list[str]) -> None:
     except (Exception, KeyboardInterrupt) as exc:   # noqa: BLE001
         print()
         print(f"(충돌 안내를 마치지 못했습니다 — 동기화 결과에는 영향 없음: "
+              f"{type(exc).__name__}: {exc})")
+
+
+def _run_child(name: str, verb: str, *args: str) -> int:
+    """dsync 하위 명령을 같은 콘솔에서 띄운다. Ctrl+C는 삼킨다(종료코드 계약)."""
+    cmd = [sys.executable, "-P", "-m", "dooray_sync.cli.main", verb, "-p", name, *args]
+    try:
+        return subprocess.call(cmd, env=_child_env())
+    except KeyboardInterrupt:
+        print()
+        return 1
+
+
+def _offer_bulk_delete(extra: list[str]) -> None:
+    """대량 삭제 게이트로 멈춘 프로파일을 알리고, 동의하면 이어서 지운다.
+
+    이 게이트는 '원격이나 로컬이 통째로 사라진 사고'를 잡으라고 있는 것이다.
+    그래서 기본값은 **아니오**이고, 무엇이 지워지는지 먼저 보여 준 뒤 묻는다.
+    """
+    pending = list(_PENDING_DELETES)
+    _PENDING_DELETES.clear()
+    if not pending:
+        return
+    try:
+        print()
+        print("=" * 70)
+        print(f"대량 삭제로 판단해 중단된 프로파일 {len(pending)}개 — 아무것도 지우지 않았습니다.")
+        for name, root, why in pending:
+            print(f"  [{name}] {why}   {root}")
+        if "--dry-run" in extra or "--unattended" in extra:
+            return
+        print()
+        print("계획을 먼저 보고 싶으면: dsync sync -p <이름> --full --dry-run")
+        print("한쪽이 통째로 사라진 사고라면 여기서 '아니오'를 고르세요.")
+        for name, root, _why in pending:
+            print()
+            print(f"[프로파일 '{name}'] {root}")
+            rc = _run_child(name, "sync", "--dry-run", "--allow-bulk-delete")
+            if rc != 0:
+                print(f"  미리보기를 만들지 못했습니다(종료코드 {rc}) — 건너뜁니다.")
+                continue
+            if not _ask_yes_no("  위 계획대로 정말 삭제하시겠습니까? [y/N]: "):
+                print("  건너뜁니다. 나중에 하려면: "
+                      f"dsync sync -p {name} --allow-bulk-delete")
+                continue
+            rc = _run_child(name, "sync", "--allow-bulk-delete")
+            if rc == 0:
+                print(f"  [{name}] 삭제를 포함해 동기화했습니다.")
+                _clear_auto_notices(name)
+            else:
+                print(f"  [{name}] 종료코드 {rc} — 다시 하려면: "
+                      f"dsync sync -p {name} --allow-bulk-delete")
+    except (Exception, KeyboardInterrupt) as exc:   # noqa: BLE001
+        print()
+        print(f"(삭제 안내를 마치지 못했습니다 — 동기화 결과에는 영향 없음: "
+              f"{type(exc).__name__}: {exc})")
+
+
+def _offer_reconcile(extra: list[str]) -> None:
+    """기준선이 없어 '보호'로 건너뛴 파일을 알리고, 동의하면 reconcile을 돌린다."""
+    pending = list(_PENDING_BASELINE)
+    _PENDING_BASELINE.clear()
+    if not pending:
+        return
+    try:
+        total = sum(n for _, _, n in pending)
+        print()
+        print("=" * 70)
+        print(f"기준선 없는 파일 {total}건 — 어느 쪽이 최신인지 몰라 건드리지 않고 두었습니다.")
+        for name, root, n in pending:
+            print(f"  [{name}] {n}건   {root}")
+        if "--dry-run" in extra or "--unattended" in extra:
+            return
+        print()
+        print("reconcile은 원격 사본을 받아 내용을 대조해 기준선만 기록합니다.")
+        print("**로컬 파일은 어떤 경우에도 건드리지 않습니다** — 내용이 다르면 그대로 남깁니다.")
+        if not _ask_yes_no("지금 대조하시겠습니까? [y/N]: "):
+            print("나중에 하려면: dsync reconcile -p <이름>")
+            return
+        for name, _root, _n in pending:
+            print()
+            print(f"[프로파일 '{name}'] 기준선 대조")
+            rc = _run_child(name, "reconcile")
+            left = _baseline_missing_count(name)
+            if left:
+                print(f"  [{name}] 남은 기준선 없음 {left}건 (종료코드 {rc}) — "
+                      f"내용이 실제로 다른 파일은 사람이 정해야 합니다.")
+            else:
+                print(f"  [{name}] 기준선을 모두 세웠습니다.")
+    except (Exception, KeyboardInterrupt) as exc:   # noqa: BLE001
+        print()
+        print(f"(대조 안내를 마치지 못했습니다 — 동기화 결과에는 영향 없음: "
               f"{type(exc).__name__}: {exc})")
 
 
@@ -871,7 +1051,11 @@ def main(argv: list[str]) -> int:
 
     # 프로파일 루프가 **전부 끝난 뒤** 한 번만 묻는다 — 루프 안에서 물으면
     # 하향 실행의 뒤쪽 프로파일이 사람 대기에 인질이 된다(설계 사유 1).
+    # 순서: 삭제(sync를 통째로 막은 것) → 충돌 → 기준선. 앞의 것을 풀어야 뒤의
+    # 것이 제대로 보이는 의존이 있다(삭제로 중단되면 충돌·기준선은 세지도 못한다).
+    _offer_bulk_delete(extra)
     _offer_resolve(extra)
+    _offer_reconcile(extra)
 
     _print_auto_footer(targets)
 

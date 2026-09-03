@@ -114,6 +114,41 @@ META_LAST_PULL_AT = "last_pull_at"
 # dry-run 표에 한 번에 찍는 최대 행 수. 수만 건짜리 계획을 콘솔에 다 쏟지 않는다.
 _MAX_PLAN_ROWS = 200
 
+# 충돌 해결 선택지 — 번호와 이름을 **둘 다** 받는다.
+# 번호를 넣은 이유: 매 건마다 'both/local/remote'를 타이핑하게 하면 오타가 잦고,
+# 예전 코드는 오타를 만나면 그 건을 조용히 건너뛰었다(사용자 피드백 2026-09-04).
+# --keep 은 이름만 받던 기존 계약을 유지하므로 이름 쪽을 지우면 안 된다.
+_KEEP_CHOICES = ("both", "local", "remote")
+_KEEP_BY_NUM = {"1": "both", "2": "local", "3": "remote"}
+
+
+def _normalize_keep(raw: str) -> str:
+    """'1'·'both' 등 입력 하나를 정본 이름으로. 알 수 없으면 ''."""
+    s = (raw or "").strip().lower()
+    if s in _KEEP_BY_NUM:
+        return _KEEP_BY_NUM[s]
+    return s if s in _KEEP_CHOICES else ""
+
+
+def _prompt_keep(tries: int = 3) -> str:
+    """번호(또는 이름)로 충돌 선택지 하나를 받는다. 못 받으면 ''.
+
+    **반드시 유한하다.** EOF/Ctrl+C면 즉시 그만두고, 오입력도 tries회까지만
+    되묻는다 — isatty()가 True인데 stdin이 EOF인 환경이 실재하므로(Windows의
+    NUL은 문자 장치다) 무한 루프를 만들면 그 환경에서 창이 영영 멈춘다.
+    """
+    for _ in range(max(1, tries)):
+        try:
+            raw = input("    번호를 고르세요 [1]: ").strip()
+        except (EOFError, KeyboardInterrupt, OSError, ValueError):
+            _out("")
+            return ""
+        pick = _normalize_keep(raw or "1")
+        if pick:
+            return pick
+        _err("    1, 2, 3 중 하나를 고르세요(both/local/remote 도 됩니다).")
+    return ""
+
 app = typer.Typer(
     add_completion=False,
     no_args_is_help=True,
@@ -2456,8 +2491,8 @@ def resolve(
             if conflict_id and not targets:
                 _fail(f"충돌 id {conflict_id} 를 찾을 수 없습니다.", EXIT_FAIL)
 
-            choice = (keep or "").strip().lower()
-            if choice and choice not in ("local", "remote", "both"):
+            choice = _normalize_keep(keep)
+            if (keep or "").strip() and not choice:
                 _fail("--keep 은 local, remote, both 중 하나여야 합니다.", EXIT_CONFIG)
             if not choice and not sys.stdin.isatty():
                 _fail("대화형 입력이 불가능한 환경입니다. --keep 을 지정하거나 --list 를 쓰세요.",
@@ -2482,11 +2517,13 @@ def resolve(
                     _out(f"  충돌 #{row['id']}: {row['rel_path']}")
                     _out(f"    원래 경로  : 원격본 (지금 이 자리에 있음)")
                     _out(f"    로컬 사본  : {row['local_copy_path'] or '-'}")
-                    pick = typer.prompt(
-                        "    어느 쪽을 살릴까요? [both=둘 다 유지 / local=내 사본을 원래 자리로 / remote=사본 버림]",
-                        default="both").strip().lower()
-                    if pick not in ("local", "remote", "both"):
-                        _err("    건너뜁니다(입력이 올바르지 않음).")
+                    _out("      1) both   - 둘 다 유지 (기본)")
+                    _out("      2) local  - 내 사본을 원래 자리로")
+                    _out("      3) remote - 사본 버림")
+                    # 오입력은 건너뛰지 않고 다시 묻는다(유한 — _prompt_keep 참조).
+                    pick = _prompt_keep()
+                    if not pick:
+                        _err("    건너뜁니다(선택을 받지 못했습니다).")
                         continue
                 if _resolve_one(store, p, row, pick, dry_run, log, drive=drive):
                     done += 1
