@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import datetime
 import os
+import re
 import subprocess
 import sys
 import tomllib
@@ -846,6 +847,106 @@ def _print_auto_footer(targets: list[tuple[str, dict]]) -> None:
         print("자동 동기화: 꺼짐 — 켜려면 synchere.bat --auto on")
 
 
+# --------------------------------------------------------------------------
+# 새 버전 알림 (배포 전략 항목 C) — 알리기만 한다. 절대 자동으로 갱신하지 않는다.
+# --------------------------------------------------------------------------
+# 동료가 매일 실행하는 유일한 지점이 이 파일이다. 로그 첫 줄에 버전이 찍히지만
+# 그건 '물어봐야 아는' 것이고, 여기서는 '말해 주는' 것이 목적이다.
+#
+# 저장소가 public 이라 인증이 필요 없다(설치.bat 이 같은 호스트에서 zip 을 자격
+# 증명 없이 받는다). 기준은 main 의 __version__ 이고, 그 파일 주석이 "릴리스마다
+# 올릴 것"을 규약으로 못박아 두었기에 main 을 봐도 릴리스 표시로 읽을 수 있다.
+_VERSION_URL = ("https://raw.githubusercontent.com/martinyoo/dooraydrive"
+                "/main/dooray_sync/__init__.py")
+# 정상 응답은 509바이트다(2026-09-15 실측). 프록시 로그인 페이지는 200 으로 HTML 을
+# 돌려주므로 크기로 먼저 거른다 — 설치.bat:186 이 zip 에 쓰는 것과 같은 수법인데,
+# 기대 페이로드가 작아서 여기서는 하한이 아니라 **상한**이 판정선이다.
+_VERSION_MAX_BYTES = 4096
+# 앵커된 엄격한 패턴. 본문 어딘가의 문자열을 느슨하게 긁으면 엉뚱한 값을 '새 버전'
+# 이라고 발표하게 된다. exec/eval 은 쓰지 않는다 — 원격 텍스트는 신뢰 대상이 아니다.
+_VERSION_RE = re.compile(r'^__version__\s*=\s*["\']([0-9][0-9A-Za-z.+-]{0,31})["\']',
+                         re.MULTILINE)
+
+
+def _fetch_remote_version() -> str | None:
+    """main 의 `__version__`. 못 구하면 None — 실패는 전부 조용하다.
+
+    **truststore 를 이 프로세스에서 직접 보장한다.** 주입은 `api/client.py` 의
+    import 부수효과 한 곳뿐이고(그 파일 주석이 "HTTP 단일 관문"이라고 자리를
+    정해 두었다), sync_here 는 실제 sync 를 자식 프로세스로 돌리므로 **이미 등록된
+    폴더를 도는 정상 경로에서는 api/client 를 한 번도 import 하지 않는다** — 즉 이
+    프로세스는 미주입 상태다. 그대로 httpx 를 쓰면 SSL 검사망(동료 회사 PC)에서
+    매번 CERTIFICATE_VERIFY_FAILED 이고, 실패를 무시하는 설계 탓에 **겨냥한 바로
+    그 PC 에서만 기능이 영원히 무음**이 된다. 개발 PC 에서는 재현되지 않는다.
+    """
+    try:
+        # import 자체가 주입이다. verify=False 는 쓰지 않는다 — 검사망을 뚫는 게
+        # 아니라 OS 인증서 저장소를 쓰게 하는 것이 처방이다.
+        from dooray_sync.api import client as _gateway   # noqa: F401
+        import httpx
+
+        # DoorayClient 를 재사용하지 않는다: 그 클라이언트는 기본 헤더에 Dooray
+        # 토큰을 달고 있고 절대 URL 을 그대로 통과시키므로, 재사용하면 토큰이
+        # githubusercontent.com 으로 나간다. 헤더 없는 새 요청을 쓴다.
+        r = httpx.get(_VERSION_URL,
+                      timeout=httpx.Timeout(connect=4.0, read=4.0,
+                                            write=4.0, pool=4.0))
+        if r.status_code != 200:
+            return None
+        body = r.content[:_VERSION_MAX_BYTES + 1]
+        if len(body) > _VERSION_MAX_BYTES:
+            return None
+        # 대상 파일은 한국어 주석을 담고 있어 cp949 로 디코딩되지 않는다(실측).
+        # 로케일 코덱에 맡기지 않고 UTF-8 로 못박는다.
+        m = _VERSION_RE.search(body.decode("utf-8", errors="replace"))
+        return m.group(1) if m else None
+    except (Exception, KeyboardInterrupt):  # noqa: BLE001 — 힌트는 결과에 영향 금지
+        return None
+
+
+def _version_tuple(v: str) -> tuple[int, ...] | None:
+    """'0.2.0' → (0, 2, 0). 숫자 마디가 아니면 None = 비교 포기.
+
+    문자열 비교를 쓰면 안 된다 — '0.10.0' < '0.9.0' 이 된다.
+    """
+    out: list[int] = []
+    for part in v.split("."):
+        if not part.isdigit():
+            return None
+        out.append(int(part))
+    return tuple(out) if out else None
+
+
+def _print_version_notice(extra: list[str]) -> None:
+    """원격이 **더 높을 때만** 한 줄. 실패·동률·판정 불가는 전부 침묵한다.
+
+    '다르면'이 아니라 '더 높으면'인 이유: 개발 PC 의 체크아웃은 main 보다 앞설 수
+    있고, 일부러 롤백해 둔 PC 도 있다. '다르면 알림'은 그 둘에 상시 오탐이 되고,
+    상시 오탐은 곧 아무도 안 보는 줄이 된다.
+
+    **아무것도 반환하지 않는다** — 종료코드에 개입할 수 없어야 한다. synchere.bat 은
+    0/2 만 정상 종료로 보고 나머지를 30회 ANY-KEY 재시도 루프로 돌리므로, 여기서
+    예외가 새면 성공한 동기화가 '실패'로 보인다. KeyboardInterrupt 까지 삼키는
+    이유는 이 자리가 실행의 맨 끝, 즉 사람이 Ctrl+C 를 누르는 자리이기 때문이다.
+    """
+    try:
+        if "--dry-run" in extra or "--unattended" in extra:
+            return
+        from dooray_sync import __version__ as mine
+
+        remote = _fetch_remote_version()
+        if not remote or remote == mine:
+            return
+        here, there = _version_tuple(mine), _version_tuple(remote)
+        if here is None or there is None or there <= here:
+            return
+        print()
+        print(f"새 버전이 있습니다: {mine} → {remote}")
+        print("  갱신: 프로그램 폴더 **밖**에 둔 설치.bat 사본을 실행하세요.")
+    except (Exception, KeyboardInterrupt):  # noqa: BLE001 — 힌트는 결과에 영향 금지
+        return
+
+
 def resolve_targets(root: str | Path, profiles: dict[str, dict]) -> list[tuple[str, dict]]:
     """--root가 가리키는 실행 대상 집합(모듈 docstring의 상향/하향 규칙).
 
@@ -1068,6 +1169,11 @@ def main(argv: list[str]) -> int:
         print(f"마커 정합 기록 실패: {', '.join(marker_failed)} — config가 잠겨 "
               f"있었을 수 있습니다. 다시 실행하면 재시도됩니다.")
         return 1
+
+    # 성공 경로에서만 조회한다. rc=1 이면 배치가 같은 창에서 최대 30회 재실행하므로
+    # 여기가 아니라 위쪽에 두면 GitHub 조회도 30번 일어난다. 그리고 실패한 실행의
+    # 화면에는 이미 더 급한 메시지가 있다.
+    _print_version_notice(extra)
     return 0
 
 

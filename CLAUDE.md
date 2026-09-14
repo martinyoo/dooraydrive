@@ -46,22 +46,27 @@ vault에 저장할 때는 소스코드를 복사하지 않습니다. **결정·�
 - **B. `설치.bat` 갱신 모드 — 완료** (`fca71ed`, 2026-08-11). 기존 설치를 재사용하지 않고
   최신본으로 교체한다. 받기·풀기가 성공한 뒤에만 옛 사본을 `.old`로 밀어내고 바꿔치기하며,
   받기 실패 시에는 기존 사본으로 진행하되 `OUT OF DATE`를 명시한다.
-- **A. 버전 정체성 — 부분 구현** (M3, 2026-08-18 HSY 실측). `__version__`은 `0.2.0`으로
-  올랐고 **표시된다** — `dsync --version`·`doctor`·`--report-json`·자동 루프 헤더, 그리고
-  로그 첫 줄(`logging_setup.py:132`). 동료가 로그를 붙여넣으면 버전을 안다.
-  **남은 것 둘, 그리고 둘 다 롤백의 선행조건이다**: (a) **git 태그가 하나도 없다**
-  (`git tag -l`이 빈 목록) — 태그가 없으면 zip URL을 `refs/tags/<version>.zip`으로
-  지목할 수 없다. (b) **설치 스탬프가 없다** — 프로그램 폴더에 무엇을 언제 어디서
-  받았는지 남지 않아, 실행조차 안 되는 PC에서는 버전을 알 길이 없다.
-- **C. `synchere.bat` 새 버전 알림 — 미구현.** 확인함(2026-08-18): 저장소 어디에도
-  `raw.githubusercontent` 버전 조회가 없다.
+- **A. 버전 정체성 — 완료** (2026-09-14~15). `__version__`이 `dsync --version`·`doctor`·
+  `--report-json`·자동 루프 헤더·로그 첫 줄에 표시되는 것에 더해, 남아 있던 둘이 끝났다:
+  (a) **`v0.2.0` 태그**를 달았다 — zip URL을 `refs/tags/<version>.zip`으로 지목할 수 있다.
+  (b) **설치 스탬프** `INSTALLED.txt`(버전·URL·시각·경로)를 `설치.bat`이 교체 직후 쓴다 —
+  실행조차 안 되는 PC도 버전을 말할 수 있다.
+- **C. `synchere.bat` 새 버전 알림 — 완료** (2026-09-15). `tools/sync_here.py`의
+  `_fetch_remote_version`/`_print_version_notice`. 성공 경로 끝에서 main의
+  `__version__`을 raw.githubusercontent로 받아 **원격이 더 높을 때만** 한 줄 알린다
+  (자동 갱신 없음). 주의할 점 셋이 코드 주석에 근거와 함께 박혀 있다 — truststore는
+  `api/client.py` import로만 주입되는데 이 프로세스는 그것을 import하지 않는다 /
+  `DoorayClient` 재사용은 Dooray 토큰을 GitHub로 보낸다 / 예외는
+  `except (Exception, KeyboardInterrupt)`로 삼켜야 종료코드가 안전하다.
 - **D. DB `PRAGMA user_version` — 완료** (M3 단위 2). `store/db.py:43`에 `SCHEMA_VERSION`,
   `db.py:187~210`에 승격·검증. 새 스키마 DB를 옛 코드가 열면 거부한다
   (`tests/test_schema_version.py`).
-- **롤백 수단이 없다.** B는 교체 성공 직후 `.old`를 지우므로 되돌릴 사본이 남지
-  않고, zip URL이 항상 `refs/heads/main.zip`이라 과거 버전을 받을 수단도 없다.
-  **A의 (a) 태그가 선행되지 않으면 롤백은 불가능하다.** D가 끝났어도 이건 그대로다 —
-  D는 "옛 코드가 새 DB를 조용히 깨뜨리는 것"을 막을 뿐, 되돌릴 코드를 만들어 주지 않는다.
+- **롤백 — v0.2.0부터 가능하다.** `설치.bat <버전>`(또는 `DSYNC_VERSION`)이
+  `refs/tags/<버전>.zip`을 받고, 압축 안 폴더 이름을 가정하지 않는다(태그는
+  `dooraydrive-0.2.0`, main은 `dooraydrive-main`). 버전을 지정했는데 받기에 실패하면
+  기존 사본으로 넘어가지 않는다. **남은 한계 둘**: v0.2.0 **이전**으로는 되돌릴 수 없고
+  (태그가 없다), 스키마를 바꾼 릴리스는 어느 방법으로도 롤백되지 않는다 — D는 조용한
+  파손을 명시적 거부로 바꿨을 뿐 마이그레이션을 주지 않는다.
 - **M3가 B에 새 위험을 얹었다(미검증, 분석 수준).** 자동 루프가 도입되면서 프로그램
   폴더를 `sys.path`에 얹은 파이썬 프로세스가 **하루 종일 살아 있다.** `설치.bat`이
   교체에 성공하면 그 프로세스의 `sys.path` 문자열은 이제 **새 폴더**를 가리키므로,

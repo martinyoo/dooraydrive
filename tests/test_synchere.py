@@ -921,3 +921,167 @@ def test_resolve_flag_says_nothing_to_do_when_clean(cfgdir, monkeypatch, capsys)
     assert sh.main(["--root", str(root), "--resolve"]) == 0
     assert resolved == []
     assert "처리할 충돌이 없습니다" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# 새 버전 알림 (배포 전략 항목 C)
+# --------------------------------------------------------------------------
+# 이 기능의 나쁜 실패는 '알림이 안 뜨는 것'이 아니라 **동기화를 망가뜨리는 것**이다.
+# synchere.bat 은 0/2 만 정상 종료로 보고 나머지를 30회 ANY-KEY 재시도 루프로
+# 돌리므로, 힌트 하나가 예외를 흘리면 성공한 동기화가 [FAILED] 로 보인다.
+# 그래서 여기서 제일 중요한 것은 '알림이 뜬다'가 아니라 '무슨 일이 있어도 rc=0'이다.
+
+
+@pytest.fixture()
+def fake_httpx(monkeypatch):
+    """httpx 를 대역으로 갈아끼운다 — 실제 소켓을 여는 테스트는 만들지 않는다.
+
+    치환 전에 진짜 `dooray_sync.api.client` 를 먼저 로드한다. 그 모듈이 대역 httpx
+    로 재실행되면 안 되기 때문이다(그리고 그 import 가 곧 truststore 주입이다).
+    """
+    import types
+
+    import dooray_sync.api.client  # noqa: F401
+
+    def _install(status: int = 200, content: bytes = b""):
+        calls: list[dict] = []
+
+        def get(url, **kw):
+            calls.append({"url": url, **kw})
+            return types.SimpleNamespace(status_code=status, content=content)
+
+        monkeypatch.setitem(sys.modules, "httpx",
+                            types.SimpleNamespace(get=get, Timeout=lambda **kw: kw))
+        return calls
+
+    return _install
+
+
+# 실제 파일과 같은 모양 — 한국어 주석과 em dash 를 포함한다(cp949 로 디코딩 불가).
+VERSION_FILE = (
+    '"""dooray_sync — Dooray Drive 로컬 동기화 CLI."""\n'
+    "# 릴리스마다 올릴 것 — 이 값이 멈춰 있으면 무엇이 깔렸는지 알 수 없다\n"
+    '__version__ = "9.9.9"\n'
+).encode("utf-8")
+
+
+def test_fetch_parses_the_version_from_a_utf8_korean_file(fake_httpx):
+    """대상 파일은 한국어 주석 때문에 cp949 로 디코딩되지 않는다(실측).
+    로케일 코덱에 맡기면 UnicodeDecodeError 로 죽는 자리다."""
+    sh = _sync_here()
+    fake_httpx(200, VERSION_FILE)
+    assert sh._fetch_remote_version() == "9.9.9"
+
+
+def test_fetch_sends_no_authorization_header(fake_httpx):
+    """DoorayClient 를 재사용하면 기본 헤더의 Dooray 토큰이 GitHub 로 나간다.
+    이 테스트가 그 재사용을 막는 결선이다."""
+    sh = _sync_here()
+    calls = fake_httpx(200, VERSION_FILE)
+    sh._fetch_remote_version()
+    assert calls, "요청이 나가지 않았다"
+    assert "headers" not in calls[0], f"헤더가 실렸다: {calls[0]}"
+
+
+def test_fetch_rejects_a_proxy_login_page(fake_httpx):
+    """프록시 로그인 페이지는 200 으로 HTML 을 돌려준다. 기대 페이로드가 509바이트라
+    설치.bat 의 '하한' 수법을 못 쓰고 상한으로 거른다."""
+    sh = _sync_here()
+    fake_httpx(200, b"<html>" + b"x" * 5000 + b"</html>")
+    assert sh._fetch_remote_version() is None
+
+
+def test_fetch_rejects_non_200(fake_httpx):
+    sh = _sync_here()
+    fake_httpx(404, VERSION_FILE)
+    assert sh._fetch_remote_version() is None
+
+
+def test_fetch_ignores_a_body_without_the_anchor(fake_httpx):
+    """느슨한 패턴이면 본문 어딘가의 문자열을 '새 버전'으로 발표하게 된다."""
+    sh = _sync_here()
+    fake_httpx(200, b'print("__version__ = 1.2.3")\n')
+    assert sh._fetch_remote_version() is None
+
+
+def test_version_tuple_orders_numerically_not_lexically():
+    """문자열 비교를 쓰면 '0.10.0' < '0.9.0' 이 된다."""
+    sh = _sync_here()
+    assert sh._version_tuple("0.10.0") > sh._version_tuple("0.9.0")
+    assert sh._version_tuple("0.2.0rc1") is None      # 판정 포기 = 침묵
+
+
+def _notice_root(cfgdir, monkeypatch, sh) -> Path:
+    root = _root(cfgdir, "folder", marker=True)
+    _mk_profile("a", root, "sync")
+    monkeypatch.setattr(sh, "_run_sync", lambda n, r, e: 0)
+    return root
+
+
+def test_notice_prints_when_remote_is_newer(cfgdir, monkeypatch, capsys):
+    sh = _sync_here()
+    root = _notice_root(cfgdir, monkeypatch, sh)
+    monkeypatch.setattr(sh, "_fetch_remote_version", lambda: "99.0.0")
+
+    assert sh.main(["--root", str(root)]) == 0
+    assert "새 버전" in capsys.readouterr().out
+
+
+def test_notice_is_silent_when_remote_is_not_newer(cfgdir, monkeypatch, capsys):
+    """개발 PC 의 체크아웃은 main 보다 앞설 수 있고, 일부러 롤백해 둔 PC 도 있다.
+    '다르면 알림'이면 그 둘에 상시 오탐이 되고, 상시 오탐은 아무도 안 보는 줄이 된다."""
+    sh = _sync_here()
+    root = _notice_root(cfgdir, monkeypatch, sh)
+    monkeypatch.setattr(sh, "_fetch_remote_version", lambda: "0.0.1")
+
+    assert sh.main(["--root", str(root)]) == 0
+    assert "새 버전" not in capsys.readouterr().out
+
+
+def test_notice_failure_never_changes_the_exit_code(cfgdir, monkeypatch, capsys):
+    """가장 중요한 성질 — 조회가 터져도 성공한 동기화는 0 으로 끝나야 한다."""
+    sh = _sync_here()
+    root = _notice_root(cfgdir, monkeypatch, sh)
+
+    def boom():
+        raise RuntimeError("끊김")
+
+    monkeypatch.setattr(sh, "_fetch_remote_version", boom)
+    assert sh.main(["--root", str(root)]) == 0
+    assert "새 버전" not in capsys.readouterr().out
+
+
+def test_notice_survives_keyboard_interrupt(cfgdir, monkeypatch):
+    """실행의 맨 끝은 사람이 Ctrl+C 를 누르는 자리다. KeyboardInterrupt 는
+    Exception 이 아니라서 `except Exception` 만으로는 새어 나간다."""
+    sh = _sync_here()
+    root = _notice_root(cfgdir, monkeypatch, sh)
+
+    def interrupted():
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sh, "_fetch_remote_version", interrupted)
+    assert sh.main(["--root", str(root)]) == 0
+
+
+def test_notice_is_skipped_on_dry_run(cfgdir, monkeypatch):
+    """--dry-run 은 아무것도 바꾸지 않는 실행이다. 네트워크를 탈 이유가 없다."""
+    sh = _sync_here()
+    root = _notice_root(cfgdir, monkeypatch, sh)
+    called: list[int] = []
+    monkeypatch.setattr(sh, "_fetch_remote_version",
+                        lambda: called.append(1) or "99.0.0")
+
+    assert sh.main(["--root", str(root), "--dry-run"]) == 0
+    assert called == []
+
+
+def test_main_checks_the_version_after_the_loop(cfgdir, monkeypatch):
+    """결선: main()의 _print_version_notice 호출을 지우면 이 테스트가 깨진다."""
+    sh = _sync_here()
+    root = _notice_root(cfgdir, monkeypatch, sh)
+    seen: list[tuple] = []
+    monkeypatch.setattr(sh, "_print_version_notice", lambda e: seen.append(tuple(e)))
+
+    assert sh.main(["--root", str(root)]) == 0
+    assert seen == [()]
