@@ -25,11 +25,12 @@ from pathlib import Path
 
 import pytest
 
-CANON = Path(__file__).resolve().parent.parent / "tools" / "gitlock.py"
-VAULT_COPY = Path(r"C:\drive\obsidian\knowledge_base\scripts\gitlock.py")
+from tests import machine
 
-needs_vault = pytest.mark.skipif(
-    not VAULT_COPY.exists(), reason="이 PC 에 vault 사본이 없다")
+CANON = Path(__file__).resolve().parent.parent / "tools" / "gitlock.py"
+VAULT_COPY, _WHY = machine.resolve("knowledge_base", "scripts", "gitlock.py")
+
+needs_vault = pytest.mark.skipif(VAULT_COPY is None, reason=_WHY)
 
 
 def _digest(path: Path) -> str:

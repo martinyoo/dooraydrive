@@ -17,7 +17,8 @@
 #   .\SYNC.ps1 -DryRun            계획만 보고 끝
 #   .\SYNC.ps1 -Yes               확인 없이 바로 실행
 #   .\SYNC.ps1 -Status            상태만 요약
-#   .\SYNC.ps1 -Only spri2026,swstat    일부 프로파일만
+#   .\SYNC.ps1 -Only <프로파일>,<프로파일>   일부만 (이름은 PC마다 다르다 —
+#                                 python tools\set_sync_mode.py --list 로 확인)
 param(
   [switch]$Pull,
   [switch]$Sync,

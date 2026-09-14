@@ -70,20 +70,30 @@ for label, p in (("APPDATA", appdata), ("USERPROFILE", os.environ.get("USERPROFI
 print("\n[CLI가 계산하는 경로]")
 try:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from dooray_sync.config import config_path, config_exists
+    import tomllib
+
+    from dooray_sync.config import config_path
     from dooray_sync.util.paths import ext_path
 
     cp = config_path()
     line("config_path()", cp)
     line("ext_path()", ext_path(cp))
     line("exists(ext)", os.path.exists(ext_path(cp)))
-    line("config_exists('spri2025')", config_exists("spri2025"))
+    # 특정 프로파일 이름을 박아 두고 config_exists()를 물으면, 그 이름을 안 쓰는
+    # PC에서는 언제나 False가 떠 "설정을 못 읽는다"로 오독된다(진단 도구가 오진을
+    # 만드는 셈). 실제로 들어 있는 목록을 그대로 보여 준다.
+    try:
+        with open(ext_path(cp), "rb") as f:
+            names = sorted((tomllib.load(f).get("profile") or {}).keys())
+        line("config 내 프로파일", ", ".join(names) if names else "(없음)")
+    except OSError as exc:
+        line("config 내 프로파일", f"읽기 실패 {type(exc).__name__}: {exc}")
 except Exception as exc:  # noqa: BLE001
     line("CLI 경로 계산", f"실패 {type(exc).__name__}: {exc}")
 
 
 # ---------------------------------------------------------------------------
-# 프로파일 인자를 주면 DB 기준선과 로컬 스캔을 대조한다:  python diag.py swstat
+# 프로파일 인자를 주면 DB 기준선과 로컬 스캔을 대조한다:  python diag.py <프로파일>
 # ---------------------------------------------------------------------------
 if len(sys.argv) > 1:
     prof = sys.argv[1]

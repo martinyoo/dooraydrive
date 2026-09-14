@@ -10,9 +10,10 @@ raw 목록 API를 깊이 제한으로 돈다(비용은 폴더 수 비례 ~0.4초
 깊이 1~2라 기본 깊이 3이면 수십 폴더만 순회한다 — WORK 하위 2,392폴더 전체를 돌지
 않는다).
 
-실행: python tools\\discover_roots.py [--depth N] [--local-base 경로]
+실행: python tools\\discover_roots.py [--depth N] [--local-base 경로] [--drive-id ID]
       --local-base 는 init 명령의 --local-root 를 채울 이 PC의 최상위 폴더
       (기본 C:\\Dooray — 새 PC 기준).
+      --drive-id 는 보통 생략한다 — config에 등록된 프로파일에서 찾는다(tools/_driveid.py).
 """
 from __future__ import annotations
 
@@ -30,9 +31,9 @@ from dooray_sync.api.drive import DriveAPI               # noqa: E402
 from dooray_sync.auth import get_token                   # noqa: E402
 from dooray_sync.config import config_path               # noqa: E402
 from dooray_sync.util.paths import path_key, to_nfc      # noqa: E402
+from tools import _driveid                               # noqa: E402
 
 MARKER = "synchere.bat"
-DEFAULT_DRIVE = "3229053305881780627"
 
 
 def _registered() -> dict[str, str]:
@@ -61,19 +62,28 @@ def main() -> int:
     if "--local-base" in args:
         i = args.index("--local-base")
         local_base = args[i + 1]
+    explicit_drive = None
+    if "--drive-id" in args:
+        i = args.index("--drive-id")
+        explicit_drive = args[i + 1]
+    try:
+        drive_id = _driveid.resolve(explicit_drive)
+    except _driveid.DriveIdNotFound as exc:
+        print(exc)
+        return 2
 
     registered = _registered()
     found: list[tuple[str, bool, str]] = []   # (원격경로, 등록여부, 프로파일명)
 
     with DoorayClient("https://api.gov-dooray.com", get_token()) as client:
         api = DriveAPI(client)
-        root = api.find_root_folder(DEFAULT_DRIVE)
+        root = api.find_root_folder(drive_id)
         # (folder_id, 경로, 깊이) BFS — 마커가 있는 폴더를 찾는다
         queue: list[tuple[str, str, int]] = [(root, "", 0)]
         scanned = 0
         while queue:
             fid, path, d = queue.pop(0)
-            children = list(api.iter_children(DEFAULT_DRIVE, fid))
+            children = list(api.iter_children(drive_id, fid))
             scanned += 1
             has_marker = any(
                 not c.is_dir and path_key(c.name) == path_key(MARKER) for c in children)
@@ -100,7 +110,7 @@ def main() -> int:
         print("아직 이 PC에 등록되지 않은 동기화 루트 — 쓰려면 아래 명령으로 등록:")
         for path, _r, _n in news:
             leaf = path.rpartition("/")[2]
-            print(f'  dsync init -p {leaf} --drive-id {DEFAULT_DRIVE} '
+            print(f'  dsync init -p {leaf} --drive-id {drive_id} '
                   f'--remote-path "{path}" --local-root "{local_base}\\{leaf}"')
         print()
         print("  (로컬에 같은 파일이 이미 있다면 init 뒤 'dsync reconcile'을 먼저 실행)")

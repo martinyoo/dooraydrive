@@ -1,7 +1,7 @@
 """git 잠금 하버스의 격리 자체를 검사한다 — 하버스 코드보다 먼저 존재해야 한다.
 
 잠금 하버스는 정의상 `.git` 내부를 만들고 지운다. 경로 계산이 한 번만 어긋나면
-`C:\\drive\\obsidian` 의 진짜 볼트가 망가진다 — 그리고 그 사고는 **다른 테스트가
+이 PC의 진짜 볼트가 망가진다 — 그리고 그 사고는 **다른 테스트가
 전부 초록인 채로** 일어난다. 격리는 풀려도 빨간불이 안 뜨는 종류의 고장이라,
 겨냥한 탐지기를 따로 둔다(vault 체크리스트 `tests-reaching-real-machine-state.md`).
 
@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+from tests import machine
 from tests.gitlock_harness import REAL_VAULT_ROOTS, assert_outside_real_vaults
 
 GIT_ENV_VARS = (
@@ -62,16 +63,22 @@ def test_git_home_is_not_the_real_user_profile():
     아니라 **정체** — 진짜 홈 그 자체인가다.
     """
     home = Path(os.environ["HOME"]).resolve()
-    real_home = Path(r"C:\Users\martin.hs.yoo").resolve()
-    assert home != real_home, f"HOME 이 진짜 홈이다: {home}"
+    # 진짜 홈은 machine이 **덮이기 전에** 붙잡아 둔 값이다. 여기서 다시 물으면
+    # (expanduser·USERPROFILE 어느 쪽이든) 격리가 덮어 놓은 가짜가 와서, 격리가
+    # 풀린 상태에서도 이 단언이 통과해 버린다.
+    assert home != machine.REAL_USER_HOME, f"HOME 이 진짜 홈이다: {home}"
     # 진짜 홈의 .gitconfig 가 있어도 읽히지 않아야 한다 —
     # 그 확증은 test_global_save_alias_is_not_visible 이 한다.
 
 
 # ---------------------------------------------------------------- 2. 경로 검사
-@pytest.mark.parametrize("root", REAL_VAULT_ROOTS)
+@pytest.mark.parametrize("root", REAL_VAULT_ROOTS or [None])
 def test_real_vault_paths_are_rejected(root):
     """볼트 안 경로는 하버스가 거부해야 한다."""
+    if root is None:
+        # 빈 파라미터셋을 pytest에 넘기면 경고와 함께 조용히 사라진다 — 사유를
+        # 남긴다. 목록이 비어도 임시 폴더 검사(아래 테스트)가 방어선으로 남는다.
+        pytest.skip(f"{machine.ENV_VAULT_ROOT} 미설정 — 지킬 볼트가 지정되지 않았다")
     with pytest.raises(AssertionError, match="실제 볼트"):
         assert_outside_real_vaults(root / "knowledge_base" / "scenario")
 
@@ -103,7 +110,7 @@ def test_git_actually_reads_the_isolated_config(tmp_path):
     written = Path(os.environ["GIT_CONFIG_GLOBAL"])
     text = written.read_text(encoding="utf-8")
     assert "[harness]" in text and "isolated" in text, f"기록 안 됨: {text!r}"
-    assert written.resolve() != (Path(r"C:\Users\martin.hs.yoo") / ".gitconfig")
+    assert written.resolve() != (machine.REAL_USER_HOME / ".gitconfig")
 
 
 def test_global_save_alias_is_not_visible(tmp_path):

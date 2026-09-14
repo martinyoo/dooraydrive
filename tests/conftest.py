@@ -32,6 +32,12 @@ if str(REPO) not in sys.path:
 
 from dooray_sync import config as cfg  # noqa: E402
 
+# 여기서 import하는 이유는 캡처 시점을 고정하기 위해서다 — machine.REAL_USER_HOME은
+# 모듈 import 때 진짜 홈을 붙잡는데, 아래 `_isolate_git_env`가 HOME·USERPROFILE을
+# 임시 폴더로 덮는다. conftest는 어떤 테스트 모듈보다 먼저 import되므로 여기가
+# 가장 이른 지점이다. (사용처: tests/test_gitlock_isolation.py)
+from tests import machine  # noqa: E402,F401
+
 
 @pytest.fixture(autouse=True)
 def _isolate_user_dirs(tmp_path_factory, monkeypatch):

@@ -31,9 +31,11 @@ from pathlib import Path
 
 import pytest
 
-LIB = Path(r"C:\drive\obsidian\agent_base\deploy\lib.ps1")
+from tests import machine
 
-needs_lib = pytest.mark.skipif(not LIB.exists(), reason="이 PC 에 lib.ps1 이 없다")
+LIB, _WHY = machine.resolve("agent_base", "deploy", "lib.ps1")
+
+needs_lib = pytest.mark.skipif(LIB is None, reason=_WHY)
 
 # lib.ps1:3 이 5.1 호환을 요구한다. 5.1 에서만 조용히 실패하는 종류를 이미
 # 한 번 겪었으므로(R11, stderr 줄바꿈) 양쪽에서 돌린다.

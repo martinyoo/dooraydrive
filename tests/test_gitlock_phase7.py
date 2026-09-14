@@ -12,18 +12,19 @@ git 은 잔해를 남기지 않는다(잔해 10건이 전부 0바이트였던 �
 from __future__ import annotations
 
 import subprocess
-from pathlib import Path
 
 import pytest
 
+from tests import machine
 from tests.gitlock_harness import scenario as sc
 
-VAULT = Path(r"C:\drive\obsidian")
-BOOTSTRAP_CMD = VAULT / "agent_base" / "deploy" / "bootstrap.cmd"
-SYNCHERE_BAT = VAULT / "knowledge_base" / "git+dooray-synchere.bat"
+# 파일마다 따로 판정한다 — 볼트는 있는데 그 파일만 없는 경우가 실제로 있고,
+# 한 덩어리로 묶으면 무엇이 없어서 건너뛴 건지 사유에 남지 않는다.
+BOOTSTRAP_CMD, _WHY_BOOTSTRAP = machine.resolve("agent_base", "deploy", "bootstrap.cmd")
+SYNCHERE_BAT, _WHY_SYNCHERE = machine.resolve("knowledge_base", "git+dooray-synchere.bat")
 
-needs_vault = pytest.mark.skipif(
-    not VAULT.exists(), reason="이 PC 에 vault 가 없다(데스크톱 구성)")
+needs_bootstrap = pytest.mark.skipif(BOOTSTRAP_CMD is None, reason=_WHY_BOOTSTRAP)
+needs_synchere = pytest.mark.skipif(SYNCHERE_BAT is None, reason=_WHY_SYNCHERE)
 
 
 @pytest.fixture()
@@ -34,7 +35,7 @@ def scn(tmp_path):
 
 
 # ---------------------------------------------------------------- T2. pause
-@needs_vault
+@needs_bootstrap
 def test_T2_1_bootstrap_cmd_pauses_before_exit():
     """`bootstrap.cmd` 가 창을 즉시 닫으면 안 된다.
 
@@ -46,7 +47,7 @@ def test_T2_1_bootstrap_cmd_pauses_before_exit():
     assert "pause" in text.lower(), "bootstrap.cmd 에 pause 가 없다 — 창이 즉시 닫힌다"
 
 
-@needs_vault
+@needs_bootstrap
 def test_T2_2_bootstrap_cmd_is_ascii_only():
     """cmd.exe 는 BOM·비ASCII 를 콘솔 코드페이지로 오독한다(전역 인코딩 교훈)."""
     raw = BOOTSTRAP_CMD.read_bytes()
@@ -55,7 +56,7 @@ def test_T2_2_bootstrap_cmd_is_ascii_only():
     assert not bad, f"비ASCII 바이트 {len(bad)}개"
 
 
-@needs_vault
+@needs_bootstrap
 def test_T2_2b_batch_files_are_crlf():
     r"""`.cmd`·`.bat` 은 CRLF 여야 한다.
 
@@ -75,7 +76,7 @@ def test_T2_2b_batch_files_are_crlf():
     assert lone_lf == 0, f"단독 LF {lone_lf}개 — .gitattributes 규칙 위반"
 
 
-@needs_vault
+@needs_synchere
 def test_T2_3_synchere_wrapper_delegates_its_pause():
     """계획 원문의 지적을 정정한 근거를 고정한다.
 

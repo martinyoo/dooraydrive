@@ -15,12 +15,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from dooray_sync.api.client import DoorayClient          # noqa: E402
 from dooray_sync.api.drive import DriveAPI               # noqa: E402
 from dooray_sync.auth import get_token                   # noqa: E402
-
-DEFAULT_DRIVE = "3229053305881780627"
+from tools import _driveid                               # noqa: E402
 
 
 def main() -> int:
-    drive_id = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_DRIVE
+    try:
+        drive_id = _driveid.resolve(sys.argv[1] if len(sys.argv) > 1 else None)
+    except _driveid.DriveIdNotFound as exc:
+        print(exc)
+        return 2
     with DoorayClient("https://api.gov-dooray.com", get_token()) as client:
         api = DriveAPI(client)
         root = api.find_root_folder(drive_id)

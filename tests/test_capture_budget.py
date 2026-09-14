@@ -22,10 +22,11 @@ from pathlib import Path
 
 import pytest
 
-CAPTURE_PY = Path(r"C:\drive\obsidian\knowledge_base\scripts\capture.py")
+from tests import machine
 
-needs_vault = pytest.mark.skipif(
-    not CAPTURE_PY.exists(), reason="이 PC 에 vault 가 없다")
+CAPTURE_PY, _WHY = machine.resolve("knowledge_base", "scripts", "capture.py")
+
+needs_vault = pytest.mark.skipif(CAPTURE_PY is None, reason=_WHY)
 
 pytestmark = needs_vault
 
@@ -231,10 +232,11 @@ def test_deferred_is_documented(capture_mod):
 
 
 # ---------------------------------------------------------------- 결선
-CAPTURE_IO = CAPTURE_PY.parent / "telegram_bot" / "capture_io.py"
+CAPTURE_IO, _WHY_IO = machine.resolve(
+    "knowledge_base", "scripts", "telegram_bot", "capture_io.py")
 
 
-@pytest.mark.skipif(not CAPTURE_IO.exists(), reason="capture_io.py 없음")
+@pytest.mark.skipif(CAPTURE_IO is None, reason=_WHY_IO)
 def test_caller_passes_a_deadline():
     """**결선 공백을 막는다.**
 
@@ -275,10 +277,11 @@ def test_push_failures_go_through_lock_handling(capture_mod):
         "— add·commit·push 셋 다 필요하다")
 
 
-EXTRACT_PY = CAPTURE_PY.parent / "telegram_bot" / "extract.py"
+EXTRACT_PY, _WHY_EXTRACT = machine.resolve(
+    "knowledge_base", "scripts", "telegram_bot", "extract.py")
 
 
-@pytest.mark.skipif(not EXTRACT_PY.exists(), reason="extract.py 없음")
+@pytest.mark.skipif(EXTRACT_PY is None, reason=_WHY_EXTRACT)
 def test_extract_paths_do_not_need_a_deadline():
     """`extract.py` 도 capture.py 를 띄우지만 예산이 필요 없다 — 확인해 둔다.
 
@@ -298,7 +301,7 @@ def test_extract_paths_do_not_need_a_deadline():
         f"extract.py 가 git 을 쓰는 하위명령을 부른다: {used} — 예산 결선 필요")
 
 
-@pytest.mark.skipif(not CAPTURE_PY.exists(), reason="capture.py 없음")
+@pytest.mark.skipif(CAPTURE_PY is None, reason=_WHY)
 def test_only_three_subcommands_touch_git(capture_mod):
     """`commit_push` 호출 지점이 셋이라는 전제를 고정한다.
 
@@ -312,7 +315,7 @@ def test_only_three_subcommands_touch_git(capture_mod):
     assert calls <= 8, f"commit_push 호출이 {calls}곳으로 늘었다 — 결선을 다시 보라"
 
 
-@pytest.mark.skipif(not CAPTURE_IO.exists(), reason="capture_io.py 없음")
+@pytest.mark.skipif(CAPTURE_IO is None, reason=_WHY_IO)
 def test_deadline_leaves_tail_room():
     """마감시한이 timeout 보다 **앞서야** 한다 — 같으면 여유가 0이다."""
     import importlib.util
@@ -332,7 +335,7 @@ def test_deadline_leaves_tail_room():
     _ = (spec, mod)
 
 
-@pytest.mark.skipif(not CAPTURE_IO.exists(), reason="capture_io.py 없음")
+@pytest.mark.skipif(CAPTURE_IO is None, reason=_WHY_IO)
 def test_tail_reserve_covers_min_budget(capture_mod):
     """여유가 `GIT_MIN_BUDGET` 보다 커야 예산 판정이 의미를 갖는다.
 

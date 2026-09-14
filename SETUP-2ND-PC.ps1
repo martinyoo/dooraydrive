@@ -1,181 +1,38 @@
-﻿# [폐지 예정 2026-08-10] 이 스크립트는 더 이상 설치 흐름에서 쓰이지 않는다.
-# INSTALL.ps1이 호출하지 않으며, 하드코딩된 프로파일 목록은 특정 사용자 전용이라
-# 동료 PC에 맞지 않는다. 대체 흐름: 동기화할 폴더에 synchere.bat를 복사해
-# 더블클릭하면 그 폴더가 등록되고 시작된다(tools/sync_here.py의 유도 사슬 —
-# 다른 PC에서 동기화하던 폴더는 원격 마커로 자동 결합해 이어받는다).
+﻿# [축소됨 2026-09-14] 남은 기능은 '발견'(discover) 하나뿐이다.
 #
-# 두 번째 PC(회사 PC) 최초 설정 — PowerShell에서 실행:  .\SETUP-2ND-PC.ps1
+# 예전에는 이 스크립트가 프로파일 4개를 하드코딩해 한 번에 init 했다. 그 목록은
+# 특정 사용자의 업무 폴더 이름·파일 수·용량이었다. 공개 저장소에 둘 것이 아니고,
+# 방식 자체도 2026-08-10 결정으로 이미 폐기됐다 — **동기화 폴더는 설치 때 정하지
+# 않는다.** 하드코딩한 목록은 만든 사람의 PC에서만 맞고 동료 PC에서는 틀린다.
 #
-# 이미 원격에 올라가 있는 내용을 이 PC로 내려받기 위한 설정이다.
-# SETUP.ps1(첫 PC용)과 다른 점:
-#   - 원격 폴더를 만들지 않는다(--create-remote 없음). 없으면 실패시킨다 — 오타로 빈 폴더가
-#     새로 생기면 pull이 0건을 받고 정상처럼 보이기 때문이다.
-#   - --force를 쓰지 않는다. 설정이 이미 있으면 멈춘다(기존 기준선 보호).
-#   - 로컬이 비어 있다고 가정한다. 파일이 이미 있으면 init 뒤 reconcile을 먼저 돌려야 한다.
+# 지금의 흐름: 동기화할 폴더에 synchere.bat 을 복사해 더블클릭하면 그 폴더가
+# 등록되고 시작된다(tools/sync_here.py 의 유도 사슬 — 다른 PC에서 동기화하던
+# 폴더는 원격 마커로 자동 결합해 이어받는다).
 #
-# 사용 예:  .\SETUP-2ND-PC.ps1 -LocalBase 'D:\Dooray'
+# 이 파일에 남은 것은 그 유도 사슬이 무엇을 찾게 될지 **미리 눈으로 보는** 도구다.
+#
+# 사용:  .\SETUP-2ND-PC.ps1
+#        .\SETUP-2ND-PC.ps1 -LocalBase 'D:\Dooray'
 param(
   [string]$LocalBase = 'C:\Dooray',
+  # 예전에는 '발견만' 모드를 고르는 스위치였다. 지금은 그것이 유일한 모드라
+  # 아무것도 바꾸지 않는다 — 옛 안내문을 보고 붙이는 사람이 있어 받아만 둔다.
   [switch]$Discover
 )
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
-# -Discover: 드라이브의 마커(synchere.bat)를 스캔해 동기화 루트 후보를 보여준다.
-# 마커는 발견 힌트일 뿐 자동 등록은 하지 않는다 — init은 사용자가 확인 후 실행.
-if ($Discover) {
-  Write-Host "== 원격 마커 기반 동기화 루트 발견 ==" -ForegroundColor Cyan
-  python tools\discover_roots.py --local-base $LocalBase
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-  Write-Host ""
-  Write-Host "위 후보를 확인한 뒤, 쓰려는 폴더의 init 명령을 복사해 실행하세요." -ForegroundColor Green
-  Write-Host "init 후에는 그 로컬 폴더에 synchere.bat를 복사해 두세요 — 실행기이자" -ForegroundColor Green
-  Write-Host "등록 스위치입니다(없으면 다음 SYNC.ps1 -Sync가 그 프로파일을 자동 해제)." -ForegroundColor Green
-  Write-Host "(기본 4개 프로파일 자동 설정은 -Discover 없이 실행합니다)" -ForegroundColor DarkGray
-  exit 0
-}
-
-$DRIVE   = '3229053305881780627'
-$NEED_GB = 11.5   # 원격 실측 11.24GB + 여유
-
-$jobs = @(
-  @{ p='spri2025'; remote='WORK/spri 2025'; sub='spri 2025'; files=700; gb=4.13 },
-  @{ p='spri2026'; remote='WORK/spri 2026'; sub='spri 2026'; files=621; gb=2.23 },
-  @{ p='swstat';   remote='WORK/SW통계';    sub='SW통계';    files=13;  gb=0.35 },
-  @{ p='workenv';  remote='근무환경';        sub='근무환경';   files=440; gb=4.53 }
-)
-
-# ---------------------------------------------------------------------------
-Write-Host "== 0) 사전 점검 ==" -ForegroundColor Cyan
-
-$py = (Get-Command python -ErrorAction SilentlyContinue)
-if (-not $py) {
-  Write-Host "  [실패] python을 찾을 수 없습니다." -ForegroundColor Red
-  Write-Host "  python.org에서 3.11 이상 설치 (설치 첫 화면 'Add python.exe to PATH' 체크)"
-  exit 1
-}
-$ver = (python -c "import sys;print('%d.%d'%sys.version_info[:2])")
-Write-Host ("  [정상] python {0} — {1}" -f $ver, $py.Source) -ForegroundColor DarkGray
-
-python -c "import httpx, keyring" 2>$null
-if ($LASTEXITCODE -ne 0) {
-  Write-Host "  [실패] 의존성이 없습니다. 먼저 실행하세요:" -ForegroundColor Red
-  Write-Host "    pip install -r requirements.txt"
-  exit 1
-}
-Write-Host "  [정상] 의존성 확인" -ForegroundColor DarkGray
-
-# 디스크 여유 — 받을 양보다 적으면 중간에 멈춘다
-$qualifier = Split-Path -Qualifier $LocalBase
-if ($qualifier) {
-  $freeGB = [math]::Round((Get-PSDrive ($qualifier -replace ':','')).Free / 1GB, 1)
-  if ($freeGB -lt $NEED_GB) {
-    Write-Host ("  [실패] {0} 여유 {1}GB — 최소 {2}GB 필요" -f $qualifier, $freeGB, $NEED_GB) -ForegroundColor Red
-    exit 1
-  }
-  Write-Host ("  [정상] {0} 여유 {1}GB (필요 {2}GB)" -f $qualifier, $freeGB, $NEED_GB) -ForegroundColor DarkGray
-}
+# 마커(synchere.bat)를 스캔해 동기화 루트 후보를 보여준다. 마커는 발견 힌트일 뿐
+# 자동 등록은 하지 않는다 — 등록 여부는 사용자가 확인 후 결정한다.
+# drive_id 는 넘기지 않는다: config 에 등록된 프로파일에서 찾는다(tools/_driveid.py).
+Write-Host "== 원격 마커 기반 동기화 루트 발견 ==" -ForegroundColor Cyan
+python tools\discover_roots.py --local-base $LocalBase
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 Write-Host ""
-Write-Host "== 1) 토큰·연결 점검 ==" -ForegroundColor Cyan
-python -m dooray_sync.cli.main doctor
-if ($LASTEXITCODE -ne 0) {
-  Write-Host ""
-  Write-Host "토큰이 없으면 먼저 등록하세요 (PC마다 따로 등록해야 합니다):" -ForegroundColor Yellow
-  Write-Host '  python -c "import keyring; keyring.set_password(''dooray-sync'',''api-token'',''발급받은토큰'')"'
-  Write-Host "(설정이 아직 없다는 경고는 정상입니다 — 계속 진행합니다)" -ForegroundColor DarkGray
-}
-
-# ---------------------------------------------------------------------------
+Write-Host "가장 쉬운 길: 쓰려는 폴더에 synchere.bat 을 복사해 더블클릭하세요." -ForegroundColor Green
+Write-Host "             등록과 첫 동기화가 그 한 번으로 끝납니다." -ForegroundColor Green
 Write-Host ""
-Write-Host ("== 2) 프로파일 init  (로컬 기준: {0}) ==" -f $LocalBase) -ForegroundColor Cyan
-
-foreach ($j in $jobs) {
-  $local = Join-Path $LocalBase $j.sub
-  Write-Host ""
-  Write-Host ("-- {0}  ->  {1}" -f $j.p, $j.remote) -ForegroundColor Cyan
-
-  # 재실행 복구: 이미 설정된 프로파일은 건너뛴다(--force 금지 원칙 유지 — 기존
-  # 기준선 보호). 이 분기가 없으면 부분 실패 후 재실행이 첫 기존 프로파일의
-  # init에서 죽어 아래 2-2(마커 배치)에 영원히 도달하지 못한다(적대 검증 지적).
-  $exists = python -c "import sys;sys.path.insert(0,'.');from dooray_sync.config import config_exists;print(1 if config_exists('$($j.p)') else 0)" 2>$null
-  if ("$exists".Trim() -eq '1') {
-    Write-Host ("  [건너뜀] {0} — 설정이 이미 있습니다(재실행 복구). init을 다시 하지 않습니다." -f $j.p) -ForegroundColor DarkGray
-    continue
-  }
-
-  # 로컬에 파일이 이미 있으면 이 스크립트의 전제(빈 로컬)가 깨진다.
-  if (Test-Path -LiteralPath $local) {
-    $n = @(Get-ChildItem -LiteralPath $local -Recurse -File -ErrorAction SilentlyContinue).Count
-    if ($n -gt 0) {
-      Write-Host ("  [주의] 로컬에 이미 {0}개 파일이 있습니다: {1}" -f $n, $local) -ForegroundColor Yellow
-      Write-Host  "         init 뒤 'dsync reconcile -p $($j.p)'를 먼저 실행해야 합니다." -ForegroundColor Yellow
-      Write-Host  "         (기준선 없이 pull하면 전부 '보류'로 멈춥니다)" -ForegroundColor DarkGray
-    }
-  }
-
-  python -m dooray_sync.cli.main init -p $j.p --drive-id $DRIVE `
-      --remote-path $j.remote --local-root $local
-  if ($LASTEXITCODE -ne 0) {
-    Write-Host ("  [실패] {0} init 실패 — 중단합니다." -f $j.p) -ForegroundColor Red
-    Write-Host  "         원격 폴더 이름이 정확한지, 토큰이 유효한지 확인하세요." -ForegroundColor Red
-    exit 1
-  }
-}
-
-# ---------------------------------------------------------------------------
-Write-Host ""
-Write-Host "== 2-1) 원격 스캔 완료 확인 ==" -ForegroundColor Cyan
-# 건수가 아니라 스캔이 끝났는지를 본다(SETUP.ps1과 같은 판정). 자세한 이유는
-# docs/에이전트_운영교훈.md §5 참조.
-$missing = @()
-foreach ($j in $jobs) {
-  $out = python -c "import sys;sys.path.insert(0,'.');from dooray_sync.config import db_path,load_config;from dooray_sync.store.db import Store,META_LAST_FULL_SCAN;p=load_config('$($j.p)');s=Store(db_path('$($j.p)'));print((s.get_meta(META_LAST_FULL_SCAN) or '-')+'|'+str(s.count_files(p.drive_id)));s.close()" 2>$null
-  $scan, $n = ($out -split '\|')
-  if ($LASTEXITCODE -eq 0 -and $scan -and $scan -ne '-') {
-    Write-Host ("  [정상] {0} — 원격 기록 {1}건 (예상 {2}건)" -f $j.p, $n, $j.files) -ForegroundColor DarkGray
-  } else {
-    Write-Host ("  [스캔 미완료] {0}" -f $j.p) -ForegroundColor Red
-    $missing += $j.p
-  }
-}
-if ($missing.Count -gt 0) {
-  Write-Host ""
-  Write-Host "원격 스캔이 끝나지 않은 프로파일이 있습니다: $($missing -join ', ')" -ForegroundColor Red
-  exit 1
-}
-
-# ---------------------------------------------------------------------------
-Write-Host ""
-Write-Host "== 2-2) 로컬 마커(synchere.bat) 배치 ==" -ForegroundColor Cyan
-# '등록 = 루트에 마커 ON'이 불변식이다(구현계획서 M2.5). 마커 없이 두면 이 PC의
-# 첫 SYNC.ps1 -Sync 정합이 방금 만든 프로파일을 전부 자동 해제(off)해 버린다.
-# 마커는 양축 상시 제외라 pull로도 내려오지 않는다 — 여기서 직접 놓는 것이 유일하다.
-foreach ($j in $jobs) {
-  $local = Join-Path $LocalBase $j.sub
-  if (-not (Test-Path -LiteralPath $local)) {
-    New-Item -ItemType Directory -Force -Path $local | Out-Null
-  }
-  $dst = Join-Path $local 'synchere.bat'
-  if (Test-Path -LiteralPath $dst) {
-    Write-Host ("  [정상] {0}" -f $dst) -ForegroundColor DarkGray
-  } else {
-    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'synchere.bat') -Destination $dst
-    Write-Host ("  [배치] {0}" -f $dst) -ForegroundColor DarkGray
-  }
-}
-
-# ---------------------------------------------------------------------------
-Write-Host ""
-Write-Host "설정 완료. 다음은 내려받기입니다 — 총 1,774파일 / 약 11.2GB." -ForegroundColor Green
-Write-Host ""
-Write-Host "먼저 계획만 확인하고(아무것도 바꾸지 않습니다):" -ForegroundColor Green
-Write-Host "  .\dsync pull -p swstat --dry-run"
-Write-Host ""
-Write-Host "작은 것부터 실제로 받아 보고, 정상이면 나머지를 받으세요:" -ForegroundColor Green
-Write-Host "  .\dsync pull -p swstat      # 13파일 / 0.35GB — 경로 검증용"
-Write-Host "  .\dsync pull -p spri2026    # 621파일 / 2.23GB"
-Write-Host "  .\dsync pull -p spri2025    # 700파일 / 4.13GB"
-Write-Host "  .\dsync pull -p workenv     # 440파일 / 4.53GB"
-Write-Host ""
-Write-Host "중단되어도 안전합니다 — 다시 실행하면 받은 것은 건너뛰고 남은 것만 받습니다." -ForegroundColor DarkGray
+Write-Host "dsync init 으로 직접 등록했다면, 그 폴더에 synchere.bat 을 꼭 복사해" -ForegroundColor Green
+Write-Host "두세요 - 실행기이자 등록 스위치입니다(없으면 다음 실행이 자동 해제)." -ForegroundColor Green
+exit 0

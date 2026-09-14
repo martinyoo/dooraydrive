@@ -17,8 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from dooray_sync.api.client import DoorayClient          # noqa: E402
 from dooray_sync.api.drive import DriveAPI               # noqa: E402
 from dooray_sync.auth import get_token                   # noqa: E402
-
-DEFAULT_DRIVE = "3229053305881780627"
+from tools import _driveid                               # noqa: E402
 
 
 def main() -> int:
@@ -29,7 +28,11 @@ def main() -> int:
     if not name.startswith("_"):
         print(f"거부: '{name}' — '_'로 시작하는 시험 폴더만 지울 수 있습니다.")
         return 2
-    drive_id = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_DRIVE
+    try:
+        drive_id = _driveid.resolve(sys.argv[2] if len(sys.argv) > 2 else None)
+    except _driveid.DriveIdNotFound as exc:
+        print(exc)
+        return 2
 
     with DoorayClient("https://api.gov-dooray.com", get_token()) as client:
         api = DriveAPI(client)
