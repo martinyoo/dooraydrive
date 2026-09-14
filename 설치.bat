@@ -275,10 +275,43 @@ echo ============================================================
 echo   Dooray Drive sync - installer
 echo   Running the copy next to this file:
 echo   %RUNDIR%
-echo   (nothing is downloaded in this mode - to update, run the
-echo    downloaded installer instead)
 echo ============================================================
 echo.
+REM  Say WHICH copy this is and what it can and cannot do.
+REM  The old text was one parenthesised line ("nothing is downloaded in this
+REM  mode") and people still read a run here as an update - measured twice:
+REM  2026-08-07 (a stale copy kept being double-clicked) and 2026-09-15
+REM  ("so I just run C:\dooraydrive\<this file>?"). synchere.bat already
+REM  refuses in the very same situation and names the fix; this is the same
+REM  treatment for the installer.
+REM
+REM  The test is .git, not INSTALLED.txt: a source checkout always has .git,
+REM  while installs made before the stamp existed have no INSTALLED.txt and
+REM  must still be recognised as installs.
+if exist "%RUNDIR%\.git" goto :in_repo_source
+
+echo   [!] THIS DOES NOT UPDATE THE PROGRAM.
+echo       This folder is an installed copy, not a source checkout.
+echo       Running here only re-checks python, dependencies, token and
+echo       connection - nothing is downloaded, no code changes.
+echo.
+echo       To UPDATE: copy this file into any folder that does NOT
+echo       contain INSTALL.ps1 (your Desktop, or %%TEMP%%) and run that
+echo       copy. It fetches the latest version and replaces this folder.
+echo       To roll back, give that copy a version: ^<this file^> v0.2.0
+echo.
+goto :in_repo_go
+
+:in_repo_source
+echo   [!] This is a SOURCE CHECKOUT (.git found here).
+echo       Setting it up in place registers DSYNC_HOME to THIS folder,
+echo       which makes the checkout the program that runs every day -
+echo       half-finished code would then sync real files.
+echo       If you keep a separate installed copy, stop and run the
+echo       installed one instead. Nothing is downloaded in this mode.
+echo.
+
+:in_repo_go
 
 REM ===========================================================================
 REM  Run the real installer. INSTALL.ps1 holds all Korean text, all prompts
