@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import os
 import signal
 import subprocess
@@ -289,11 +290,25 @@ def _apply_backoff(st: AutoState, name: str, kind: str, report: dict) -> None:
         st.set_backoff_mult(name, max(1.0, cur * 0.75))
 
 
-def _config_mtime() -> float:
+def _config_fingerprint() -> str:
+    """config 파일의 내용 지문 — "바뀌었는가"를 판정하는 유일한 근거.
+
+    예전에는 mtime 이었다. 갈아탄 이유는 실측이다(2026-09-14). **내용이 매번
+    달라지는 저장 300회 중 mtime 은 변경을 173회(58%) 놓쳤다**(내용 지문은 0회).
+    Windows 시스템 시계가 약 15.6ms 단위로 움직이는데 config 저장은 그보다
+    훨씬 빨리 끝나기 때문이다. 그래서 "config 가 바뀌면 쉬는 상태가 자동으로
+    풀린다"는 약속이 사실상 동전 던지기였고, 같은 이유로 회귀 테스트가 전체
+    실행에서 간헐적으로 빨간불이 됐다 — 릴리스 판정('테스트 전건 통과')이
+    흔들린다는 뜻이다.
+
+    config 는 작은 파일이라 틱마다 해시해도 비용이 문제되지 않는다. 시간이
+    아니라 내용을 보는 것이 애초에 물어야 했던 질문이기도 하다.
+    """
     try:
-        return os.path.getmtime(ext_path(config_path()))
+        with open(ext_path(config_path()), "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
     except OSError:
-        return 0.0
+        return ""
 
 
 def _note_outcome(st: AutoState, name: str, kind: str, msg: str,
@@ -305,11 +320,12 @@ def _note_outcome(st: AutoState, name: str, kind: str, msg: str,
     if kind == "config":
         # 같은 거부를 2분마다 영원히 반복하지 않는다. config가 바뀌거나 사람이
         # 그 폴더에서 실행하기 전까지 이 프로파일의 자동 실행을 쉰다.
-        entry["config_error_mtime"] = _config_mtime()
+        entry["config_error_fp"] = _config_fingerprint()
         notify.add(name, "config", "설정 문제로 자동 실행을 멈췄습니다 - "
                                    "그 폴더에서 synchere.bat을 한 번 실행하세요", ts=ts)
         return
-    entry.pop("config_error_mtime", None)
+    entry.pop("config_error_fp", None)
+    entry.pop("config_error_mtime", None)   # 옛 키 청소(0.2.0 이전 state.json)
 
     from ..api.faults import ADVICE, LABEL, Fault, is_transient
 
@@ -362,13 +378,15 @@ def _note_outcome(st: AutoState, name: str, kind: str, msg: str,
 
 def _skipped_by_config_error(st: AutoState, name: str) -> bool:
     """설정 오류로 쉬는 중인가. config 파일이 바뀌면 자동으로 풀린다."""
-    stamp = st.profile(name).get("config_error_mtime")
-    if stamp is None:
+    stamp = st.profile(name).get("config_error_fp")
+    if not stamp:
+        # 옛 키(config_error_mtime)만 있는 state.json 은 여기서 자연히 풀린다 —
+        # 한 틱 더 돌아 보고 여전히 설정 문제면 새 지문으로 다시 쉰다(fail-open).
         return False
-    try:
-        return float(stamp) == _config_mtime()
-    except (TypeError, ValueError):
-        return False
+    fp = _config_fingerprint()
+    if not fp:
+        return False          # 지문을 못 구하면 쉬게 두지 않는다
+    return str(stamp) == fp
 
 
 def _write_status(st: AutoState, auto: dict, names: list[str],

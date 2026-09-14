@@ -110,3 +110,37 @@ def test_config_error_parks_profile_until_config_changes(statedir):
     cfg.save_config(cfg.Profile(name="b", drive_id="d",
                                 local_root=str(statedir / "b")))
     assert _skipped_by_config_error(st, "a") is False
+
+
+def test_config_change_is_seen_even_when_mtime_did_not_move(statedir):
+    """시계가 안 움직여도 내용이 바뀌었으면 풀려야 한다.
+
+    이 판정이 mtime 이던 시절의 실측(2026-09-14): 내용이 매번 달라지는 저장
+    300회 중 **mtime 은 변경을 173회(58%) 놓쳤다**(내용 지문은 0회). Windows
+    시스템 시계는 약 15.6ms 단위로 움직이는데 config 저장은 그보다 훨씬 빨리
+    끝난다. 그래서 "config 가 바뀌면 재개한다"가 동전 던지기였고, 위 테스트가
+    전체 실행에서 간헐적으로 빨간불이 됐다 — 릴리스 판정이 흔들린다는 뜻이다.
+
+    여기서는 mtime 을 **강제로 되돌려** 그 조건을 확실히 만든다. 안전장치는
+    그것이 필요한 조건에서 검증해야 한다(vault: vault-sync-script-silent-commit-loss).
+    """
+    import os
+
+    from dooray_sync.auto.runner import _skipped_by_config_error
+    from dooray_sync.util.paths import ext_path
+
+    cfg.save_config(cfg.Profile(name="a", drive_id="d",
+                                local_root=str(statedir / "a")))
+    path = ext_path(cfg.config_path())
+    before = os.stat(path)
+
+    st = AutoState({})
+    _note_outcome(st, "a", "config", "설정 문제", {}, NOW)
+    assert _skipped_by_config_error(st, "a") is True
+
+    cfg.save_config(cfg.Profile(name="b", drive_id="d",
+                                local_root=str(statedir / "b")))
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert os.stat(path).st_mtime_ns == before.st_mtime_ns, "전제가 안 만들어졌다"
+
+    assert _skipped_by_config_error(st, "a") is False
