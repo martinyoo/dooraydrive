@@ -16,6 +16,18 @@ REM    4. the drive THIS FILE sits on - save it on D: and it installs on D:
 REM       (a copy already installed at C:\dooraydrive wins, so re-runs do not
 REM        fork into a second copy)
 REM
+REM  Version, for ROLLBACK. Default is the latest on main.
+REM    installer.bat v0.2.0              a token shaped like vN... is a version
+REM    installer.bat D:\dooraydrive v0.2.0
+REM    set DSYNC_VERSION=v0.2.0          env var, same effect
+REM  It must be a tag that exists in the repo; the zip is then fetched from
+REM  refs/tags/<version> instead of refs/heads/main. Rollback exists only
+REM  because the tag does - without tags there is no way to name a past build.
+REM  When a version was ASKED FOR and the download fails, this installer does
+REM  NOT quietly fall back to the copy already on disk: you asked to change
+REM  versions, so ending up on the old one while reporting success would be
+REM  the failure mode the whole feature is meant to remove.
+REM
 REM  ENCODING - this file must stay pure ASCII. No Korean, not even in
 REM  comments or in a path that names this file.
 REM  cmd.exe reads .bat in the console code page (CP949 on Korean Windows), so
@@ -28,8 +40,10 @@ REM  INSTALL.ps1 takes over.
 REM ===========================================================================
 setlocal EnableExtensions
 
-set "ZIPURL=https://github.com/martinyoo/dooraydrive/archive/refs/heads/main.zip"
-set "ZIPFILE=%TEMP%\dooraydrive-main.zip"
+REM ZIPURL is assembled after argument parsing - the version can come from the
+REM command line, so it is not known yet at this point.
+set "ZIPBASE=https://github.com/martinyoo/dooraydrive/archive"
+set "ZIPFILE=%TEMP%\dooraydrive-src.zip"
 set "EXDIR=%TEMP%\dooraydrive-extract"
 
 REM Split argv: the first non-switch argument is the install folder, the rest
@@ -37,9 +51,23 @@ REM go to INSTALL.ps1. Parsed with goto, not with (), because %VAR% inside a
 REM parenthesised block expands before the block runs.
 set "TARGET="
 set "PSARGS="
+set "VERSION="
 :parse
 if "%~1"=="" goto :parsed
 set "ARG=%~1"
+REM A token shaped like vN (v then a digit) is a version, wherever it sits -
+REM checked before TARGET so `installer.bat D:\dooraydrive v0.2.0` works too.
+REM The digit test enumerates 0-9 instead of using LSS/GTR: those operators
+REM switch between numeric and string comparison depending on the operands,
+REM and this file must never guess.
+set "VDIGIT="
+if /I not "%ARG:~0,1%"=="v" goto :not_version
+for %%N in (0 1 2 3 4 5 6 7 8 9) do if "%ARG:~1,1%"=="%%N" set "VDIGIT=1"
+if not defined VDIGIT goto :not_version
+set "VERSION=%ARG%"
+shift
+goto :parse
+:not_version
 if defined TARGET goto :parse_ps
 if "%ARG:~0,1%"=="-" goto :parse_ps
 if "%ARG:~0,1%"=="/" goto :parse_ps
@@ -53,6 +81,14 @@ goto :parse
 :parsed
 
 if not defined TARGET if defined DSYNC_TARGET set "TARGET=%DSYNC_TARGET%"
+if not defined VERSION if defined DSYNC_VERSION set "VERSION=%DSYNC_VERSION%"
+
+REM Two plain lines, not an if/else block: %VAR% inside () expands before the
+REM block runs (same reason the parser above uses goto).
+set "ZIPURL=%ZIPBASE%/refs/heads/main.zip"
+set "VERLABEL=main"
+if defined VERSION set "ZIPURL=%ZIPBASE%/refs/tags/%VERSION%.zip"
+if defined VERSION set "VERLABEL=%VERSION%"
 
 REM Mode B is decided before any prompt - running in place needs no folder.
 if exist "%~dp0INSTALL.ps1" goto :in_repo
@@ -122,6 +158,7 @@ goto :bad_target
 :target_ok
 echo.
 echo   Fetching the program into %TARGET%
+if defined VERSION echo   Version requested: %VERSION%
 echo.
 
 REM  Refresh an existing install instead of silently reusing it. Reusing was the
@@ -156,7 +193,14 @@ if exist "%EXDIR%" rmdir /S /Q "%EXDIR%"
 mkdir "%EXDIR%"
 tar -xf "%ZIPFILE%" -C "%EXDIR%"
 if errorlevel 1 goto :extract_failed
-if not exist "%EXDIR%\dooraydrive-main\INSTALL.ps1" goto :extract_failed
+REM  Find the extracted folder instead of assuming its name. GitHub names the
+REM  top folder after the ref: refs/heads/main gives dooraydrive-main, but the
+REM  tag v0.2.0 gives dooraydrive-0.2.0 - the leading v is dropped. Looking for
+REM  the folder that actually holds INSTALL.ps1 handles both, and survives any
+REM  later change to that naming.
+set "SRCDIR="
+for /d %%D in ("%EXDIR%\*") do if exist "%%D\INSTALL.ps1" set "SRCDIR=%%D"
+if not defined SRCDIR goto :extract_failed
 
 REM `move SRC DST` puts SRC *inside* DST when DST already exists, which would
 REM bury the program one level deep (%TARGET%\dooraydrive-main\INSTALL.ps1) and
@@ -176,18 +220,33 @@ if defined REFRESH if exist "%TARGET%" goto :refresh_locked
 if exist "%TARGET%" rmdir "%TARGET%" 2>nul
 if exist "%TARGET%" goto :target_busy
 
-move "%EXDIR%\dooraydrive-main" "%TARGET%" >nul
+move "%SRCDIR%" "%TARGET%" >nul
 if errorlevel 1 goto :move_failed
 if defined REFRESH rmdir /S /Q "%TARGET%.old" >nul 2>&1
 rmdir /S /Q "%EXDIR%" >nul 2>&1
 del "%ZIPFILE%" >nul 2>&1
-echo       Done - %TARGET%
+REM  Install stamp. A PC whose program will not start at all (a bad import, a
+REM  half-extracted folder) cannot print its own version - and that is exactly
+REM  the PC whose version you need. Leave it where anyone can read it without
+REM  running anything. Redirection goes BEFORE echo so no trailing space is
+REM  written into the value.
+>"%TARGET%\INSTALLED.txt" echo dooraydrive install stamp
+>>"%TARGET%\INSTALLED.txt" echo version : %VERLABEL%
+>>"%TARGET%\INSTALLED.txt" echo url     : %ZIPURL%
+>>"%TARGET%\INSTALLED.txt" echo when    : %DATE% %TIME%
+>>"%TARGET%\INSTALLED.txt" echo into    : %TARGET%
+echo       Done - %TARGET%  (%VERLABEL%)
 goto :fetched
 
 REM  Could not fetch, but a working copy is already here - use it rather than
 REM  dying, and say plainly that it may be out of date. Only reachable when
 REM  REFRESH is set, so this never runs on a first install.
 :stale_fallback
+REM  A specific version was ASKED FOR. Falling back to the copy already on disk
+REM  would leave the PC on the wrong version while the installer reports
+REM  success - which is the exact failure this feature exists to remove.
+REM  Recovery must not report success (vault: vault-sync-script-silent-commit-loss).
+if defined VERSION goto :version_failed
 echo.
 echo   WARNING: could not fetch the latest version.
 echo   Falling back to the existing copy at %TARGET% - it may be OUT OF DATE.
@@ -281,6 +340,17 @@ echo   [STOP] Could not create %TARGET%.
 echo          A folder with that name may already exist, or permission denied.
 echo          Run this file again and give another folder, for example:
 echo            D:\dooraydrive
+goto :bail
+
+:version_failed
+echo.
+echo   [STOP] Could not fetch version %VERSION%.
+echo          Nothing was changed - the copy at %TARGET% is untouched.
+echo          Check that the tag exists and is spelled exactly:
+echo          %ZIPURL%
+echo          Tag list: https://github.com/martinyoo/dooraydrive/tags
+del "%ZIPFILE%" >nul 2>&1
+rmdir /S /Q "%EXDIR%" >nul 2>&1
 goto :bail
 
 :bad_target

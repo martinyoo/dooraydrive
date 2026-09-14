@@ -1,0 +1,42 @@
+# 줄바꿈 정책 — 저장소에는 LF로 보관하고, Windows 스크립트만 CRLF로 꺼낸다.
+#
+# 왜 필요한가 (2026-09-14 실측):
+#
+# 1) 이 저장소에는 .gitattributes 가 없었고 core.autocrlf 도 false 다. 인덱스는
+#    전부 LF인데 작업트리 54개 파일이 CRLF였다. 속성이 없으면 git 이 아무 변환도
+#    하지 않으므로, 그 파일을 한 번 편집하는 순간 **모든 줄이 변경으로 잡힌다** —
+#    6개 파일을 고쳤는데 diff 가 1,975줄이 됐다. 동료와 같이 쓰는 저장소에서
+#    이런 diff 는 리뷰도 병합도 불가능하게 만든다.
+#    text 속성이 붙으면 git 이 비교 전에 정규화하므로 이 잠복 문제가 사라진다.
+#
+# 2) .bat/.cmd 가 CRLF여야 하는 것은 취향이 아니다. cmd.exe 는 LF 배치 파일에서
+#    라벨·goto·복합 구문이 어긋나고 **그 실패가 조용하다.** synchere.bat 과
+#    설치.bat 이 정확히 그 구조(라벨 + goto)이고, 지금 배포되는 zip 의
+#    synchere.bat 은 LF 102줄이다. 우연히 동작하고 있을 뿐이다.
+#
+# 3) .ps1 은 UTF-8 BOM 이어야 한다 — Windows PowerShell 5.1 이 BOM 없는 파일을
+#    cp949 로 읽어 한글이 깨진다. BOM 은 git 이 관여하지 않으니 파일 자체로
+#    유지하고, 여기서는 줄바꿈만 고정한다.
+#
+# 주의: eol 속성은 체크아웃에만 작용한다. 이미 받아 둔 작업트리는 바뀌지 않으므로
+# 기존 PC 에서 실제로 CRLF 로 만들려면 한 번 재체크아웃해야 한다
+# (git rm --cached -r . && git reset --hard). 새로 clone·zip 받는 쪽은 그냥 맞다.
+
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 문서·자료로 들어올 수 있는 바이너리 — text=auto 의 내용 추측에 맡기지 않는다.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.pdf  binary
+*.zip  binary
+*.xlsx binary
+*.pptx binary
+*.docx binary
+*.hwp  binary
+*.hwpx binary
