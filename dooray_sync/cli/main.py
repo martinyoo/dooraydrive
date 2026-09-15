@@ -1692,10 +1692,11 @@ def _keep_local_next_sync(store: Store, p: Profile, item: _DiffItem, log) -> boo
     rec.parent_id = item.rec.parent_id or rec.parent_id
     rec.server_name = item.rec.server_name or rec.server_name
     rec.is_dir = False
-    rec.remote_md5 = baseline
-    rec.remote_size = item.rec.remote_size
-    rec.remote_version = item.rec.remote_version
-    rec.remote_revision = item.rec.remote_revision
+    # **remote_* 는 손대지 않는다.** `_resolve_one`(검증된 경로)도 local_* 만 바꾼다.
+    # 2026-09-15 실측: 여기에 remote_md5 를 채웠더니 다음 계획이 '새버전업로드'가
+    # 아니라 **'갱신받기'** 가 됐다 — 사용자가 고른 것과 정반대로 로컬을 덮을 뻔했다.
+    # Dooray 목록 API 응답에는 해시가 없어서(core/remote.py: "changes에만 존재"),
+    # 기준선에만 해시가 있고 원격 쪽에는 없는 상태가 '원격이 바뀌었다'로 읽힌다.
     rec.local_md5 = baseline          # '마지막으로 원격과 일치했던 내용' = 원격 것
     rec.local_mtime_ns = None         # 비워야 다음 diff가 해시를 다시 계산한다
     rec.local_size = None
@@ -1745,14 +1746,20 @@ def _decide_diffs(store: Store, p: Profile, items: list[_DiffItem], log) -> None
             _out("")
             _out(f"  [{i}/{len(items)}] {it.rel}")
             _out(f"        {it.why}")
-            _out("        1) 로컬 것을 살린다 — 다음 동기화가 이 파일을 원격에 올립니다")
             _out("        2) 원격 것을 살린다 — 로컬은 '(충돌 …)' 이름으로 보존하고 자리를 비웁니다")
             _out("        3) 나중에 (기본)")
             pick = _prompt_baseline()
             if pick == "local":
-                if _keep_local_next_sync(store, p, it, log):
-                    done_local += 1
-                    _out("    → 로컬 우선으로 표시했습니다.")
+                # [일시 차단 2026-09-15] '로컬 살리기'는 실계정에서 **반대로 동작했다** —
+                # 표시한 뒤 다음 계획이 '새버전업로드'가 아니라 '갱신받기'(로컬을 원격본으로
+                # 교체)가 됐다. 고른 것과 정반대이고 로컬을 덮는다.
+                # 단위 테스트는 원격 항목에 md5·version을 채워 넣고 시험해서 못 잡았다 —
+                # 실제 Dooray 목록 API 응답에는 해시가 없다(core/remote.py). 안전장치를
+                # 그것이 필요 없는 조건에서 시험한 전형이다.
+                # 원인을 규명할 때까지 **고를 수 없게** 둔다. 되돌릴 수 없는 쪽으로
+                # 틀리는 기능은 없는 편이 낫다.
+                _err("    '로컬 살리기'는 결함이 확인되어 잠시 막아 두었습니다"
+                     " — 그대로 둡니다.")
             elif pick == "remote":
                 dst = _keep_remote_next_sync(p, it)
                 if dst:
