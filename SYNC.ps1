@@ -324,7 +324,8 @@ foreach ($p in $profiles) {
   if ($hold -gt 0) {
     Write-Host ("      [보류] {0}건 — 원격에도 있는데 기준선이 없어 올리지 않습니다." -f $hold) -ForegroundColor Yellow
     Write-Host  "             해소:  .\dsync reconcile -p $p" -ForegroundColor DarkGray
-    Write-Host  "             (화면이 권하는 --assume-local-newer 는 쓰지 마세요 — 보류 전체를 덮어쓰는 전역 스위치입니다)" -ForegroundColor DarkGray
+    Write-Host  "             (reconcile 이 내용이 다른 파일마다 어느 쪽을 살릴지 번호로 묻습니다)" -ForegroundColor DarkGray
+    Write-Host  "             (--assume-local-newer 는 쓰지 마세요 — 보류 전체를 덮어쓰는 전역 스위치입니다)" -ForegroundColor DarkGray
     $blocked += "$p(보류 $hold)"
   }
   if ($rerr -gt 0) {

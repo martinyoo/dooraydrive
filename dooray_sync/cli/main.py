@@ -25,7 +25,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, NamedTuple
 
 # 규약 §0-1: 진입점에서 즉시 UTF-8 재설정. import 부수효과지만 여기가 유일한 진입점이고,
 # 아래 import들이 한국어 메시지를 출력할 수 있으므로 가장 먼저 해야 한다.
@@ -58,7 +58,7 @@ from ..config import (
     save_config,
     state_dir,
 )
-from ..core.differ import KIND_CONFLICT, DiffStats, diff
+from ..core.differ import KIND_CONFLICT, DiffStats, conflict_copy_name, diff
 from ..core.executor import SyncExecutor
 from ..core.journal import SyncJournal, recover
 from ..core.planner import ACTION_LABEL, TRASH_KINDS, BulkDeleteAbort
@@ -1246,7 +1246,10 @@ def _print_push_plan(plan: _PushPlan) -> None:
              f"어느 쪽이 최신인지 알 수 없습니다.")
         _err("        'dsync reconcile'을 먼저 실행하세요 — 원격 내용을 받아 대조해서")
         _err("        같으면 기준선만 기록하고(전송 없음), 다르면 알려 줍니다.")
-        _err("        로컬이 최신임이 확실하면 'dsync push --assume-local-newer'.")
+        # 여기서 --assume-local-newer 를 권하지 않는다. 그것은 보류 **전체**를 여는
+        # 전역 스위치라 이 파일들 중 하나만 고르는 수단이 아니다(AGENTS.md '넘지 말아야
+        # 할 선'). reconcile 이 파일마다 번호로 묻고 그 자리에서 처리한다.
+        _err("        내용이 다른 파일은 reconcile이 파일마다 어느 쪽을 살릴지 묻습니다.")
         for rel in plan.ambiguous[:10]:
             _err(f"        - {rel}")
         if len(plan.ambiguous) > 10:
@@ -1608,6 +1611,168 @@ def pull(
                         raise typer.Exit(EXIT_FAIL)
 
 
+class _DiffItem(NamedTuple):
+    """내용이 다른 파일 하나 — 번호 선택에 필요한 재료를 전부 들고 다닌다.
+
+    예전에는 `(rel, why)` 튜플이라 화면에 찍고 버렸다. 그래서 할 수 있는 일이
+    "명령을 적어 주고 끝내는 것"밖에 없었다(CLAUDE.md '화면이 명령을 시키면 그
+    기능은 없는 것이다'). 판정 시점에 이미 손에 있던 것을 버리지 않는다.
+    """
+    rel: str
+    why: str
+    entry: object            # LocalEntry
+    rec: object              # FileRecord — file_id·parent_id·server_name·원격 메타
+    remote_md5: str          # 크기 불일치 경로에서는 '' (받아보지 않았다)
+
+
+# 번호와 이름을 둘 다 받는다 — _KEEP_BY_NUM과 같은 계약(main.py 상단).
+_BASELINE_BY_NUM = {"1": "local", "2": "remote", "3": "skip"}
+_BASELINE_CHOICES = ("local", "remote", "skip")
+
+
+def _prompt_baseline(tries: int = 3) -> str:
+    """내용이 다른 파일 하나를 어떻게 할지 번호로 받는다. 못 받으면 'skip'.
+
+    계약은 `_prompt_keep`과 같다 — 오타를 만나면 그 건을 **조용히 건너뛰지 않고**
+    되묻되 유한하고, EOF·Ctrl+C·죽은 스트림은 즉시 포기한다. 기본값은 언제나
+    안전한 쪽(아무것도 하지 않음)이다.
+    """
+    for _ in range(max(1, tries)):
+        try:
+            raw = input("    번호를 고르세요 [3]: ").strip()
+        except (EOFError, KeyboardInterrupt, OSError):
+            _out("")
+            return "skip"
+        if not raw:
+            return "skip"
+        low = raw.lower()
+        if low in _BASELINE_BY_NUM:
+            return _BASELINE_BY_NUM[low]
+        if low in _BASELINE_CHOICES:
+            return low
+        _err("    1, 2, 3 중 하나를 고르세요(local/remote/skip 도 됩니다).")
+    return "skip"
+
+
+def _keep_local_next_sync(store: Store, p: Profile, item: _DiffItem, log) -> bool:
+    """이 파일 하나만 '로컬을 올린다'로 표시한다. 전역 스위치를 쓰지 않는다.
+
+    `resolve --keep local`과 같은 기법이다(`_resolve_one` 참조): 기준선은 **원격
+    내용의 해시**로 두고 `(mtime, size)`만 비운다. 그러면 다음 동기화가 해시를 다시
+    계산해 '로컬이 기준선과 다르다'고 보고 **이 파일 하나를** 올린다.
+
+    `--assume-local-newer`를 쓰지 않는 이유: 그것은 보류 **전체**를 여는 전역
+    스위치라 영향 범위가 이 파일 하나로 닫히지 않는다(CLAUDE.md '넘지 말아야 할 선').
+
+    기준선으로 쓸 원격 해시가 없으면(크기만 보고 다르다고 판정한 경로) 그때 한 번
+    받아서 구한다 — 사용자가 고른 파일 하나에 대한 왕복이라 정당하다. 구하지
+    못하면 **아무것도 하지 않는다**: 기준선을 모르는 채로 표시하면 다음 동기화가
+    다시 보류하거나(무동작) 잘못된 기준선으로 판정하게 된다.
+    """
+    baseline = item.remote_md5
+    if not baseline:
+        # 크기만 보고 다르다고 판정한 경로에는 원격 해시가 없다. 사용자가 고른 파일
+        # 하나에 대해서만 그때 받아서 구한다. 대조 단계의 연결은 이 시점에 이미
+        # 닫혀 있으므로(결과 절은 `with _drive_api` 밖이다) 짧게 새로 연다.
+        try:
+            with _drive_api(p, log) as drive:
+                baseline = drive.remote_md5(
+                    p.drive_id, item.rec.file_id, state_dir(p.name) / "verify") or ""
+        except Exception as exc:                      # noqa: BLE001
+            _err(f"    원격 해시를 구하지 못했습니다 — {type(exc).__name__}: {exc}")
+            return False
+    if not baseline:
+        _err("    원격 해시를 구하지 못해 표시하지 않았습니다 — 이 파일은 그대로 둡니다.")
+        return False
+    rec = store.get_by_path(p.drive_id, item.rel) or FileRecord(
+        drive_id=p.drive_id, rel_path=item.rel)
+    # upsert_file은 부분 갱신이 아니라 레코드 전체 덮어쓰기다 — 넘기지 않은 필드는
+    # NULL이 된다(store/db.py). 그래서 기존 값을 읽어 채운 뒤 필요한 것만 바꾼다.
+    rec.file_id = item.rec.file_id or rec.file_id
+    rec.parent_id = item.rec.parent_id or rec.parent_id
+    rec.server_name = item.rec.server_name or rec.server_name
+    rec.is_dir = False
+    rec.remote_md5 = baseline
+    rec.remote_size = item.rec.remote_size
+    rec.remote_version = item.rec.remote_version
+    rec.remote_revision = item.rec.remote_revision
+    rec.local_md5 = baseline          # '마지막으로 원격과 일치했던 내용' = 원격 것
+    rec.local_mtime_ns = None         # 비워야 다음 diff가 해시를 다시 계산한다
+    rec.local_size = None
+    rec.sync_status = "pending_upload"
+    rec.error_msg = "기준선 결정(로컬 우선) — 다음 동기화에서 올립니다"
+    store.upsert_file(rec)
+    return True
+
+
+def _keep_remote_next_sync(p: Profile, item: _DiffItem) -> str:
+    """로컬 파일을 충돌 사본 이름으로 옮겨 원래 자리를 비운다. 실패하면 ''.
+
+    화면이 지금까지 "로컬 파일을 다른 이름으로 옮긴 뒤 dsync pull"이라고 **적어 주던
+    바로 그 일**을 대신 한다. 원래 자리가 비면 다음 동기화가 원격본을 받는다.
+
+    **아무것도 지우지 않는다.** 로컬 내용은 사본으로 남고, 그 사본은 다음 동기화가
+    (프로파일의 `upload_conflict_copy` 기본값대로) 원격에도 올린다 — 즉 되돌릴 수
+    있다. 충돌 사본 이름은 충돌 처리와 같은 생성기를 쓴다(`conflict_copy_name`).
+    """
+    src = local_path(p.root_path, item.rel)
+    dst = local_path(p.root_path, conflict_copy_name(item.rel, _dt.datetime.now()))
+    try:
+        os.replace(ext_path(src), ext_path(dst))
+    except OSError as exc:
+        _err(f"    옮기지 못했습니다 — {type(exc).__name__}: {exc}")
+        return ""
+    return dst
+
+
+def _decide_diffs(store: Store, p: Profile, items: list[_DiffItem], log) -> None:
+    """내용이 다른 파일을 하나씩 보여 주고 **번호로 결정해 그 자리에서 처리한다.**
+
+    예전에는 여기서 `dsync push --assume-local-newer`와 `로컬 파일을 다른 이름으로
+    옮긴 뒤 dsync pull`을 화면에 적어 주고 끝났다. 전자는 보류 **전체**를 덮어쓰는
+    전역 스위치라 `SYNC.ps1`이 화면에서 따로 "쓰지 마세요"라고 반박하고 있었다 —
+    도구가 자기 안내문을 신뢰하지 않는 상태였다.
+
+    두 선택지 모두 **영향 범위가 그 파일 하나로 닫히고 되돌릴 수 있다**: 1은 DB
+    표시만 바꾸고(전송은 다음 동기화가 한다), 2는 로컬을 사본으로 남긴 채 자리만
+    비운다. **아무것도 지우지 않는다.**
+
+    어떤 실패도 reconcile의 결과·종료코드를 바꾸지 않는다 — 결정은 부가 기능이다.
+    """
+    done_local = done_remote = 0
+    for i, it in enumerate(items, 1):
+        try:
+            _out("")
+            _out(f"  [{i}/{len(items)}] {it.rel}")
+            _out(f"        {it.why}")
+            _out("        1) 로컬 것을 살린다 — 다음 동기화가 이 파일을 원격에 올립니다")
+            _out("        2) 원격 것을 살린다 — 로컬은 '(충돌 …)' 이름으로 보존하고 자리를 비웁니다")
+            _out("        3) 나중에 (기본)")
+            pick = _prompt_baseline()
+            if pick == "local":
+                if _keep_local_next_sync(store, p, it, log):
+                    done_local += 1
+                    _out("    → 로컬 우선으로 표시했습니다.")
+            elif pick == "remote":
+                dst = _keep_remote_next_sync(p, it)
+                if dst:
+                    done_remote += 1
+                    _out(f"    → 로컬을 보존했습니다: {dst}")
+            else:
+                _out("    → 그대로 둡니다.")
+        except KeyboardInterrupt:
+            _out("")
+            _out("    중단했습니다 — 나머지는 그대로 둡니다.")
+            return
+        except Exception as exc:                      # noqa: BLE001
+            _err(f"    처리하지 못했습니다 — {type(exc).__name__}: {exc}")
+            continue
+    if done_local or done_remote:
+        _out("")
+        _out(f"  결정됨 — 로컬 우선 {done_local}건 · 원격 우선 {done_remote}건. "
+             f"실제 전송은 다음 동기화가 합니다.")
+
+
 @app.command()
 def reconcile(
     profile: str = typer.Option("default", "--profile", "-p", help="프로파일 이름"),
@@ -1668,7 +1833,7 @@ def reconcile(
                 raise typer.Exit(EXIT_OK)
 
             same: list[str] = []
-            diff: list[tuple[str, str]] = []
+            diff: list[_DiffItem] = []
             failed: list[tuple[str, str]] = []
             verify_dir = state_dir(p.name) / "verify"
 
@@ -1715,8 +1880,10 @@ def reconcile(
                     try:
                         # 크기가 다르면 내용도 다르다 — 받아볼 필요가 없다.
                         if rec.remote_size is not None and entry.size != rec.remote_size:
-                            diff.append((rel, f"크기 다름(로컬 {_human_size(entry.size)} / "
-                                              f"원격 {_human_size(rec.remote_size)})"))
+                            diff.append(_DiffItem(
+                                rel, f"크기 다름(로컬 {_human_size(entry.size)} / "
+                                     f"원격 {_human_size(rec.remote_size)})",
+                                entry, rec, ""))
                             progress.tick()
                             continue
 
@@ -1728,7 +1895,8 @@ def reconcile(
                             if rmd5 and rmd5 == local_md5:
                                 same.append(rel)
                             else:
-                                diff.append((rel, "내용 다름(MD5 불일치)"))
+                                diff.append(_DiffItem(rel, "내용 다름(MD5 불일치)",
+                                                      entry, rec, rmd5 or ""))
                                 progress.tick()
                                 continue
 
@@ -1758,11 +1926,14 @@ def reconcile(
             ])
             if diff:
                 _out("")
-                _err("  아래 파일은 로컬과 원격의 내용이 다릅니다. 어느 쪽을 살릴지 정하세요:")
-                _err("    로컬을 올리려면  dsync push --assume-local-newer")
-                _err("    원격을 받으려면  로컬 파일을 다른 이름으로 옮긴 뒤 dsync pull")
-                for rel, why in diff[:_MAX_PLAN_ROWS]:
-                    _err(f"      - {rel}: {why}")
+                _err(f"  로컬과 원격의 내용이 다른 파일 {len(diff)}건 — 어느 쪽을 살릴지 "
+                     f"파일마다 정합니다.")
+                if dry_run:
+                    for it in diff[:_MAX_PLAN_ROWS]:
+                        _err(f"      - {it.rel}: {it.why}")
+                    _out("    (dry-run — 묻지 않습니다)")
+                else:
+                    _decide_diffs(store, p, diff, log)
             if failed:
                 _out("")
                 _list_reasons("실패", failed)

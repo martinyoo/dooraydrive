@@ -1686,6 +1686,167 @@ def test_resolve_keep_local_leads_to_upload_next_sync(tmp_path: Path):
     store.close()
 
 
+# ---------------------------------------------------------------------------
+# reconcile 의 번호 선택 — "명령을 적어 주고 끝내지 않는다"(AGENTS.md)
+# ---------------------------------------------------------------------------
+# 요점은 UX 가 아니라 **범위**다. 예전 화면은 `dsync push --assume-local-newer` 를
+# 권했는데 그것은 보류 **전체**를 여는 전역 스위치다. 아래 둘은 파일 하나로 닫히고
+# 되돌릴 수 있어야 한다.
+
+
+def test_reconcile_keep_local_uploads_only_that_file_next_sync(tmp_path: Path):
+    """'로컬을 살린다'로 표시한 파일은 다음 sync 에서 올라가야 한다.
+
+    전역 스위치 없이 이 파일 하나만 열리는지가 요점이다. 기준선을 지우면 영구
+    PROTECT, 로컬 해시로 덮으면 영구 무동작이 된다 — 둘 다 틀렸다.
+    """
+    root, store, p = _setup(tmp_path)
+    _write(root, "a.txt", b"MY-EDIT")
+    rec = FileRecord(drive_id="d", rel_path="a.txt", file_id="F1",
+                     remote_version=2, remote_size=6)
+    store.upsert_file(rec)            # local_md5 없음 = '기준선 없음(보호)' 상태
+
+    scanner = LocalScanner(root, [])
+    entry = scanner.scan()[path_key("a.txt")]
+
+    from dooray_sync.cli.main import _DiffItem, _keep_local_next_sync
+    item = _DiffItem("a.txt", "내용 다름(MD5 불일치)", entry, rec, _md5(b"REMOTE"))
+    assert _keep_local_next_sync(store, p, item, None)
+
+    got = store.get_by_path("d", "a.txt")
+    assert got.local_md5 == _md5(b"REMOTE"), "기준선은 '원격 내용'이어야 한다"
+    assert got.local_mtime_ns is None and got.local_size is None, \
+        "(mtime, size)를 비워야 다음 diff 가 해시를 다시 계산한다"
+
+    view = RemoteView(is_complete=True, entries={
+        path_key("a.txt"): R("a.txt", _md5(b"REMOTE"), ver=2, size=6)})
+    decisions, _ = diff(base={path_key("a.txt"): got},
+                        local={path_key("a.txt"): entry},
+                        remote=view, hash_local=scanner.fill_md5)
+    kinds = [d.kind for d in decisions if d.rel_path == "a.txt"]
+    assert KIND_UPLOAD_VERSION in kinds, (
+        f"고른 로컬본이 올라가지 않는다: {[(d.case, d.kind, d.reason) for d in decisions]}")
+    store.close()
+
+
+def test_reconcile_keep_local_does_nothing_without_a_remote_hash(tmp_path: Path):
+    """기준선으로 쓸 원격 해시를 못 구하면 **아무것도 하지 않는다.**
+
+    모르는 채로 표시하면 다음 동기화가 잘못된 기준선으로 판정한다. 조용히 넘어가는
+    것보다 그대로 두고 다시 묻는 편이 낫다.
+    """
+    root, store, p = _setup(tmp_path)
+    _write(root, "a.txt", b"MY-EDIT")
+    rec = FileRecord(drive_id="d", rel_path="a.txt", file_id="F1")
+    store.upsert_file(rec)
+    scanner = LocalScanner(root, [])
+    entry = scanner.scan()[path_key("a.txt")]
+
+    from dooray_sync.cli.main import _DiffItem, _keep_local_next_sync
+
+    class _Boom:
+        def __enter__(self):
+            raise RuntimeError("연결 안 됨")
+
+        def __exit__(self, *a):
+            return False
+
+    import dooray_sync.cli.main as cli
+    orig, cli._drive_api = cli._drive_api, lambda *a, **k: _Boom()
+    try:
+        item = _DiffItem("a.txt", "크기 다름", entry, rec, "")   # 원격 해시 없음
+        assert _keep_local_next_sync(store, p, item, None) is False
+    finally:
+        cli._drive_api = orig
+
+    got = store.get_by_path("d", "a.txt")
+    assert not got.local_md5, "기준선을 함부로 세우면 안 된다"
+    store.close()
+
+
+def test_reconcile_keep_remote_moves_local_aside_without_deleting(tmp_path: Path):
+    """'원격을 살린다'는 로컬을 **지우지 않는다** — 사본으로 남기고 자리만 비운다.
+
+    화면이 "로컬 파일을 다른 이름으로 옮긴 뒤 dsync pull" 이라고 적어 주던 바로 그
+    일이고, 자리가 비면 다음 동기화가 원격본을 받는다.
+    """
+    root, store, p = _setup(tmp_path)
+    _write(root, "a.txt", b"MY-EDIT")
+    scanner = LocalScanner(root, [])
+    entry = scanner.scan()[path_key("a.txt")]
+
+    from dooray_sync.cli.main import _DiffItem, _keep_remote_next_sync
+    item = _DiffItem("a.txt", "크기 다름", entry,
+                     FileRecord(drive_id="d", rel_path="a.txt"), "")
+    dst = _keep_remote_next_sync(p, item)
+
+    assert dst, "옮기지 못했다"
+    assert not (root / "a.txt").exists(), "원래 자리가 비어야 다음 동기화가 원격을 받는다"
+    assert Path(dst).read_bytes() == b"MY-EDIT", "로컬 내용이 사라졌다"
+    assert "충돌" in Path(dst).name, f"충돌 사본 이름이 아니다: {dst}"
+    store.close()
+
+
+def test_prompt_baseline_takes_numbers_and_names():
+    """번호를 넣은 이유가 오타 방지인데, 이름도 계속 받아야 기존 습관이 안 깨진다.
+
+    (이 파일은 pytest 없이도 도는 계약이라 fixture 대신 직접 갈아끼운다 — 맨 위 docstring.)
+    """
+    import builtins
+
+    from dooray_sync.cli import main as cli
+    orig = builtins.input
+    try:
+        for typed, expected in [("1", "local"), ("2", "remote"), ("3", "skip"),
+                                ("local", "local"), ("REMOTE", "remote"), ("", "skip")]:
+            builtins.input = lambda _="", _t=typed: _t
+            got = cli._prompt_baseline()
+            assert got == expected, f"{typed!r} → {got!r} (기대 {expected!r})"
+    finally:
+        builtins.input = orig
+
+
+def test_prompt_baseline_gives_up_immediately_on_eof():
+    """EOF·Ctrl+C·죽은 스트림에서는 되묻지 않고 즉시 안전한 쪽으로 빠진다.
+
+    isatty 로 대화형 여부를 판정하지 않기 때문에(Windows 의 NUL 은 문자 장치라
+    stdin=DEVNULL 에서도 True) 이 탈출구가 유일한 방어선이다.
+    """
+    import builtins
+
+    from dooray_sync.cli import main as cli
+
+    def boom(_=""):
+        raise EOFError
+
+    orig = builtins.input
+    builtins.input = boom
+    try:
+        assert cli._prompt_baseline() == "skip"
+    finally:
+        builtins.input = orig
+
+
+def test_prompt_baseline_reasks_on_typo_but_is_finite():
+    """오타는 그 건을 조용히 건너뛰지 않고 되묻되, 무한히 묻지 않는다."""
+    import builtins
+
+    from dooray_sync.cli import main as cli
+    typed = iter(["x", "y", "z"])
+    orig = builtins.input
+    builtins.input = lambda _="": next(typed)
+    try:
+        assert cli._prompt_baseline(tries=3) == "skip"
+        exhausted = False
+        try:
+            next(typed)
+        except StopIteration:
+            exhausted = True
+        assert exhausted, "되묻지 않고 일찍 포기했다 — 입력이 남아 있다"
+    finally:
+        builtins.input = orig
+
+
 def test_remote_move_without_baseline_protects_local():
     """기준선이 없으면 이동이 끼어도 로컬을 덮지 않는다 — 이동 없을 때와 같은 판단이어야."""
     old, new = path_key("a.txt"), path_key("sub/a.txt")
