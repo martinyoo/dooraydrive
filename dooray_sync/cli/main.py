@@ -1885,11 +1885,22 @@ def reconcile(
                 for key, entry, rec in targets:
                     rel = entry.rel_path
                     try:
-                        # 크기가 다르면 내용도 다르다 — 받아볼 필요가 없다.
-                        if rec.remote_size is not None and entry.size != rec.remote_size:
+                        # 크기가 다르면 내용도 다르다 — **단, 여기서 쓰는 '원격 크기'는
+                        # 살아 있는 원격이 아니라 DB에 저장된 값이고 그것은 낡을 수 있다.**
+                        # 2026-09-15 실측: DB 575B / 실제 원격 566B 였고 내용은 로컬과
+                        # 바이트 단위로 같았는데, 이 지름길이 **받아보지도 않고** "내용
+                        # 다름"이라 선언해 사용자에게 선택을 요구했다. 그 잘못된 전제 위에서
+                        # 다음 계획까지 거꾸로 섰다.
+                        # reconcile 의 목적 자체가 '살아 있는 원격과 대조'이므로 기본값은
+                        # 해시로 확인한다. 이 지름길이 절약해 주는 것은 **크기가 다를 때의
+                        # 다운로드 한 번**인데, 그때가 바로 저장된 값이 틀렸을 가능성이 가장
+                        # 큰 경우다 — 아낄 곳이 아니었다.
+                        # --trust-size 를 준 경우에만 쓴다(덜 엄밀함을 사용자가 고른 것).
+                        if (trust_size and rec.remote_size is not None
+                                and entry.size != rec.remote_size):
                             diff.append(_DiffItem(
                                 rel, f"크기 다름(로컬 {_human_size(entry.size)} / "
-                                     f"원격 {_human_size(rec.remote_size)})",
+                                     f"DB 기록 {_human_size(rec.remote_size)})",
                                 entry, rec, ""))
                             progress.tick()
                             continue
@@ -1916,7 +1927,10 @@ def reconcile(
                                 local_md5=local_md5,
                                 remote_revision=rec.remote_revision,
                                 remote_version=rec.remote_version,
-                                remote_md5=local_md5, remote_size=rec.remote_size,
+                                # 내용이 같다는 것을 방금 해시로 확인했으므로 크기도 같다.
+                                # 낡아 있던 rec.remote_size 를 여기서 바로잡는다 — 그 값을
+                                # 그대로 되쓰면 오탐의 원인이 DB 에 그대로 남는다.
+                                remote_md5=local_md5, remote_size=entry.size,
                                 sync_status="synced", last_synced_at=now_iso(),
                             ))
                     except Exception as exc:

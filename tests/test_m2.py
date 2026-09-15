@@ -1787,6 +1787,32 @@ def test_reconcile_keep_remote_moves_local_aside_without_deleting(tmp_path: Path
     store.close()
 
 
+def test_reconcile_does_not_trust_a_stored_remote_size_by_default():
+    """DB 에 저장된 원격 크기만 보고 '내용 다름'이라 선언하면 안 된다.
+
+    2026-09-15 실측: DB 는 575B 라고 갖고 있었고 실제 원격은 566B 였다. 내용은 로컬과
+    **바이트 단위로 동일**했는데, 지름길이 받아보지도 않고 "내용 다름"이라 선언해
+    사용자에게 선택을 요구했다. 그리고 그 잘못된 전제 위에서 다음 계획이 거꾸로 섰다
+    (고른 것과 반대로 **로컬을 원격본으로 덮는** 계획).
+
+    이 지름길이 절약하는 것은 '크기가 다를 때의 다운로드 한 번'인데, 그때가 바로
+    저장된 값이 틀렸을 가능성이 가장 큰 경우다. `--trust-size` 를 준 경우에만 허용한다.
+    """
+    src = (Path(__file__).resolve().parent.parent
+           / "dooray_sync" / "cli" / "main.py").read_text(encoding="utf-8")
+
+    i = src.find("entry.size != rec.remote_size")
+    assert i > 0, "크기 비교 지름길을 찾지 못했다 — 위치가 바뀌었으면 이 테스트를 갱신하라"
+    assert "trust_size" in src[max(0, i - 300):i], (
+        "저장된 원격 크기로 '내용 다름'을 선언하는 경로가 --trust-size 로 막혀 있지 않다")
+
+    j = src.find("remote_md5=local_md5")
+    assert j > 0, "기준선 기록 지점을 찾지 못했다"
+    assert "remote_size=entry.size" in src[j:j + 300], (
+        "내용이 같다고 확인한 뒤에도 낡은 rec.remote_size 를 되쓰고 있다 — "
+        "오탐의 원인이 DB 에 그대로 남는다")
+
+
 def test_prompt_baseline_takes_numbers_and_names():
     """번호를 넣은 이유가 오타 방지인데, 이름도 계속 받아야 기존 습관이 안 깨진다.
 
