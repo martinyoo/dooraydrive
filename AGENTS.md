@@ -12,7 +12,7 @@
 
 | 항목 | 값 |
 |---|---|
-| 로컬 경로 | `D:\drive\dooraydrive\obsidian\agent_base` (Obsidian vault) |
+| 로컬 경로 | **PC마다 다릅니다** — 아래 §개발 PC 구성 표를 보십시오 |
 | 원격 | `https://github.com/martinyoo/AgentOps` — **private** |
 | 이 프로젝트 관련 문서 | `AI-Sessions/wiki/` 아래, `project: AgentOps` 또는 `shared` |
 | 명령 키워드 | `save`(저장) · `ingest`(raw 가공) · `query`(조회) · `lint`(점검) |
@@ -142,11 +142,29 @@ vault에 저장할 때는 소스코드를 복사하지 않습니다. **결정·�
 
 ## 개발 PC 구성 (혼동 주의)
 
-| 무엇 | 경로 |
-|---|---|
-| 저장소(개발) | `D:\drive\dev\dooraydrive` |
-| 실행되는 설치본 | `C:\dooraydrive` — git이 아닌 **zip 사본** |
-| 어느 쪽이 도는가 | `DSYNC_HOME` 사용자 환경변수 = `C:\dooraydrive` |
+**아래 경로는 예시이지 상수가 아닙니다. PC마다 다릅니다.**
+
+2026-09-16에 이 표와 vault 경로를 랩탑에서 그대로 믿었다가 **둘 다 존재하지 않는
+폴더**였습니다 — 랩탑에는 `D:` 드라이브 자체가 없습니다. 하드코딩된 경로에는 언제나
+소비자가 있고(vault `hardcoded-path-and-its-consumers`), 여기서 그 소비자는 **이 파일을
+읽는 다음 에이전트**입니다. 새 PC에서 시작하면 **먼저 확인하고, 확인한 값을 여기 한 줄로
+추가**하십시오.
+
+| 무엇 | 데스크톱 (HSY) | 랩탑 |
+|---|---|---|
+| 저장소(개발) | `D:\drive\dev\dooraydrive` | `C:\drive\dev\dooraydrive` |
+| AgentOps vault | `D:\drive\dooraydrive\obsidian\agent_base` | `C:\drive\obsidian\agent_base` |
+| 실행되는 설치본 | `C:\dooraydrive` — git이 아닌 **zip 사본** | 같은 규칙 |
+| 어느 쪽이 도는가 | `DSYNC_HOME` 사용자 환경변수 | 〃 |
+
+확인하는 법 (PowerShell):
+
+```powershell
+Get-PSDrive -PSProvider FileSystem | Select-Object Name          # 어떤 드라이브가 있나
+Get-ChildItem C:\, D:\ -Directory -Filter 'AI-Sessions' -Recurse -Depth 4 `
+  -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName   # vault
+[Environment]::GetEnvironmentVariable('DSYNC_HOME', 'User')      # 실행본
+```
 
 `synchere.bat`은 `DSYNC_HOME`을 **가장 먼저** 봅니다([synchere.bat:55](synchere.bat:55)).
 **저장소를 고치고 커밋해도 실행본은 바뀌지 않습니다** — 프로그램 폴더를 갱신해야 반영됩니다.
