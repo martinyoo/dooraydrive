@@ -379,16 +379,40 @@ set "UPDBAT=%UPDDIR%\dsync-update-%RANDOM%.bat"
 copy /Y "%~f0" "%UPDBAT%" >nul 2>&1
 if not exist "%UPDBAT%" goto :update_copy_failed
 cd /d "%UPDDIR%"
-REM  Pass the folder explicitly. Left to its default the copy would target the
-REM  drive IT sits on (%TEMP%, usually C:) - wrong for anyone installed
-REM  elsewhere, and it would fork a second install instead of updating this one.
-set "UPDARGS="%RUNDIR%""
-if defined VERSION set "UPDARGS=%UPDARGS% %VERSION%"
+REM  Hand the folder over in the ENVIRONMENT, not on the command line. The copy
+REM  must not be left to its default (the drive IT sits on - %TEMP%, usually C:):
+REM  for anyone installed elsewhere that forks a second install instead of
+REM  updating this one. But `start` is the wrong place to pass it. Its first
+REM  quoted token is the window TITLE, and once further quoted tokens follow a
+REM  quoted command it stops parsing them as a command at all and opens an EMPTY
+REM  INTERACTIVE WINDOW instead - measured 2026-09-16 on a real PC, which is how
+REM  this comment came to exist: an invalid-name error and a bare cmd prompt
+REM  sitting in %TEMP%, with the program never updated and nothing to say so.
+REM  DSYNC_TARGET / DSYNC_VERSION are read at :parsed near the top of this very
+REM  file, so the copy already knows how to receive them, and the child inherits
+REM  them because it is started before endlocal. What is left on the start line
+REM  is the one form that is never ambiguous: a title, one quoted path, nothing.
+REM  (%PSARGS% is dropped here on purpose: the only switch that reaches this
+REM  branch is one INSTALL.ps1 asked about, and -Check skips the prompt outright,
+REM  so there is nothing to forward - and re-introducing a quoted tail is exactly
+REM  what broke this line.)
+set "DSYNC_TARGET=%RUNDIR%"
+if defined VERSION set "DSYNC_VERSION=%VERSION%"
 echo.
 echo   Updating %RUNDIR% in a new window. This one closes now.
 echo.
-start "Dooray Drive update" "%UPDBAT%" %UPDARGS%%PSARGS%
+start "Dooray Drive update" "%UPDBAT%"
+REM  A failed launch must not vanish: this window is about to close, and the
+REM  alternative is a double-click that appears to have done nothing at all.
+if errorlevel 1 goto :update_start_failed
 endlocal & exit /b 0
+
+:update_start_failed
+echo.
+echo   [STOP] Could not open the update window. Nothing was changed.
+echo          Run this file instead - it does the same update:
+echo          %UPDBAT%
+goto :bail
 
 :update_copy_failed
 echo.
