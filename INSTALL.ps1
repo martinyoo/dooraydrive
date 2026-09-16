@@ -9,8 +9,15 @@
 # 사용 예
 #   .\INSTALL.ps1           전체 설치 (물어보며 진행)
 #   .\INSTALL.ps1 -Check    이 PC가 준비됐는지 점검만 (아무것도 안 바꿈)
+#   .\INSTALL.ps1 -OfferUpdate
+#                           설치된 폴더 안에서 실행됐을 때, 설치를 시작하기 전에
+#                           갱신할지 먼저 묻는다. 설치.bat만 이 스위치를 붙인다.
 param(
-  [switch]$Check
+  [switch]$Check,
+  # 설치.bat이 '프로그램 폴더 안의 사본'이라고 판단했을 때만 붙인다.
+  [switch]$OfferUpdate,
+  # 롤백 지정(`설치.bat v0.2.0`)이 있었으면 그 이름. 질문에 그대로 보여 준다.
+  [string]$UpdateVersion
 )
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
@@ -35,6 +42,61 @@ Write-Host ""
 Write-Host "  Dooray Drive 동기화 설치" -ForegroundColor White
 if ($Check) { Write-Host "  (점검 모드 — 아무것도 바꾸지 않습니다)" -ForegroundColor Yellow }
 Write-Host "  설치 폴더: $PSScriptRoot" -ForegroundColor DarkGray
+
+# --------------------------------------------------------- 0) 갱신할지 먼저 묻는다
+# 프로그램 폴더 **안**의 사본을 더블클릭한 경우다(설치.bat이 -OfferUpdate로 알려 준다).
+# 예전에는 그 화면이 "갱신하려면 이 파일을 폴더 밖으로 복사해 실행하세요"라고 시키고
+# 끝났다. 시키기만 하는 기능은 없는 기능이다(AGENTS.md) — 여기서 번호로 고르게 하고,
+# 고른 것은 설치.bat이 그대로 실행한다.
+#
+# 계약은 종료코드 하나다: **10 = 갱신을 골랐다.** 설치.bat의 :self_update 한 곳만
+# 읽는다. 교체를 이 파일이 직접 하지 않는 이유는 단순하다 — 자기가 들어 있는 폴더를
+# 자기가 갈아 끼울 수는 없다. 설치.bat이 자신을 %TEMP%로 빼내 거기서 실행한다.
+#
+# 기본값(엔터·EOF·오입력 3회)은 2다. **2는 "아무것도 안 함"이 아니다** — 이 파일이 지금까지
+# 하던 일 그대로다: 빠진 구성요소를 pip으로 채우고, 파이썬이 없으면 받아 설치하고, 토큰이
+# 없으면 묻고, DSYNC_HOME을 이 폴더로 등록한다. 그래서 화면에 "점검"이라고 쓰지 않는다 —
+# 그 이름은 `-Check`(아무것도 안 바꿈)가 이미 쓰고 있고, 2에 붙이면 거짓말이 된다.
+# 안전의 기준은 여기서 **되돌릴 수 없는 것**이다: 폴더 통째 교체는 1에만 있고 기본값은
+# 그리로 가지 않는다. 대화형이 아니면(파이프·EOF·죽은 스트림) 묻지 않고 기본값으로 간다 —
+# isatty로 판정하지 않는 것과 같은 이유로, 방어선은 기본값과 유한 루프다.
+if ($OfferUpdate -and -not $Check) {
+  $verLabel = if ($UpdateVersion) { "$UpdateVersion 버전을" } else { '최신 버전을' }
+  Write-Host ""
+  Write-Host "  이 폴더는 이미 설치된 프로그램입니다. 무엇을 할까요?" -ForegroundColor White
+  Write-Host ""
+  Write-Host "    1  갱신 — $verLabel 받아 이 폴더를 통째로 바꿉니다" -ForegroundColor White
+  Write-Host "    2  이 PC 다시 맞추기 — 프로그램 코드는 그대로 두고, 빠진 구성요소·토큰을" -ForegroundColor White
+  Write-Host "       채운 뒤 연결을 확인합니다 (기본값 · 지금까지 이 파일이 하던 일)" -ForegroundColor White
+  Write-Host ""
+  Write-Host "  갱신하려면 동기화 창을 먼저 모두 닫아 주세요(자동 동기화 창 포함)." -ForegroundColor Yellow
+  Write-Host "  동기화가 도는 중에는 폴더를 바꾸지 못하고, 열어 둔 창은 갱신 뒤에" -ForegroundColor DarkGray
+  Write-Host "  옛 코드와 새 코드를 섞어 쓰게 됩니다." -ForegroundColor DarkGray
+  Write-Host "  설정·토큰·동기화 폴더는 이 폴더 밖에 있어 갱신해도 그대로입니다." -ForegroundColor DarkGray
+  Write-Host "  2는 프로그램을 바꾸지 않지만 아무것도 안 하는 것도 아닙니다 — 빠진 것은" -ForegroundColor DarkGray
+  Write-Host "  내려받아 채우고, 이 폴더를 실행 대상(DSYNC_HOME)으로 등록합니다." -ForegroundColor DarkGray
+  Write-Host ""
+
+  $pick = ''
+  for ($i = 0; $i -lt 3 -and -not $pick; $i++) {
+    $ans = $null
+    try { $ans = Read-Host "  번호 (그냥 엔터 = 2)" } catch { $ans = $null }
+    if ($null -eq $ans) { break }                             # EOF·죽은 스트림 — 즉시 포기
+    $ans = $ans.Trim()
+    if (-not $ans) { break }                                  # 엔터 = 기본값
+    if     ($ans -match '^(1|갱신|update|u)$') { $pick = 'update' }
+    elseif ($ans -match '^(2|점검|맞추기|check|setup|c|s)$') { $pick = 'check' }
+    else   { Warn "1 또는 2를 입력해 주세요." }
+  }
+
+  if ($pick -eq 'update') {
+    Write-Host ""
+    Write-Host "  갱신을 시작합니다. 새 창이 열리고 이 창은 닫힙니다." -ForegroundColor Green
+    exit 10
+  }
+  Write-Host ""
+  Info "이 PC 설정만 다시 맞춥니다. 갱신하려면 다시 실행해 1을 고르세요."
+}
 
 # --------------------------------------------------------------------- 1) Python
 Head "1/5  Python 확인"

@@ -942,7 +942,7 @@ def _print_version_notice(extra: list[str]) -> None:
             return
         print()
         print(f"새 버전이 있습니다: {mine} → {remote}")
-        print("  갱신: 프로그램 폴더 **밖**에 둔 설치.bat 사본을 실행하세요.")
+        print("  갱신: 프로그램 폴더의 설치.bat 을 더블클릭하고 1(갱신)을 고르세요.")
     except (Exception, KeyboardInterrupt):  # noqa: BLE001 — 힌트는 결과에 영향 금지
         return
 

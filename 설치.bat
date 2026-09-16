@@ -6,6 +6,12 @@ REM  Two modes, auto-detected:
 REM   (A) Bootstrap : this .bat was downloaded on its own.
 REM                   Fetch the repo into the install folder, run setup there.
 REM   (B) In-repo   : this .bat sits next to INSTALL.ps1. Run setup here.
+REM                   In an INSTALLED copy (no .git) setup asks first whether
+REM                   to update; choosing it stages this file into %TEMP% and
+REM                   hands over, and that copy runs mode (A) against this
+REM                   folder. A folder cannot replace itself from the inside -
+REM                   the staged copy is what makes the choice real instead of
+REM                   an instruction printed on a screen.
 REM
 REM  Install folder, highest priority first:
 REM    1. first argument      installer.bat D:\dooraydrive
@@ -45,6 +51,10 @@ REM command line, so it is not known yet at this point.
 set "ZIPBASE=https://github.com/martinyoo/dooraydrive/archive"
 set "ZIPFILE=%TEMP%\dooraydrive-src.zip"
 set "EXDIR=%TEMP%\dooraydrive-extract"
+REM Set only by the installed-copy branch of mode (B). OFFERUPD is what makes
+REM exit code 10 mean anything; PSEXTRA is what asks INSTALL.ps1 for the prompt.
+set "OFFERUPD="
+set "PSEXTRA="
 
 REM Split argv: the first non-switch argument is the install folder, the rest
 REM go to INSTALL.ps1. Parsed with goto, not with (), because %VAR% inside a
@@ -213,8 +223,13 @@ REM  PC with no installer at all if the move then failed (permission, file in
 REM  use). Rename it aside, move the new one in, and only then drop the old one.
 REM  This runs after the download and extract have already succeeded, so a
 REM  network failure never touches the copy that is already working.
-if defined REFRESH rmdir /S /Q "%TARGET%.old" >nul 2>&1
-if defined REFRESH move "%TARGET%" "%TARGET%.old" >nul 2>&1
+REM  The name is normally <folder>.old, but that name can be occupied by a
+REM  copy an earlier update could not delete (a file in it still open). A
+REM  leftover must not block every future update, so :swap_aside falls back to
+REM  a unique name, and retries: a handle on the folder is usually momentary
+REM  (Explorer, a virus scanner, a console that just exited).
+set "OLDDIR=%TARGET%.old"
+if defined REFRESH call :swap_aside
 if defined REFRESH if exist "%TARGET%" goto :refresh_locked
 
 if exist "%TARGET%" rmdir "%TARGET%" 2>nul
@@ -222,7 +237,9 @@ if exist "%TARGET%" goto :target_busy
 
 move "%SRCDIR%" "%TARGET%" >nul
 if errorlevel 1 goto :move_failed
-if defined REFRESH rmdir /S /Q "%TARGET%.old" >nul 2>&1
+if defined REFRESH rmdir /S /Q "%OLDDIR%" >nul 2>&1
+REM  Say it rather than leave a mystery folder next to the program.
+if defined REFRESH if exist "%OLDDIR%" echo   Note: the previous copy is still at %OLDDIR% (safe to delete).
 rmdir /S /Q "%EXDIR%" >nul 2>&1
 del "%ZIPFILE%" >nul 2>&1
 REM  Install stamp. A PC whose program will not start at all (a bad import, a
@@ -290,15 +307,17 @@ REM  while installs made before the stamp existed have no INSTALLED.txt and
 REM  must still be recognised as installs.
 if exist "%RUNDIR%\.git" goto :in_repo_source
 
-echo   [!] THIS DOES NOT UPDATE THE PROGRAM.
-echo       This folder is an installed copy, not a source checkout.
-echo       Running here only re-checks python, dependencies, token and
-echo       connection - nothing is downloaded, no code changes.
-echo.
-echo       To UPDATE: copy this file into any folder that does NOT
-echo       contain INSTALL.ps1 (your Desktop, or %%TEMP%%) and run that
-echo       copy. It fetches the latest version and replaces this folder.
-echo       To roll back, give that copy a version: ^<this file^> v0.2.0
+REM  An installed copy. This branch used to end at "to update, copy this file
+REM  somewhere else and run it there" - a command printed on a screen, which
+REM  by this repo's rule is no feature at all (AGENTS.md: a feature you have to
+REM  instruct the user to run is a feature you do not have). Setup now asks, in
+REM  Korean, and UPDATE comes back as exit code 10 -> :self_update below.
+set "OFFERUPD=1"
+set "PSEXTRA= -OfferUpdate"
+if defined VERSION set "PSEXTRA=%PSEXTRA% -UpdateVersion "%VERSION%""
+echo   This folder is an installed copy.
+echo   Setup will ask whether to UPDATE it or only re-check this PC.
+if defined VERSION echo   Version requested: %VERSION%
 echo.
 goto :in_repo_go
 
@@ -322,11 +341,61 @@ REM  refuses to run them.
 REM ===========================================================================
 :run
 cd /d "%RUNDIR%"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%RUNDIR%\INSTALL.ps1"%PSARGS%
+powershell -NoProfile -ExecutionPolicy Bypass -File "%RUNDIR%\INSTALL.ps1"%PSEXTRA%%PSARGS%
 set "RC=%ERRORLEVEL%"
+REM  10 means "the user picked UPDATE at the prompt -OfferUpdate produced".
+REM  That is the whole contract with INSTALL.ps1, and it is read here only.
+REM  The OFFERUPD guard is load-bearing: without it any other path that ever
+REM  exits 10 would start replacing folders.
+if defined OFFERUPD if "%RC%"=="10" goto :self_update
 echo.
 pause
 endlocal & exit /b %RC%
+
+REM ===========================================================================
+REM  Self-update handoff - reached only from the line above.
+REM ===========================================================================
+:self_update
+REM  The folder this file sits in is about to be replaced whole, so the updater
+REM  cannot be this file where it stands. Two things block that:
+REM    - cmd.exe keeps the running .bat open for the whole run, and
+REM    - :run just did `cd /d "%RUNDIR%"`, and a folder that is any process's
+REM      current directory cannot be renamed at all.
+REM  So: copy this file out, step out of the folder, hand over, and leave. The
+REM  copy downloads and extracts first (seconds), by which time this process is
+REM  long gone and the swap sees no handle of ours.
+REM  The copy lands in a folder of its own, guaranteed to hold no INSTALL.ps1 -
+REM  that absence is exactly what puts it in mode (A).
+REM  Its name is ASCII on purpose: this file's own name is not, and a non-ASCII
+REM  name must never be written into a .bat (see the ENCODING note at the top).
+REM  A NEW NAME EVERY TIME, and nothing here is ever deleted. Double-clicking
+REM  this file again while an update window is still working is a thing people
+REM  do when a download is slow, and a fixed name would make that second run
+REM  delete or overwrite the very file the first window is executing. The cost
+REM  is one ~20KB file left in %TEMP% per update, which is what %TEMP% is for.
+set "UPDDIR=%TEMP%\dooraydrive-update"
+mkdir "%UPDDIR%" >nul 2>&1
+set "UPDBAT=%UPDDIR%\dsync-update-%RANDOM%.bat"
+copy /Y "%~f0" "%UPDBAT%" >nul 2>&1
+if not exist "%UPDBAT%" goto :update_copy_failed
+cd /d "%UPDDIR%"
+REM  Pass the folder explicitly. Left to its default the copy would target the
+REM  drive IT sits on (%TEMP%, usually C:) - wrong for anyone installed
+REM  elsewhere, and it would fork a second install instead of updating this one.
+set "UPDARGS="%RUNDIR%""
+if defined VERSION set "UPDARGS=%UPDARGS% %VERSION%"
+echo.
+echo   Updating %RUNDIR% in a new window. This one closes now.
+echo.
+start "Dooray Drive update" "%UPDBAT%" %UPDARGS%%PSARGS%
+endlocal & exit /b 0
+
+:update_copy_failed
+echo.
+echo   [STOP] Could not put the updater in %TEMP%. Nothing was changed.
+echo          Copy this file to your Desktop and run that copy instead -
+echo          it does the same update from outside the folder.
+goto :bail
 
 REM ===========================================================================
 REM  Errors (English - INSTALL.ps1 has not been reached yet)
@@ -366,7 +435,7 @@ goto :bail
 :move_failed
 REM  Put the old copy back. The refresh renamed it aside a moment ago, so
 REM  without this the PC is left with no installer at all.
-if defined REFRESH if not exist "%TARGET%" move "%TARGET%.old" "%TARGET%" >nul 2>&1
+if defined REFRESH if not exist "%TARGET%" move "%OLDDIR%" "%TARGET%" >nul 2>&1
 if defined REFRESH if exist "%TARGET%\INSTALL.ps1" goto :stale_fallback
 echo.
 echo   [STOP] Could not create %TARGET%.
@@ -404,12 +473,31 @@ goto :bail
 :refresh_locked
 echo.
 echo   [STOP] Could not replace the existing copy at %TARGET%.
-echo          A file in that folder is probably open - close any window or
-echo          program using it (Explorer, an editor, a running sync) and
-echo          run this file again. Nothing was changed.
+echo          Something in that folder is held open. The usual cause is a
+echo          sync window still running (synchere, or the automatic loop) -
+echo          close it, then run this again. An editor or Explorer window
+echo          sitting in the folder does it too. Nothing was changed.
 goto :bail
 
 :bail
 echo.
 pause
 endlocal & exit /b 1
+
+REM ===========================================================================
+REM  Rename %TARGET% aside. Returns with %TARGET% gone on success and OLDDIR
+REM  holding the name it went to; the caller tests %TARGET% itself. Called only
+REM  when REFRESH is set, and never inside setlocal - OLDDIR must survive.
+REM ===========================================================================
+:swap_aside
+set "SWAPTRY=0"
+:swap_try
+rmdir /S /Q "%OLDDIR%" >nul 2>&1
+if exist "%OLDDIR%" set "OLDDIR=%TARGET%.old%RANDOM%"
+move "%TARGET%" "%OLDDIR%" >nul 2>&1
+if not exist "%TARGET%" goto :eof
+set /a SWAPTRY+=1
+if %SWAPTRY% GEQ 3 goto :eof
+REM  ping, not timeout: timeout fails outright when stdin is redirected.
+ping -n 2 127.0.0.1 >nul 2>&1
+goto :swap_try
