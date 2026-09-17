@@ -27,7 +27,9 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from dooray_sync import config as cfg   # noqa: E402
-from dooray_sync.cli.main import _normalize_keep, _prompt_keep   # noqa: E402
+from dooray_sync.cli.main import (                              # noqa: E402
+    _ask_apply_rest, _normalize_keep, _prompt_keep,
+)
 
 _SH = None
 
@@ -94,6 +96,210 @@ def test_prompt_keep_returns_empty_on_dead_stdin(monkeypatch, exc):
 
     monkeypatch.setattr("builtins.input", _boom)
     assert _prompt_keep() == ""
+
+
+# --------------------------------------------------------------------------
+# 1-b) 중도 이탈과 일괄 적용 (2026-09-18 사용자 요구)
+#
+# 실사용에서 3,869건을 한 건씩 누르다 중단했다. 화면이 "CLI 인자를 치세요"로
+# 끝나면 그 기능은 없는 것이다(AGENTS.md) — 그래서 '0) 그만'과 '남은 전부 같게'를
+# 넣었다. 둘 다 안전한 쪽이 기본값이어야 한다.
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("raw", ["0", "q", "Q", "quit", "그만", " 0 "])
+def test_prompt_keep_quits_when_allowed(monkeypatch, raw):
+    monkeypatch.setattr("builtins.input", lambda _p: raw)
+    assert _prompt_keep(allow_quit=True) == "quit"
+
+
+@pytest.mark.parametrize("raw", ["0", "q", "quit", "그만"])
+def test_quit_words_are_not_accepted_without_allow_quit(monkeypatch, raw):
+    """`--keep` 검증과 표를 공유하므로, 허락하지 않은 자리에서는 그냥 오입력이다."""
+    answers = iter([raw, raw, raw])
+    monkeypatch.setattr("builtins.input", lambda _p: next(answers))
+    assert _prompt_keep(tries=3) == ""
+
+
+def test_keep_flag_never_accepts_quit():
+    """`--keep 0` 이 통과하면 _resolve_one 에 알 수 없는 pick 이 들어간다."""
+    for raw in ("0", "q", "quit", "그만"):
+        assert _normalize_keep(raw) == ""
+
+
+def test_quit_beats_default_so_enter_still_means_both(monkeypatch):
+    """빈 입력은 여전히 기본값 both — '그만'이 기본이 되면 안 된다."""
+    monkeypatch.setattr("builtins.input", lambda _p: "")
+    assert _prompt_keep(allow_quit=True) == "both"
+
+
+@pytest.mark.parametrize("ans,want", [
+    ("y", True), ("yes", True), ("Y", True), ("예", True),
+    ("", False), ("n", False), ("no", False), ("아니오", False), ("2", False),
+])
+def test_apply_rest_defaults_to_no(monkeypatch, ans, want):
+    monkeypatch.setattr("builtins.input", lambda _p: ans)
+    assert _ask_apply_rest("local", 3868) is want
+
+
+@pytest.mark.parametrize("exc", [EOFError, KeyboardInterrupt, OSError, ValueError])
+def test_apply_rest_is_no_on_dead_stdin(monkeypatch, exc):
+    """타입어헤드·EOF·Ctrl+C 가 3,869건을 움직이면 안 된다."""
+    def _boom(_p):
+        raise exc
+
+    monkeypatch.setattr("builtins.input", _boom)
+    assert _ask_apply_rest("local", 3868) is False
+
+
+def test_apply_rest_not_asked_when_nothing_remains(monkeypatch):
+    def _never(_p):
+        raise AssertionError("남은 건이 없는데 물었다")
+
+    monkeypatch.setattr("builtins.input", _never)
+    assert _ask_apply_rest("local", 0) is False
+
+
+def test_apply_rest_shows_the_count_and_the_choice(monkeypatch, capsys):
+    """무엇을 몇 건에 적용하는지 보이지 않으면 동의가 아니다."""
+    monkeypatch.setattr("builtins.input", lambda _p: "n")
+    _ask_apply_rest("local", 3868)
+    out = capsys.readouterr().out
+    assert "3868" in out
+    assert "local" in out
+
+
+def test_apply_rest_survives_none_stdin(monkeypatch):
+    monkeypatch.setattr(sys, "stdin", None)
+    assert _ask_apply_rest("local", 10) is False
+
+
+# --------------------------------------------------------------------------
+# 1-c) 루프 배선 — 헬퍼가 맞아도 이어 붙이는 곳에서 틀릴 수 있다
+# --------------------------------------------------------------------------
+class _FakeStore:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def iter_unresolved(self):
+        return list(self._rows)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _drive_resolve(monkeypatch, answers, n_rows=5):
+    """resolve 를 대화형으로 돌리고 (처리된 id 목록, 선택 목록, 화면)을 돌려준다."""
+    import contextlib
+
+    from dooray_sync.cli import main as m
+
+    rows = [{"id": i, "rel_path": f"f{i}.txt", "kind": "both_modified",
+             "local_copy_path": f"C:\\x\\f{i} (충돌).txt", "ts": "2026-09-18"}
+            for i in range(1, n_rows + 1)]
+    handled = []
+
+    monkeypatch.setattr(m, "setup_logging", lambda *a, **k: None)
+    monkeypatch.setattr(m, "_error_boundary", lambda _log: contextlib.nullcontext())
+    monkeypatch.setattr(m, "_instance_lock", lambda _n: contextlib.nullcontext())
+    monkeypatch.setattr(m, "_load_profile",
+                        lambda n: cfg.Profile(name=n, drive_id="", local_root="C:\\x"))
+    monkeypatch.setattr(m, "db_path", lambda _n: ":memory:")
+    monkeypatch.setattr(m, "Store", lambda _p: _FakeStore(rows))
+    monkeypatch.setattr(m, "_table", lambda *a, **k: None)
+    monkeypatch.setattr(
+        m, "_resolve_one",
+        lambda store, p, row, pick, dry, log, drive=None: (
+            handled.append((int(row["id"]), pick)) or True))
+
+    # resolve 는 대화형이 아니면 --keep 을 요구하며 죽는다. 여기서는 사람이 보고
+    # 있다고 가정한다 — isatty 판정 자체의 회귀는 별도 테스트가 본다.
+    class _TTY:
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(m.sys, "stdin", _TTY())
+    it = iter(answers)
+    monkeypatch.setattr("builtins.input", lambda _p: next(it))
+    m.resolve(profile="t", list_only=False, conflict_id=0, keep="",
+              dry_run=False, verbose=False)
+    return handled
+
+
+def test_zero_stops_the_loop_and_leaves_the_rest(monkeypatch, capsys):
+    """'0'을 고르면 거기서 멈춘다 — 예전에는 빠져나갈 길이 없었다."""
+    handled = _drive_resolve(monkeypatch, ["2", "n", "0"], n_rows=5)
+    out = capsys.readouterr().out
+
+    assert handled == [(1, "local")], handled
+    assert "중단했습니다" in out
+    assert "4건" in out, "남은 건수를 알려 주지 않으면 이어서 할지 판단할 수 없다"
+
+
+def test_apply_rest_processes_everything_without_more_prompts(monkeypatch):
+    """1건 처리 → '전부 같게' 동의 → 남은 4건은 묻지 않고 같은 선택으로."""
+    # 답이 둘뿐인데 5건이다 — 세 번째 input 이 호출되면 StopIteration 으로 죽는다.
+    handled = _drive_resolve(monkeypatch, ["2", "y"], n_rows=5)
+
+    assert handled == [(i, "local") for i in range(1, 6)], handled
+
+
+def test_apply_rest_declined_keeps_asking_each_time(monkeypatch):
+    """거절하면 예전대로 한 건씩 묻는다 — 한 번 거절이 '전부 건너뛰기'가 아니다."""
+    handled = _drive_resolve(monkeypatch, ["2", "n", "1", "3"], n_rows=3)
+
+    assert handled == [(1, "local"), (2, "both"), (3, "remote")], handled
+
+
+def test_apply_rest_is_asked_once_only(monkeypatch, capsys):
+    """매 건마다 되물으면 그것도 3,869번이다."""
+    _drive_resolve(monkeypatch, ["2", "n", "2", "2"], n_rows=3)
+    out = capsys.readouterr().out
+
+    # '남은'은 메뉴의 '0) 그만' 줄에도 있다 — _ask_apply_rest 에만 있는 문장을 센다.
+    assert out.count("되돌릴 수 있습니다") == 1, out
+
+
+def test_progress_is_shown_so_the_end_is_visible(monkeypatch, capsys):
+    """끝이 보이지 않는 프롬프트가 사용자를 중단시켰다."""
+    _drive_resolve(monkeypatch, ["2", "y"], n_rows=5)
+    out = capsys.readouterr().out
+
+    assert "(1/5)" in out, out
+
+
+def test_keep_flag_skips_every_prompt(monkeypatch):
+    """--keep 이 있으면 묻지 않는다 — 있던 계약이 그대로여야 한다."""
+    import contextlib
+
+    from dooray_sync.cli import main as m
+
+    rows = [{"id": i, "rel_path": f"f{i}.txt", "kind": "both_modified",
+             "local_copy_path": f"C:\\x\\f{i} (충돌).txt", "ts": "2026-09-18"}
+            for i in range(1, 4)]
+    handled = []
+
+    def _never(_p):
+        raise AssertionError("--keep 을 줬는데 물었다")
+
+    monkeypatch.setattr(m, "setup_logging", lambda *a, **k: None)
+    monkeypatch.setattr(m, "_error_boundary", lambda _log: contextlib.nullcontext())
+    monkeypatch.setattr(m, "_instance_lock", lambda _n: contextlib.nullcontext())
+    monkeypatch.setattr(m, "_load_profile",
+                        lambda n: cfg.Profile(name=n, drive_id="", local_root="C:\\x"))
+    monkeypatch.setattr(m, "db_path", lambda _n: ":memory:")
+    monkeypatch.setattr(m, "Store", lambda _p: _FakeStore(rows))
+    monkeypatch.setattr(m, "_table", lambda *a, **k: None)
+    monkeypatch.setattr(
+        m, "_resolve_one",
+        lambda store, p, row, pick, dry, log, drive=None: (
+            handled.append((int(row["id"]), pick)) or True))
+    monkeypatch.setattr("builtins.input", _never)
+
+    m.resolve(profile="t", list_only=False, conflict_id=0, keep="local",
+              dry_run=False, verbose=False)
+    assert handled == [(1, "local"), (2, "local"), (3, "local")]
 
 
 # --------------------------------------------------------------------------

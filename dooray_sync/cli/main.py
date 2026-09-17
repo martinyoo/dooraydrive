@@ -130,8 +130,16 @@ def _normalize_keep(raw: str) -> str:
     return s if s in _KEEP_CHOICES else ""
 
 
-def _prompt_keep(tries: int = 3) -> str:
+# '그만'은 _KEEP_BY_NUM 에 넣지 않는다 — 그 표는 `--keep` 검증과 공유하므로
+# `--keep 0` 이 조용히 통과해 _resolve_one 에 알 수 없는 pick 이 들어간다.
+_QUIT_WORDS = ("0", "q", "quit", "그만")
+
+
+def _prompt_keep(tries: int = 3, *, allow_quit: bool = False) -> str:
     """번호(또는 이름)로 충돌 선택지 하나를 받는다. 못 받으면 ''.
+
+    allow_quit 이면 0/q/그만 에 'quit' 을 돌려준다 — 대화형 루프에만 준다.
+    `--keep` 검증은 _normalize_keep 을 그대로 쓰므로 영향이 없다.
 
     **반드시 유한하다.** EOF/Ctrl+C면 즉시 그만두고, 오입력도 tries회까지만
     되묻는다 — isatty()가 True인데 stdin이 EOF인 환경이 실재하므로(Windows의
@@ -143,11 +151,44 @@ def _prompt_keep(tries: int = 3) -> str:
         except (EOFError, KeyboardInterrupt, OSError, ValueError):
             _out("")
             return ""
+        if allow_quit and raw.lower() in _QUIT_WORDS:
+            return "quit"
         pick = _normalize_keep(raw or "1")
         if pick:
             return pick
-        _err("    1, 2, 3 중 하나를 고르세요(both/local/remote 도 됩니다).")
+        _err("    1, 2, 3 중 하나를 고르세요(both/local/remote 도 됩니다)."
+             + (" 그만두려면 0." if allow_quit else ""))
     return ""
+
+
+def _ask_apply_rest(pick: str, remaining: int) -> bool:
+    """남은 전부에 같은 선택을 적용할지 **한 번** 묻는다. 기본은 '아니오'.
+
+    왜 번호 목록에 '4) 전부'를 끼워 넣지 않았나 — AGENTS.md 「넘지 말아야 할 선」이
+    영향 범위가 그 항목 하나로 닫히는 선택만 번호로 주라고 한다. 그래서 순서를
+    뒤집었다: 1건을 **실제로 처리해 결과를 보여 준 뒤**, 남은 건수를 밝히고 별도
+    질문으로 동의를 받는다. 오타 하나가 3,869건을 움직이지 못한다.
+
+    안전한 이유는 되돌릴 수 있기 때문이다 — 어느 선택지도 영구 삭제하지 않는다
+    (로컬·원격 모두 휴지통). 되돌릴 수 없는 전역 스위치(`--assume-local-newer`)와
+    같은 자리에 두지 않는 근거가 그것이다.
+
+    EOF·Ctrl+C·죽은 스트림은 전부 '아니오'다. 배치 UI가 ANY-KEY 를 훈련시켜 두어
+    타입어헤드가 그대로 답이 되는 일이 있으므로, 안전한 쪽으로 떨어뜨린다.
+    """
+    if remaining <= 0 or sys.stdin is None or sys.stdout is None:
+        return False
+    label = {"both": "둘 다 유지", "local": "내 사본을 원래 자리로",
+             "remote": "사본 버림"}.get(pick, pick)
+    _out("")
+    _out(f"    남은 {remaining}건도 전부 '{pick} — {label}' 로 처리할까요?")
+    _out("    (되돌릴 수 있습니다 — 어느 쪽도 영구 삭제하지 않고 휴지통으로 갑니다)")
+    try:
+        ans = input("    전부 같게 [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt, OSError, ValueError):
+        _out("")
+        return False
+    return ans in ("y", "yes", "예")
 
 app = typer.Typer(
     add_completion=False,
@@ -2702,29 +2743,48 @@ def resolve(
                     drive_cm = None
 
             done = 0
-            for row in targets:
+            quit_early = False
+            asked_rest = False
+            total = len(targets)
+            for idx, row in enumerate(targets):
                 pick = choice
                 if not pick:
                     _out("")
-                    _out(f"  충돌 #{row['id']}: {row['rel_path']}")
+                    _out(f"  충돌 #{row['id']}: {row['rel_path']}  "
+                         f"({idx + 1}/{total})")
                     _out(f"    원래 경로  : 원격본 (지금 이 자리에 있음)")
                     _out(f"    로컬 사본  : {row['local_copy_path'] or '-'}")
                     _out("      1) both   - 둘 다 유지 (기본)")
                     _out("      2) local  - 내 사본을 원래 자리로")
                     _out("      3) remote - 사본 버림")
+                    _out("      0) 그만   - 여기서 멈춤(남은 건 그대로)")
                     # 오입력은 건너뛰지 않고 다시 묻는다(유한 — _prompt_keep 참조).
-                    pick = _prompt_keep()
+                    pick = _prompt_keep(allow_quit=True)
+                    if pick == "quit":
+                        quit_early = True
+                        break
                     if not pick:
                         _err("    건너뜁니다(선택을 받지 못했습니다).")
                         continue
                 if _resolve_one(store, p, row, pick, dry_run, log, drive=drive):
                     done += 1
+                # 1건을 실제로 처리해 결과를 보여 준 **뒤에** 한 번만 묻는다.
+                # 화면이 "CLI 인자를 치세요"로 끝나면 그 기능은 없는 것이다
+                # (AGENTS.md) — 3,869건을 한 건씩 누르다 중단한 실사용이 근거다.
+                if not choice and not asked_rest and total - (idx + 1) > 0:
+                    asked_rest = True
+                    if _ask_apply_rest(pick, total - (idx + 1)):
+                        choice = pick
 
             if drive_cm is not None:
                 drive_cm.__exit__(None, None, None)
 
             _out("")
             _out(f"{'(dry-run) ' if dry_run else ''}처리한 충돌: {done}건")
+            if quit_early:
+                left = len(targets) - done
+                _out(f"  중단했습니다 — 남은 {left}건은 그대로 있습니다. "
+                     f"다시 실행하면 이어서 처리합니다.")
 
 
 def _drop_remote_copy(store: Store, p: Profile, copy_rel: str, drive, dry_run: bool) -> None:
