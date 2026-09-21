@@ -347,14 +347,66 @@ if ($Check) {
 # 드라이브를 훑는 폴백이 있지만, 설치 폴더가 <드라이브>:\dooraydrive 형태가
 # 아니면 그 폴백도 못 찾는다. 설치 위치를 사용자가 정하게 만든 이상 여기서
 # 정확한 경로를 남겨 두는 것이 유일하게 확실한 방법이다.
-try {
-  [Environment]::SetEnvironmentVariable('DSYNC_HOME', $PSScriptRoot, 'User')
-  $env:DSYNC_HOME = $PSScriptRoot
-  Ok "프로그램 위치 등록: DSYNC_HOME = $PSScriptRoot"
-  Info "(synchere.bat이 이 폴더를 찾는 데 씁니다. 이미 열려 있는 창에는 다음 로그인 후 적용됩니다)"
-} catch {
-  Warn "DSYNC_HOME 등록 실패(계속 진행): $($_.Exception.Message)"
-  Info "synchere.bat은 각 드라이브의 \dooraydrive 를 훑어 찾습니다"
+#
+# **소스 체크아웃이면 먼저 묻는다.** `설치.bat`은 `.git`을 보면 "여기를 등록하면 이
+# 체크아웃이 매일 도는 프로그램이 된다"고 경고하고는 **그대로 등록했다.** 경고만 하고
+# 그대로 하는 것은 사람에게 멈출 기회를 주지 않는 것이고, 이 저장소가 「화면이 명령을
+# 시키면 그 기능은 없는 것이다」로 금지한 모양의 사촌이다.
+# 2026-09-21 실측: 한 PC의 `DSYNC_HOME`이 개발 체크아웃을 가리키고 있었다. 결과는 셋이다 —
+# `git pull` 한 번이 곧 그날의 실행 코드 교체이고, 새 버전 알림이 **구조적으로 영원히
+# 침묵하며**(체크아웃의 `__version__`은 main과 같거나 앞선다), 그 PC에는 갱신·롤백 수단이
+# 아예 없다(`설치.bat`이 `.git` 때문에 갱신 질문을 띄우지 않는다).
+# `.bat`이 넘기는 플래그가 아니라 여기서 `.git`을 직접 본다 — `.\INSTALL.ps1`을 손으로
+# 실행한 경우에도 같은 질문이 떠야 한다.
+$homeCurrent  = [Environment]::GetEnvironmentVariable('DSYNC_HOME', 'User')
+$registerHome = $true
+if (Test-Path (Join-Path $PSScriptRoot '.git')) {
+  Write-Host ""
+  Write-Host "  이 폴더는 소스 체크아웃입니다(.git 있음)." -ForegroundColor Yellow
+  Write-Host "  여기를 '매일 도는 프로그램'으로 등록하면 개발 중인 코드가 실제 파일을" -ForegroundColor Yellow
+  Write-Host "  동기화합니다. 그리고 그 PC에서는 새 버전 알림이 영원히 뜨지 않습니다" -ForegroundColor DarkGray
+  Write-Host "  (체크아웃은 main과 같거나 앞서므로 '더 높은 원격'이 성립하지 않습니다)." -ForegroundColor DarkGray
+  if ($homeCurrent) {
+    Write-Host "  지금 등록된 곳: $homeCurrent" -ForegroundColor DarkGray
+  } else {
+    Write-Host "  지금은 등록된 곳이 없습니다." -ForegroundColor DarkGray
+  }
+  Write-Host ""
+  Write-Host "    1  등록한다 — 이 체크아웃을 실행 대상으로 삼습니다" -ForegroundColor White
+  Write-Host "    2  등록하지 않는다 (기본값 · 지금 등록된 곳을 그대로 둡니다)" -ForegroundColor White
+  Write-Host ""
+
+  # 기본값은 안전한 쪽(바꾸지 않음)이다. 대화형이 아니면 묻지 않고 그리로 간다.
+  $registerHome = $false
+  for ($i = 0; $i -lt 3 -and -not $registerHome; $i++) {
+    $ans = $null
+    try { $ans = Read-Host "  번호 (그냥 엔터 = 2)" } catch { $ans = $null }
+    if ($null -eq $ans) { break }                             # EOF·죽은 스트림
+    $ans = $ans.Trim()
+    if (-not $ans) { break }                                  # 엔터 = 기본값
+    if     ($ans -match '^(1|등록|yes|y)$')    { $registerHome = $true }
+    elseif ($ans -match '^(2|아니오|no|n)$')   { break }
+    else   { Warn "1 또는 2를 입력해 주세요." }
+  }
+}
+
+if (-not $registerHome) {
+  Write-Host ""
+  if ($homeCurrent) {
+    Info "DSYNC_HOME을 바꾸지 않았습니다 — synchere.bat은 계속 '$homeCurrent'를 씁니다."
+  } else {
+    Warn "DSYNC_HOME을 등록하지 않았습니다 — synchere.bat이 각 드라이브의 \dooraydrive 를 훑어 찾습니다."
+  }
+} else {
+  try {
+    [Environment]::SetEnvironmentVariable('DSYNC_HOME', $PSScriptRoot, 'User')
+    $env:DSYNC_HOME = $PSScriptRoot
+    Ok "프로그램 위치 등록: DSYNC_HOME = $PSScriptRoot"
+    Info "(synchere.bat이 이 폴더를 찾는 데 씁니다. 이미 열려 있는 창에는 다음 로그인 후 적용됩니다)"
+  } catch {
+    Warn "DSYNC_HOME 등록 실패(계속 진행): $($_.Exception.Message)"
+    Info "synchere.bat은 각 드라이브의 \dooraydrive 를 훑어 찾습니다"
+  }
 }
 
 # --------------------------------------------------------------------- 완료
