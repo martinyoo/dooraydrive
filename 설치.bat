@@ -247,8 +247,24 @@ REM  half-extracted folder) cannot print its own version - and that is exactly
 REM  the PC whose version you need. Leave it where anyone can read it without
 REM  running anything. Redirection goes BEFORE echo so no trailing space is
 REM  written into the value.
+REM  The release number, read out of the code that was just put in place.
+REM  `version` above is the REF that was fetched, and a button update always
+REM  fetches main - so it says `main` forever and cannot answer "which release
+REM  is this PC on", which is the first question colleague support asks. That is
+REM  what this line is for (item A: a PC that will not even start must still be
+REM  able to state its version).
+REM  The cleanup runs inside the for body via `call`, where the token is always
+REM  defined: a substring expansion on an UNDEFINED variable does not yield ""
+REM  here - cmd re-pairs the surrounding %% signs and executes the wreckage
+REM  (see the TARGET trimming near the top, measured). Passing the token as an
+REM  argument also drops the leading space and the quotes in one step (%~1).
+REM  Any failure just omits the line: a stamp without it is what every install
+REM  before 2026-09-21 looks like, and nothing reads it but a human.
+set "RELEASE="
+for /f "tokens=2 delims==" %%V in ('findstr /b /c:"__version__" "%TARGET%\dooray_sync\__init__.py" 2^>nul') do call :stamp_release %%V
 >"%TARGET%\INSTALLED.txt" echo dooraydrive install stamp
 >>"%TARGET%\INSTALLED.txt" echo version : %VERLABEL%
+if defined RELEASE >>"%TARGET%\INSTALLED.txt" echo release : %RELEASE%
 >>"%TARGET%\INSTALLED.txt" echo url     : %ZIPURL%
 >>"%TARGET%\INSTALLED.txt" echo when    : %DATE% %TIME%
 >>"%TARGET%\INSTALLED.txt" echo into    : %TARGET%
@@ -513,6 +529,14 @@ REM  Rename %TARGET% aside. Returns with %TARGET% gone on success and OLDDIR
 REM  holding the name it went to; the caller tests %TARGET% itself. Called only
 REM  when REFRESH is set, and never inside setlocal - OLDDIR must survive.
 REM ===========================================================================
+REM ===========================================================================
+REM  Set RELEASE from one `__version__ = "x.y.z"` token. Called from the for
+REM  body so the value is never undefined here; %~1 strips the quotes.
+REM ===========================================================================
+:stamp_release
+set "RELEASE=%~1"
+goto :eof
+
 :swap_aside
 set "SWAPTRY=0"
 :swap_try
