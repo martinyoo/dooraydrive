@@ -1670,14 +1670,38 @@ class _DiffItem(NamedTuple):
 _BASELINE_BY_NUM = {"1": "local", "2": "remote", "3": "skip"}
 _BASELINE_CHOICES = ("local", "remote", "skip")
 
+# [일시 차단 2026-09-15] '로컬 살리기'는 실계정에서 **반대로 동작했다** — 표시한 뒤 다음
+# 계획이 '새버전업로드'가 아니라 '갱신받기'(로컬을 원격본으로 교체)가 됐다. 고른 것과
+# 정반대이고 로컬을 덮는다. 단위 테스트는 원격 항목에 md5·version 을 채워 넣고 시험해서
+# 못 잡았다 — 실제 Dooray 목록 API 응답에는 해시가 없다(core/remote.py). 안전장치를
+# 그것이 필요 없는 조건에서 시험한 전형이다. 원인을 규명할 때까지 고를 수 없게 둔다.
+#
+# **목록에서 지우지 않는다.** 2026-09-21 실측: 지웠더니 화면이 2부터 시작했고, 사용자는
+# 당연히 1을 눌렀으며, 그때 도구는 사유만 말하고 **되묻지 않고 그 파일을 건너뛰었다.**
+# 오입력 안내는 그때도 "1, 2, 3 중 하나"라고 말하고 있었다 — 화면·입력 검증·실제 동작
+# 셋이 서로 다른 말을 했다. 보이게 두고, 고르면 사유를 말하고 되묻는다.
+_BASELINE_BLOCKED = {
+    "local": ("    1은 지금 고를 수 없습니다 — 2026-09-15 실계정에서 고른 것과 "
+              "반대로 동작했습니다(원인 규명 중).\n"
+              "    로컬 내용을 지키려면 2를 고르십시오. 로컬은 '(충돌 …)' 사본으로 "
+              "남고, 다음 동기화가 그 사본을 원격에도 올립니다."),
+}
 
-def _prompt_baseline(tries: int = 3) -> str:
+
+def _prompt_baseline(tries: int = 3, blocked: dict[str, str] | None = None) -> str:
     """내용이 다른 파일 하나를 어떻게 할지 번호로 받는다. 못 받으면 'skip'.
 
     계약은 `_prompt_keep`과 같다 — 오타를 만나면 그 건을 **조용히 건너뛰지 않고**
     되묻되 유한하고, EOF·Ctrl+C·죽은 스트림은 즉시 포기한다. 기본값은 언제나
     안전한 쪽(아무것도 하지 않음)이다.
+
+    `blocked`는 `{선택지: 사유}`다. **고를 수 없는 것도 오타와 같게 다룬다** — 사유를
+    말하고 되묻되 그 건을 건너뛰지 않는다. 오입력 안내도 남은 번호만 말한다(막아 둔
+    번호를 "고르세요"라고 안내하던 것이 2026-09-21에 실제로 사람을 헤매게 했다).
     """
+    nums = [n for n, v in _BASELINE_BY_NUM.items() if not (blocked and v in blocked)]
+    names = [v for v in _BASELINE_CHOICES if not (blocked and v in blocked)]
+    hint = f"    {', '.join(nums)} 중 하나를 고르세요({'/'.join(names)} 도 됩니다)."
     for _ in range(max(1, tries)):
         try:
             raw = input("    번호를 고르세요 [3]: ").strip()
@@ -1687,11 +1711,16 @@ def _prompt_baseline(tries: int = 3) -> str:
         if not raw:
             return "skip"
         low = raw.lower()
-        if low in _BASELINE_BY_NUM:
-            return _BASELINE_BY_NUM[low]
-        if low in _BASELINE_CHOICES:
-            return low
-        _err("    1, 2, 3 중 하나를 고르세요(local/remote/skip 도 됩니다).")
+        pick = _BASELINE_BY_NUM.get(low)
+        if pick is None and low in _BASELINE_CHOICES:
+            pick = low
+        if pick is None:
+            _err(hint)
+            continue
+        if blocked and pick in blocked:
+            _err(blocked[pick])
+            continue
+        return pick
     return "skip"
 
 
@@ -1787,20 +1816,16 @@ def _decide_diffs(store: Store, p: Profile, items: list[_DiffItem], log) -> None
             _out("")
             _out(f"  [{i}/{len(items)}] {it.rel}")
             _out(f"        {it.why}")
-            _out("        2) 원격 것을 살린다 — 로컬은 '(충돌 …)' 이름으로 보존하고 자리를 비웁니다")
+            _out("        1) 로컬 것을 살린다 — 지금 고를 수 없습니다")
+            _out("           (2026-09-15 실계정에서 고른 것과 반대로 동작했습니다 — 원인 규명 중)")
+            _out("        2) 로컬을 '(충돌 …)' 이름으로 보존하고, 원격 것을 이 자리에 둡니다")
+            _out("           → 로컬 내용은 사라지지 않고, 그 사본은 다음 동기화가 원격에도 올립니다")
             _out("        3) 나중에 (기본)")
-            pick = _prompt_baseline()
+            pick = _prompt_baseline(blocked=_BASELINE_BLOCKED)
             if pick == "local":
-                # [일시 차단 2026-09-15] '로컬 살리기'는 실계정에서 **반대로 동작했다** —
-                # 표시한 뒤 다음 계획이 '새버전업로드'가 아니라 '갱신받기'(로컬을 원격본으로
-                # 교체)가 됐다. 고른 것과 정반대이고 로컬을 덮는다.
-                # 단위 테스트는 원격 항목에 md5·version을 채워 넣고 시험해서 못 잡았다 —
-                # 실제 Dooray 목록 API 응답에는 해시가 없다(core/remote.py). 안전장치를
-                # 그것이 필요 없는 조건에서 시험한 전형이다.
-                # 원인을 규명할 때까지 **고를 수 없게** 둔다. 되돌릴 수 없는 쪽으로
-                # 틀리는 기능은 없는 편이 낫다.
-                _err("    '로컬 살리기'는 결함이 확인되어 잠시 막아 두었습니다"
-                     " — 그대로 둡니다.")
+                # 방어선. `blocked`를 넘기는 한 여기 닿지 않는다 — 누가 그 인자를 빼먹었을
+                # 때 되돌릴 수 없는 쪽이 조용히 실행되는 일이 없도록 남겨 둔다.
+                _err(_BASELINE_BLOCKED["local"])
             elif pick == "remote":
                 dst = _keep_remote_next_sync(p, it)
                 if dst:
