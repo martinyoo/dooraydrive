@@ -58,7 +58,9 @@ from ..config import (
     save_config,
     state_dir,
 )
-from ..core.differ import KIND_CONFLICT, DiffStats, conflict_copy_name, diff
+from ..core.differ import (
+    KIND_CONFLICT, KIND_REMOTE_TRASH, DiffStats, conflict_copy_name, diff,
+)
 from ..core.executor import SyncExecutor
 from ..core.journal import SyncJournal, recover
 from ..core.planner import ACTION_LABEL, TRASH_KINDS, BulkDeleteAbort
@@ -2193,6 +2195,92 @@ def _delete_bytes(action, base: dict) -> int:
                if key == action.key or key.startswith(prefix))
 
 
+# 무인 실행이 대량 삭제로 멈췄을 때의 안내(플래그 대신). 자동 동기화 창이 이 보류를 보고
+# '계획 보기 → y/N' 을 연다(dooray_sync/auto/runner.py 의 삭제 보류 처리). 명령은 적지
+# 않는다 — 그 창에는 칠 사람이 없다(AGENTS.md "화면이 명령을 시키면 그 기능은 없는 것이다").
+_BULK_UNATTENDED_HINT = (
+    "  의도한 삭제가 맞다면 자동 동기화 창에서 y 를 누르세요 — 지울 계획을 먼저 보여 주고\n"
+    "  진행할지 묻습니다. 한쪽 폴더가 통째로 사라진 사고라면 누르지 마세요"
+    "(그 폴더의 synchere.bat 을 실행해도 같은 질문이 나옵니다).")
+_BULK_UNATTENDED_DRY_HINT = (
+    "  (dry-run — 아무것도 지우지 않았습니다. 실제 자동 동기화에서는 그 창이 지울 계획을\n"
+    "  보여 주고 진행할지 묻습니다.)")
+
+
+def _delete_fingerprint(pl, *, view=None, local=None, base=None) -> tuple[str, int]:
+    """실행될 삭제의 지문과, 지울 원격 폴더 안에 있지만 기준선에 없는 항목 수.
+
+    사람이 본 계획과 실행되는 계획이 같은지 한 줄로 대조하려는 것이다. 들어가는 것:
+      - 삭제 동작의 종류·경로 키(순서 무관, path_key 라 실행마다 같다)
+      - 질문에 적어 보인 '실제로 사라질 항목' 수(pl.delete_count — 기준선 기준)
+      - **지울 폴더 안**에서 관측된 모든 것: 원격 항목(키·file_id·버전), 로컬 항목(키·
+        크기·수정 시각), 계획의 다른 항목(이동 — 옮겨 갈 자리 포함 — ·보고·보호·동기화
+        불가·미룸)
+    폴더 삭제는 동작 하나로 하위 전체를 가져간다. 동작 목록과 기준선 건수만 보면, 미리보기
+    뒤에 그 원격 폴더 안으로 들어온 것 — 이 PC 에 담을 수 없는 이름의 파일(동기화 불가라
+    폴더 삭제를 막지 않는다), 다른 곳에서 옮겨 들어온 폴더 — 이 지문을 바꾸지 못해 옛
+    동의로 함께 휴지통에 갔다(2026-11-10 검토에서 재현). 그래서 폴더 안을 함께 넣는다.
+
+    뷰에 넣지 않은 원격 항목(view.hidden — 이름 충돌로 가려진 것, 제외 규칙에 걸린 것,
+    같은 이름의 다른 파일에 가려진 것)도 지울 폴더 안에 있으면 넣고 둘째 반환값에 센다.
+    모두 이 PC 에는 없지만 폴더와 함께 휴지통에 간다.
+
+    한계(정직하게): 델타 실행의 원격 뷰는 커서 이후 바뀐 것만 담으므로, 미리보기 **전부터**
+    원격 폴더 안에 있던 동기화 불가·제외·이름 충돌 항목은 미리보기와 실행 양쪽에 똑같이 안
+    보인다(지문은 같고 둘째 반환값에도 안 잡힌다). 전체 순회 실행에서는 보이고 세어진다.
+    미리보기 **뒤에** 들어온 것은 어느 쪽이든 실행의 뷰에 나타나 지문을 바꾼다.
+
+    반환: (지문 16자, 지울 원격 폴더 안의 기준선 밖 관측 항목 수).
+    """
+    import hashlib
+
+    trash = [a for a in pl.actions if a.kind in TRASH_KINDS]
+    items = sorted(f"{a.kind}\t{a.key}" for a in trash)
+    items.append(f"#count={pl.delete_count}")
+    dir_prefixes = tuple(a.key + "/" for a in trash if a.is_dir)
+    remote_prefixes = tuple(a.key + "/" for a in trash if a.is_dir and a.kind == KIND_REMOTE_TRASH)
+    extra = 0
+    if dir_prefixes:
+        def under(key: str, prefixes: tuple = dir_prefixes) -> bool:
+            return bool(key) and key.startswith(prefixes)
+
+        hood: set[str] = set()
+        for a in pl.actions:
+            if a.kind in TRASH_KINDS:
+                continue
+            dest = path_key(a.new_rel_path) if getattr(a, "new_rel_path", "") else ""
+            if under(a.key) or under(dest):
+                hood.add(f"A\t{a.kind}\t{a.key}\t{dest}")
+        for tag, rows in (("R", pl.reports), ("P", pl.protected),
+                          ("U", pl.unsyncable), ("D", pl.deferred)):
+            for rel, _why in rows:
+                k = path_key(rel)
+                if under(k):
+                    hood.add(f"{tag}\t{k}")
+                    if tag == "U" and remote_prefixes and k.startswith(remote_prefixes) \
+                            and (base is None or k not in base):
+                        extra += 1
+        if view is not None:
+            for k, e in getattr(view, "entries", {}).items():
+                if under(k):
+                    hood.add(f"V\t{k}\t{e.file_id}\t{e.version}")
+                    if remote_prefixes and k.startswith(remote_prefixes) \
+                            and (base is None or k not in base):
+                        extra += 1
+            for k, fid, ver, why in getattr(view, "hidden", []):
+                if under(k):
+                    tag = f"H\t{k}\t{fid}\t{ver}\t{why}"
+                    if tag not in hood and remote_prefixes and k.startswith(remote_prefixes):
+                        extra += 1
+                    hood.add(tag)
+        if local is not None:
+            for k, le in local.items():
+                if under(k):
+                    hood.add(f"L\t{k}\t{le.size}\t{le.mtime_ns}")
+        items.extend(sorted(hood))
+    return hashlib.sha256("\n".join(items).encode("utf-8")).hexdigest()[:16], extra
+
+
 def _apply_delete_grade(pl, base: dict, *, max_deletes: int, max_mb: int,
                         base_count: int) -> tuple[int, str]:
     """무인 삭제 등급화(설계 I-A1'). 임계 초과면 **삭제 동작만** 계획에서 떼어
@@ -2345,11 +2433,16 @@ def sync(
     unattended: bool = typer.Option(
         False, "--unattended",
         help="무인 실행 강등 모드: 충돌 미처리(보류), 로컬 붕괴 시 통째 보류(exit 4)"),
+    expect_delete_fp: str = typer.Option(
+        "", "--expect-delete-fp",
+        help="사람이 미리보기에서 확인한 삭제 계획의 지문(보고서 deletes.fp). 지금 계획의 "
+             "삭제가 그것과 다르면 아무것도 하지 않고 중단 — 본 계획만 실행한다"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="상세 로그"),
 ) -> None:
     """양방향 동기화 1회. 충돌은 양쪽을 모두 보존하고, 삭제는 어떤 충돌에서도 이기지 않습니다."""
     log = setup_logging(profile, verbose=verbose)
     unattended = unattended is True   # 함수 직접 호출(테스트)의 OptionInfo 방어
+    expect_delete_fp = expect_delete_fp.strip() if isinstance(expect_delete_fp, str) else ""
     with _error_boundary(log):
         p = _load_profile(profile)
         _require_ready(p)
@@ -2541,7 +2634,14 @@ def sync(
                             "ok": Fault.OK, "no_changes": Fault.OK,
                             "dry_run": Fault.OK, "partial": Fault.PARTIAL,
                             "aborted_bulk_delete": Fault.HELD,
+                            "aborted_plan_changed": Fault.HELD,
                         }.get(outcome, Fault.UNKNOWN)
+                        # 보류 사유를 이름으로 남긴다 — 러너가 화면 문구를 해석하지 않고
+                        # '무엇 때문에 멈췄나'를 알아야 사람에게 맞는 길을 낼 수 있다.
+                        held = {"aborted_bulk_delete": "bulk_delete",
+                                "aborted_plan_changed": "plan_changed"}.get(outcome)
+                        if held:
+                            run_report["held_reason"] = held
                         run_report["finished_at"] = now_iso()
                         # 페이크 클라이언트(테스트)는 counters가 없다 — 보고는 관측
                         # 수단이므로 없으면 빈 dict로 넘어간다(실행에 영향 금지).
@@ -2563,8 +2663,21 @@ def sync(
                                         # 폴더 삭제가 실제로 몇 건을 지우는지 환산하는 근거
                                         base_keys=tuple(base.keys()))
                     except BulkDeleteAbort as exc:
-                        _finish_report("aborted_bulk_delete", error=str(exc))
-                        _fail(str(exc), EXIT_FAIL)
+                        run_report["bulk_delete"] = {
+                            "why": getattr(exc, "why", ""),
+                            "count": int(getattr(exc, "count", 0) or 0),
+                            "actions": int(getattr(exc, "actions", 0) or 0),
+                        }
+                        # 무인 실행에는 플래그를 붙여 다시 칠 사람이 없다. 자동 동기화
+                        # 창이 계획을 보여 주고 묻는다는 사실을 그 자리에서 말한다
+                        # ("화면이 명령을 시키면 그 기능은 없는 것이다" — AGENTS.md).
+                        if not unattended:
+                            text = str(exc)
+                        else:
+                            text = exc.text(_BULK_UNATTENDED_DRY_HINT if dry_run
+                                            else _BULK_UNATTENDED_HINT)
+                        _finish_report("aborted_bulk_delete", error=text)
+                        _fail(text, EXIT_FAIL)
                         raise AssertionError("도달 불가")
 
                     # 무인 삭제 등급화(I-A1') — 대량 게이트 통과분 중에서도 임계를
@@ -2594,12 +2707,34 @@ def sync(
                         cursor_after=next_cursor.revision,
                         use_full=use_full, why_full=why_full))
                     run_report["unattended"] = unattended
+                    delete_fp, delete_extra = _delete_fingerprint(pl, view=view, local=entries,
+                                                                  base=base)
                     run_report["deletes"] = {
                         "planned": planned_deletes,
                         "deferred": deferred_deletes,
                         "gone_probed": len(gone_ids),
+                        # 이번에 **실행될** 삭제(등급화 뒤)의 건수와 지문. 사람이 미리보기를
+                        # 보고 동의하면 실행 쪽이 --expect-delete-fp 로 이 지문을 들고 온다.
+                        "count": pl.delete_count,
+                        "actions": pl.delete_actions,
+                        "fp": delete_fp,
+                        # 지울 원격 폴더 안에서 관측됐지만 기준선에 없는 항목(이 PC 에 없는
+                        # 것 — 담을 수 없는 이름, 옮겨 들어온 것). 폴더와 함께 휴지통에 간다.
+                        "extra_remote": delete_extra,
                     }
                     run_report["conflicts_deferred"] = conflicts_deferred
+
+                    # 동의한 계획만 실행한다. 미리보기와 실행 사이(사람이 읽고 답하는 동안)에
+                    # 삭제 대상이 바뀌었으면 — 늘었든 줄었든 — 그 동의는 지금 계획의 동의가
+                    # 아니다. 아무것도 하지 않고 멈추고, 다시 보여 주고 묻게 한다.
+                    if expect_delete_fp and expect_delete_fp != delete_fp:
+                        msg = (
+                            "확인한 삭제 계획과 지금 계획이 달라 **아무것도 실행하지 않고** "
+                            f"중단했습니다(지금 삭제 {pl.delete_count}건).\n"
+                            "  미리보기를 다시 보고 결정하세요 — 그 사이 원격이나 로컬이 바뀌었습니다.")
+                        _finish_report("aborted_plan_changed", error=msg)
+                        _fail(msg, EXIT_FAIL)
+                        raise AssertionError("도달 불가")
 
                     # 보호·보고 판정을 파일 로그에도 남긴다. 화면에만 나오면 창을 닫는
                     # 순간 증거가 사라져, 일시 상태('기준선 없음' 등)의 사후 진단이

@@ -724,16 +724,150 @@ def _run_child(name: str, verb: str, *args: str) -> int:
         return 1
 
 
-def _offer_bulk_delete(extra: list[str]) -> None:
+# --------------------------------------------------------------------------
+# 대량 삭제 — 본 계획만, 동의한 때만 (사람 창과 자동 동기화 창이 함께 쓰는 흐름)
+# --------------------------------------------------------------------------
+# 결과 이름. 흐름은 무엇이 일어났는지만 돌려주고, 뒷말(언제 다시 묻는지)은 호출측이 한다 —
+# 사람 창은 "다음에 synchere.bat 을 실행하면", 자동 동기화 창은 "이 창에서 y 를 다시".
+BULK_DONE = "done"                  # 삭제를 포함해 동기화했다(일부 파일 실패 포함)
+BULK_DECLINED = "declined"          # 물었고 '아니오'(시간 초과·Ctrl+C 포함)
+BULK_NOTHING = "nothing"            # 미리보기에 지울 것이 없다 — 이미 풀렸다
+BULK_PREVIEW_FAILED = "preview_failed"
+BULK_CHANGED = "changed"            # 동의한 뒤 실행 직전에 계획이 바뀌어 CLI 가 거부했다
+BULK_FAILED = "failed"
+
+# 실행 보고의 outcome 중 '대량 삭제 게이트를 지나 실제로 실행까지 간 것'.
+_GATE_PASSED = frozenset({"ok", "no_changes", "partial"})
+
+
+def _read_json(path: str) -> dict:
+    """실행 보고 JSON. 없거나 깨졌으면 빈 dict — 판정은 '모른다 = 진행하지 않음'."""
+    try:
+        import json
+
+        with open(ext_path(path), encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:   # noqa: BLE001
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _new_report_path() -> str:
+    import tempfile
+    fd, path = tempfile.mkstemp(prefix="dsync-bulk-", suffix=".json")
+    os.close(fd)
+    return path
+
+
+def bulk_delete_flow(name: str, *, run, ask, base=(), report_path: str = "") -> tuple[str, int]:
+    """대량 삭제 게이트로 멈춘 프로파일 하나를 **사람이 본 계획대로만** 진행한다.
+
+    1) 미리보기 — `sync --dry-run --allow-bulk-delete`. 아무것도 바꾸지 않는다. 보고서에서
+       이번에 실행될 삭제의 건수와 지문(deletes.count / deletes.fp)을 읽는다.
+    2) 묻기 — 무엇을 몇 건 지우는지 적고 묻는다. 기본값 '아니오'(ask 가 정한다).
+    3) 실행 — `sync --allow-bulk-delete --expect-delete-fp <지문>`. 묻고 답하는 사이에 삭제
+       계획이 바뀌었으면 CLI 가 아무것도 하지 않고 멈춘다(aborted_plan_changed).
+
+    run(args) -> 종료코드. args 는 ['sync', ...]이고 프로세스는 호출측이 띄운다 — 사람 창은
+    콘솔을 그대로 물려주고, 자동 동기화 창은 중립 작업 폴더·닫힌 stdin 으로 띄운다.
+    base 는 두 단계에 똑같이 붙는 인자다(자동 동기화 창은 --unattended — 충돌 보류·로컬
+    붕괴 보류는 사람이 동의한 뒤에도 그대로 둔다). 미리보기와 실행의 인자가 --dry-run 과
+    지문 말고는 같아야 '본 계획 = 실행 계획'이 성립한다.
+    report_path: 실행 단계 보고를 남길 곳(없으면 임시 파일). 반환: (결과, 마지막 종료코드).
+    """
+    base = list(base)
+    preview = _new_report_path()
+    try:
+        rc = run(["sync", *base, "--dry-run", "--allow-bulk-delete", "--report-json", preview])
+        rep = _read_json(preview)
+    finally:
+        try:
+            os.unlink(preview)
+        except OSError:
+            pass
+    deletes = rep.get("deletes") if isinstance(rep.get("deletes"), dict) else {}
+    fp = str(deletes.get("fp") or "")
+    try:
+        count = int(deletes.get("count") or 0)
+        extra = int(deletes.get("extra_remote") or 0)
+    except (TypeError, ValueError):
+        count, extra = 0, 0
+    if rc != 0 or str(rep.get("outcome") or "") != "dry_run" or not fp:
+        print(f"  미리보기를 만들지 못했습니다(종료코드 {rc}) — 아무것도 지우지 않았습니다.")
+        return BULK_PREVIEW_FAILED, rc
+    if count <= 0:
+        print("  지금 계획에는 지울 것이 없습니다 — 아무것도 하지 않았습니다.")
+        return BULK_NOTHING, rc
+
+    print()
+    print(f"  위 계획대로 진행하면 실제로 사라질 항목은 {count}건입니다"
+          "(로컬은 휴지통, 원격은 Dooray 휴지통으로 보냅니다).")
+    if extra:
+        # 지울 원격 폴더 안에 이 PC 에 없는 것(담을 수 없는 이름, 옮겨 들어온 것)이 보인다.
+        # 폴더째 휴지통에 가므로 함께 간다 — 건수를 밝히지 않으면 동의가 아니다.
+        print(f"  그 원격 폴더 안에는 이 PC 에 없는 항목도 {extra}건 보입니다 — 폴더와 함께 "
+              "Dooray 휴지통으로 갑니다.")
+    print("  한쪽 폴더가 통째로 사라진 사고라면 '아니오'를 고르세요.")
+    if not ask(f"  정말 이 {count}건을 지울까요? [y/N]: "):
+        print("  아무것도 지우지 않았습니다.")
+        return BULK_DECLINED, 0
+
+    own = not report_path
+    out = report_path or _new_report_path()
+    try:
+        rc = run(["sync", *base, "--allow-bulk-delete", "--expect-delete-fp", fp,
+                  "--report-json", out])
+        rep = _read_json(out)
+    finally:
+        if own:
+            try:
+                os.unlink(out)
+            except OSError:
+                pass
+    outcome = str(rep.get("outcome") or "")
+    if outcome == "aborted_plan_changed":
+        print("  미리보기 뒤에 삭제 계획이 바뀌어 **아무것도 지우지 않았습니다** — "
+              "다시 보고 결정해야 합니다.")
+        return BULK_CHANGED, rc
+    if outcome in _GATE_PASSED:
+        if outcome == "partial":
+            print(f"  [{name}] 동기화했지만 일부 항목은 실패했습니다 — 지워지지 않은 것이 남으면 "
+                  "다음 동기화가 다시 보류하고 묻습니다.")
+        else:
+            print(f"  [{name}] 삭제를 포함해 동기화했습니다.")
+        return BULK_DONE, rc
+    print(f"  [{name}] 끝까지 가지 못했습니다(종료코드 {rc}) — 위 메시지를 보세요.")
+    return BULK_FAILED, rc
+
+
+def _ask_fresh(question: str) -> bool:
+    """묻기 직전에 쌓인 키를 버리고 묻는다(기본값 '아니오').
+
+    미리보기 자식은 입력을 읽지 않으므로, 그동안 눌린 y·Enter 는 콘솔에 그대로 남아
+    있다가 input() 이 질문을 띄우자마자 답으로 읽혔다 — 건수를 보기도 전에 지우기로
+    했다(2026-11-10 검토에서 실제 콘솔로 재현). 자동 동기화 창의 질문과 같은 규칙이다.
+    """
+    try:
+        from dooray_sync.auto import keys
+        keys.discard()
+    except Exception:   # noqa: BLE001 — 못 버려도 묻는 것 자체는 한다
+        pass
+    return _ask_yes_no(question)
+
+
+def _offer_bulk_delete(extra: list[str]) -> set[str]:
     """대량 삭제 게이트로 멈춘 프로파일을 알리고, 동의하면 이어서 지운다.
 
     이 게이트는 '원격이나 로컬이 통째로 사라진 사고'를 잡으라고 있는 것이다.
     그래서 기본값은 **아니오**이고, 무엇이 지워지는지 먼저 보여 준 뒤 묻는다.
+    흐름은 자동 동기화 창과 같은 bulk_delete_flow 하나다.
+    반환: 이번에 삭제를 포함해 끝까지 깨끗하게 동기화된 프로파일 이름.
     """
+    resolved: set[str] = set()
     pending = list(_PENDING_DELETES)
     _PENDING_DELETES.clear()
     if not pending:
-        return
+        return resolved
     try:
         print()
         print("=" * 70)
@@ -741,32 +875,29 @@ def _offer_bulk_delete(extra: list[str]) -> None:
         for name, root, why in pending:
             print(f"  [{name}] {why}   {root}")
         if "--dry-run" in extra or "--unattended" in extra:
-            return
+            return resolved
         print()
-        print("계획을 먼저 보고 싶으면: dsync sync -p <이름> --full --dry-run")
-        print("한쪽이 통째로 사라진 사고라면 여기서 '아니오'를 고르세요.")
-        for name, root, _why in pending:
+        print("지울 계획을 먼저 보여 드리고(미리보기는 아무것도 바꾸지 않습니다) 진행할지 묻습니다.")
+        for k, (name, root, _why) in enumerate(pending, 1):
             print()
-            print(f"[프로파일 '{name}'] {root}")
-            rc = _run_child(name, "sync", "--dry-run", "--allow-bulk-delete")
-            if rc != 0:
-                print(f"  미리보기를 만들지 못했습니다(종료코드 {rc}) — 건너뜁니다.")
-                continue
-            if not _ask_yes_no("  위 계획대로 정말 삭제하시겠습니까? [y/N]: "):
-                print("  건너뜁니다. 나중에 하려면: "
-                      f"dsync sync -p {name} --allow-bulk-delete")
-                continue
-            rc = _run_child(name, "sync", "--allow-bulk-delete")
-            if rc == 0:
-                print(f"  [{name}] 삭제를 포함해 동기화했습니다.")
+            step = f"  ({k}/{len(pending)})" if len(pending) > 1 else ""
+            print(f"[프로파일 '{name}'] {root}{step}")
+            result, rc = bulk_delete_flow(
+                name, ask=_ask_fresh,
+                run=lambda args, _n=name: _run_child(_n, args[0], *args[1:]))
+            if result == BULK_DONE and rc == 0:
+                # 끝까지 깨끗하게 동기화됐다 — 실패 목록에서 뺀다. 일부 실패(partial, rc 1)는
+                # 실패로 남겨 배치의 재시도가 그대로 돌게 하고, '지울 것 없음'은 이번 실행에서
+                # 동기화가 한 번도 안 됐으므로 역시 실패로 남긴다(재시도가 첫 동기화가 된다).
                 _clear_auto_notices(name)
-            else:
-                print(f"  [{name}] 종료코드 {rc} — 다시 하려면: "
-                      f"dsync sync -p {name} --allow-bulk-delete")
+                resolved.add(name)
+            elif result != BULK_DONE:
+                print("  다음에 이 폴더의 synchere.bat 을 실행하면 다시 묻습니다.")
     except (Exception, KeyboardInterrupt) as exc:   # noqa: BLE001
         print()
         print(f"(삭제 안내를 마치지 못했습니다 — 동기화 결과에는 영향 없음: "
               f"{type(exc).__name__}: {exc})")
+    return resolved
 
 
 def _offer_reconcile(extra: list[str]) -> None:
@@ -1154,7 +1285,10 @@ def main(argv: list[str]) -> int:
     # 하향 실행의 뒤쪽 프로파일이 사람 대기에 인질이 된다(설계 사유 1).
     # 순서: 삭제(sync를 통째로 막은 것) → 충돌 → 기준선. 앞의 것을 풀어야 뒤의
     # 것이 제대로 보이는 의존이 있다(삭제로 중단되면 충돌·기준선은 세지도 못한다).
-    _offer_bulk_delete(extra)
+    # 대량 삭제로 실패했던 프로파일이 여기서 풀렸으면 실패가 아니다 — 남겨 두면 배치가
+    # [FAILED] 와 재시도를 띄운다(다시 실행하면 같은 프로파일을 또 동기화한다).
+    resolved = _offer_bulk_delete(extra) or set()
+    failed = [n for n in failed if n not in resolved]
     _offer_resolve(extra)
     _offer_reconcile(extra)
 

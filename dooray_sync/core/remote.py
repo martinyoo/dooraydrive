@@ -102,6 +102,10 @@ class RemoteView:
     cursor: Cursor = field(default_factory=Cursor)
     unsyncable: list[tuple[str, str]] = field(default_factory=list)
     collisions: list[str] = field(default_factory=list)
+    # 관측했지만 뷰에 넣지 않은 원격 항목 — (키, file_id, 버전, 사유: collision|excluded|shadowed).
+    # 동기화 판단에는 쓰지 않는다. 폴더째 휴지통에 가는 삭제를 사람이 동의할 때, 그 폴더 안에
+    # 이 PC 가 모르는 것이 있었는지 알리고 동의를 거기에 묶으려고 남긴다(cli._delete_fingerprint).
+    hidden: list[tuple[str, str, str, str]] = field(default_factory=list)
     truncated: bool = False
     probed_ids: set[str] = field(default_factory=set)
     probe_skipped: int = 0          # 예산을 넘겨 확인하지 못한 건수 — 반드시 보고할 것
@@ -391,10 +395,12 @@ class RemoteCollector:
         if prev is not None and prev != rel:
             # 대소문자/정규화만 다른 이름은 Windows에 함께 저장할 수 없다.
             view.collisions.append(f"{rel}  (이미 {prev})")
+            view.hidden.append((key, entry.file_id, str(entry.version), "collision"))
             return
         seen[key] = rel
 
         if self.exclude and matches_any(rel, self.exclude):
+            view.hidden.append((key, entry.file_id, str(entry.version), "excluded"))
             return
 
         parent_key = key.rpartition("/")[0]
@@ -411,6 +417,11 @@ class RemoteCollector:
             return
 
         # 같은 키를 델타에서 두 번 보면 나중 것이 최신이다(항목은 revision 오름차순).
+        # 다른 file_id 가 같은 이름으로 겹치면(NFC 로 같아지는 이름 등) 앞의 것이 조용히
+        # 가려진다 — 판단은 지금처럼 두되, 가려진 사실은 남긴다.
+        old = view.entries.get(key)
+        if old is not None and old.file_id and old.file_id != entry.file_id:
+            view.hidden.append((key, old.file_id, str(old.version), "shadowed"))
         view.entries[key] = entry
         view.deleted_keys.discard(key)
         view.moved_out_keys.discard(key)
