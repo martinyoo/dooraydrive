@@ -20,7 +20,7 @@ from __future__ import annotations
 import sys
 import time
 
-__all__ = ["YES_KEYS", "drain", "discard", "ask", "chars_from_records"]
+__all__ = ["YES_KEYS", "YES_WORDS", "drain", "discard", "ask", "chars_from_records"]
 
 # 대기 중에 '계획 보기'를 여는 키. 한글 입력 상태에서 Y 를 누르면 'ㅛ'가 들어온다
 # (2026-09-23 Obsidian 런처 — 이 저장소 밖의 다른 프로그램 — 에서 실측). 여는 것은
@@ -31,6 +31,7 @@ YES_KEYS = frozenset({"y", "Y", "ㅛ"})
 # 남은 조각일 수 있다)는 다음 Enter 에 확정되어 들어오므로, '아니오'로 치려던 Enter 가
 # '예'가 될 수 있다. 대신 영문 y 로 다시 답해 달라고 되묻는다.
 _YES_WORDS = frozenset({"y", "yes", "예", "네"})
+YES_WORDS = _YES_WORDS      # 러너의 대기 중 [y/N] 도 같은 낱말을 '예'로 읽는다
 _HANGUL_Y = frozenset({"ㅛ", "ㅛㅛ"})
 _MAX_TRIES = 3
 

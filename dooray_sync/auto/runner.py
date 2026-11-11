@@ -136,6 +136,34 @@ def _last_sync_map(names: list[str]) -> dict[str, _dt.datetime | None]:
     return out
 
 
+def _due_at(st: AutoState, name: str, seen: _dt.datetime | None, interval: float,
+            now: _dt.datetime) -> _dt.datetime | None:
+    """그 프로파일이 다음에 평시 차례가 되는 시각. None 이면 지금 바로.
+
+    기준은 마지막 동기화 시각(상태 DB 의 last_sync_at)이다. **대량 삭제 보류는 예외다** —
+    그 실행은 계획 단계에서 멈춰 last_sync_at 을 남기지 않으므로, 마지막 동기화만 보면
+    보류된 폴더는 매 틱 차례가 된다. 2026-11-11 실측: WRITING 이 2분마다 같은 보류를
+    776회 반복했다. '주기 x8'은 숫자뿐이었고(기준점이 닷새 전이라 언제나 지나 있었다),
+    화면이 그 출력으로 계속 흘러 'y' 를 누를 대기 줄이 한 번도 나오지 않았다 — 사용자는
+    0.3.3 으로 올린 뒤에도 "같은 현상"을 보았다. 보류의 결과는 사람이 손대기 전까지
+    같으므로, 보류된 폴더는 **마지막 시도(보류 시각)부터** 주기를 센다.
+
+    보류 시각이 지금보다 뒤면(시계가 뒤로 간 PC) 그 기준은 버린다 — 미래 시각에 묶이면
+    시계가 따라잡을 때까지 그 폴더가 영영 안 돈다. 다음 실행이 지금 시계로 다시 찍는다.
+    """
+    marks: list[_dt.datetime] = []
+    if seen is not None:
+        marks.append(seen)
+    hold = _bulk_hold(st, name)
+    if hold:
+        at = _parse(str(hold.get("at") or ""))
+        if at is not None and at <= now:
+            marks.append(at)
+    if not marks:
+        return None
+    return max(marks) + _dt.timedelta(seconds=interval * st.backoff_mult(name))
+
+
 def decide(st: AutoState, auto: dict, names: list[str], *, now: _dt.datetime,
            last_sync: dict[str, _dt.datetime | None]) -> Decision:
     """순수 판정 — 시계·상태·설정만 보고 무엇을 돌릴지 정한다(부작용 없음)."""
@@ -163,12 +191,11 @@ def decide(st: AutoState, auto: dict, names: list[str], *, now: _dt.datetime,
     due: list[tuple[float, str]] = []
     for name in names:
         seen = last_sync.get(name)
-        if seen is None:
+        when = _due_at(st, name, seen, interval, now)
+        if when is None:
             due.append((0.0, name))
-            continue
-        wait = interval * st.backoff_mult(name)
-        if (now - seen).total_seconds() >= wait:
-            due.append((seen.timestamp(), name))
+        elif now >= when:
+            due.append((seen.timestamp() if seen is not None else 0.0, name))
     if not due:
         return Decision("idle", [], "")
     due.sort()
@@ -255,7 +282,8 @@ def _read_report(name: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _apply_backoff(st: AutoState, name: str, kind: str, report: dict) -> None:
+def _apply_backoff(st: AutoState, name: str, kind: str, report: dict, *,
+                   quiet: bool = False) -> None:
     """주기 승수 조정. 두 가지 입력이 있다.
 
     - rate limit 관측(429): 서버가 밀어내고 있다 → 즉시 2배.
@@ -285,8 +313,9 @@ def _apply_backoff(st: AutoState, name: str, kind: str, report: dict) -> None:
               f"{st.backoff_mult(name):g}배로 늘립니다)")
     elif streak >= 3:
         st.set_backoff_mult(name, cur * 2)
-        print(f"    (연속 {streak}회 같은 결과 — 주기를 "
-              f"{st.backoff_mult(name):g}배로 늘립니다)")
+        if not quiet:      # 대량 삭제 보류는 알림 블록이 '다시 확인' 시각을 따로 적는다
+            print(f"    (연속 {streak}회 같은 결과 — 주기를 "
+                  f"{st.backoff_mult(name):g}배로 늘립니다)")
     elif kind == "ok" and cur > 1.0:
         st.set_backoff_mult(name, max(1.0, cur * 0.75))
 
@@ -552,9 +581,9 @@ def _next_due(st: AutoState, auto: dict, names: list[str],
             seen = _last_sync_at(name)
         except Exception:      # noqa: BLE001
             continue
-        if seen is None:
+        when = _due_at(st, name, seen, interval, now)
+        if when is None:
             return "곧"
-        when = seen + _dt.timedelta(seconds=interval * st.backoff_mult(name))
         if soonest is None or when < soonest:
             soonest = when
     return f"{soonest:%H:%M}" if soonest else "-"
@@ -686,19 +715,74 @@ def _settle_bulk_holds(st: AutoState,
             _release_bulk_hold(st, name)
 
 
-def _print_bulk_banner(holds: list[tuple[str, dict | None]], *, key_hint: bool = True) -> None:
+def _print_bulk_banner(holds: list[tuple[str, dict | None]], *, key_hint: bool = True,
+                       recheck: dict[str, _dt.datetime | None] | None = None,
+                       now: _dt.datetime | None = None) -> None:
     """보류를 알리는 블록. 알린 뒤에는 그 전에 쌓인 키를 버린다 — 보류를 보기도 전에
-    눌린 y 가 '계획 보기'를 열면 안 된다."""
+    눌린 y 가 '계획 보기'를 열면 안 된다.
+
+    끝은 **질문**이다([y/N]). "y 를 누르면 ~합니다"라는 안내문은 사용자 눈에 질문으로
+    읽히지 않았다(2026-11-11 — "Y/N 으로 묻게 해 달라" 요구 뒤에도 "같은 현상"). 답은
+    대기 중 아무 때나 받는다 — 묻는 자리가 루프를 붙잡지 않는다는 조건은 그대로다."""
     print("    " + "-" * 62)
     for name, hold in holds:
         why = (hold or {}).get("why") or "삭제 대상이 임계를 넘음"
         print(f"    {name}: 대량 삭제로 판단해 이 폴더의 동기화를 멈췄습니다 — {why}.")
-        print("      아무것도 지우지 않았습니다.")
+        print(f"      아무것도 지우지 않았습니다.{_recheck_text(recheck, name, now)}")
     if key_hint:
-        print("    → 이 창에서 y 를 누르면 지울 계획을 먼저 보여 주고, 진행할지 y/N 으로 묻습니다.")
-        print("      누르지 않으면 보류된 채로 둡니다(다른 폴더의 자동 동기화는 계속됩니다).")
+        print("    지울 계획을 보고 처리할까요? [y/N]")
+        print("      y — 지울 계획을 먼저 보여 주고, 정말 지울지 한 번 더 묻습니다.")
+        print("      답하지 않으면 보류된 채로 두고, 다른 폴더의 자동 동기화는 계속합니다.")
     print("    " + "-" * 62)
     keys.drain()
+
+
+def _recheck_text(recheck: dict[str, _dt.datetime | None] | None, name: str,
+                  now: _dt.datetime | None) -> str:
+    """'그대로 두면 HH:MM 에 다시 확인합니다' — 이미 지난 시각은 적지 않는다.
+
+    창을 다음 날 아침에 다시 띄우면 어제 세운 보류의 시각(어제 21:30)이 오늘 밤처럼
+    읽혔다(2026-11-11 검토 재현). 지났으면 '곧', 오늘이 아니면 날짜를 붙인다."""
+    if recheck is None or name not in recheck:
+        return ""
+    when = recheck[name]
+    if when is None or (now is not None and when <= now):
+        return " 곧 다시 확인합니다."
+    fmt = "%H:%M" if now is None or when.date() == now.date() else "%m-%d %H:%M"
+    return f" 그대로 두면 {when:{fmt}} 에 다시 확인합니다."
+
+
+_NO_KEYS = frozenset({"n", "N", "ㅜ", "\x1b"})
+_NO_WORDS = frozenset({"", "n", "no", "아니", "아니오", "아니요"})
+
+
+def _first_answer(typed: str, line: str = "") -> tuple[str, str]:
+    """대기 중에 눌린 키들에서 [y/N] 답을 고른다 — (답, 아직 Enter 를 기다리는 글자).
+    답은 'yes'|'no'|'' 이고 먼저 나온 답이 이긴다.
+
+    - y·Y·ㅛ 는 누르는 즉시 '예'다(Enter 불필요 — 여는 것은 아무것도 바꾸지 않는
+      미리보기다). 한글 상태의 ㅛ 는 조합 중이라 Enter 로 확정될 때 함께 들어온다.
+    - n·N·ㅜ·Esc 는 즉시 '아니오'.
+    - 그 밖의 글자는 모았다가 Enter 에서 한 줄로 읽는다. 「예」「네」「yes」는 '예'
+      (지울지 묻는 질문 keys.ask 와 같은 낱말), 빈 줄·「아니오」는 '아니오', 나머지는
+      무시한다. 2026-11-11 검토: '네' + Enter 가 이 질문에선 '아니오', 바로 다음 질문에선
+      '예'로 읽혔다 — 한 흐름의 두 [y/N] 이 같은 답을 반대로 읽으면 안 된다.
+    지울지는 여기서 정하지 않는다 — 그것은 미리보기 뒤 keys.ask 가 따로 묻는다."""
+    for c in typed:
+        if c in keys.YES_KEYS:
+            return "yes", ""
+        if c in _NO_KEYS:
+            return "no", ""
+        if c in ("\r", "\n"):
+            word, line = line.strip().casefold(), ""
+            if word in keys.YES_WORDS:
+                return "yes", ""
+            if word in _NO_WORDS:
+                return "no", ""
+            continue
+        if c.isprintable():
+            line = (line + c)[-16:]
+    return "", line
 
 
 def _flow_runner(name: str):
@@ -800,10 +884,17 @@ def _idle_wait(st: AutoState, seconds: int, *, should_stop, only: list[str] | No
     """
     end = clock() + max(0, int(seconds))
     names = auto_profiles(only) if "--dry-run" not in extra else []
+    said_no = False
+    line = ""
     while not should_stop() and clock() < end:
         if names and _bulk_holds(st, names):
-            typed = keys.drain()
-            if any(c in keys.YES_KEYS for c in typed):
+            answer, line = _first_answer(keys.drain(), line)
+            if answer == "no" and not said_no:
+                # [y/N] 로 물었으니 N 에도 대답한다 — 아무 반응이 없으면 눌린 줄 모른다.
+                said_no = True
+                _end_idle()
+                print("    보류된 채로 둡니다 — 이 창에서 y 를 누르면 언제든 다시 묻습니다.")
+            if answer == "yes":
                 # 설정 파일이 잠깐 잠긴 순간(백신 검사·편집기 저장) y 를 눌러도 루프 전체가
                 # 죽으면 안 된다 — 틱과 같은 규율로 감싼다(2026-11-10 검토에서 재현).
                 try:
@@ -843,7 +934,7 @@ def _tick(st: AutoState, extra: list[str], only: list[str] | None) -> None:
         nxt = _next_event(st, auto, names, now)
         held = _bulk_holds(st, names) if "--dry-run" not in extra else []
         if held:
-            nxt += f" | 삭제 보류 {len(held)}개: y"
+            nxt += f" | 삭제 보류 {len(held)}개: y/N"
         _print_idle(f"[{stamp}] 대기 중{nxt}")
     else:
         _end_idle()
@@ -865,13 +956,17 @@ def _tick(st: AutoState, extra: list[str], only: list[str] | None) -> None:
         # 보류 시각은 그 실행이 **끝난** 때다. 틱 시작 시각을 쓰면, 스윕에서 앞 프로파일이
         # 도는 사이 그 폴더를 손으로 동기화한 기록(last_sync_at)이 '보류 뒤에 풀렸다'로
         # 잘못 읽혀 방금 세운 보류가 다음 틱에 지워진다(검토 재현).
-        hold = _update_bulk_hold(st, name, report, _now(), extra)
+        ended = _now()
+        hold = _update_bulk_hold(st, name, report, ended, extra)
         if hold:
             msg = f"보류 — 대량 삭제({hold['why']}). 이 폴더는 처리할 때까지 동기화되지 않습니다"
         print(f"    {name}: {msg}")
+        # 주기를 먼저 고친다 — 알림 블록이 적는 '다시 확인' 시각이 고친 주기로 계산돼야 한다.
+        _apply_backoff(st, name, kind, report, quiet=bool(hold))
         if hold:
-            _print_bulk_banner([(name, hold)])
-        _apply_backoff(st, name, kind, report)
+            when = _due_at(st, name, last_sync.get(name),
+                           float(auto["min_interval_sec"]), ended)
+            _print_bulk_banner([(name, hold)], recheck={name: when}, now=ended)
         _note_outcome(st, name, kind, msg, report, now)
 
     st.last_tick = now.isoformat(timespec="seconds")
@@ -975,10 +1070,22 @@ def run_loop(*, only: list[str] | None = None, extra: list[str] | None = None) -
     # 지난 실행이 남긴 대량 삭제 보류 — 창을 새로 띄웠어도 그 폴더는 여전히 멈춰 있다.
     try:
         start_names = auto_profiles(only)
-        _settle_bulk_holds(st, _last_sync_map(start_names))
+        start_sync = _last_sync_map(start_names)
+        _settle_bulk_holds(st, start_sync)
         held = [n for n in _bulk_holds(st, start_names) if "--dry-run" not in (extra or [])]
-        if held:
-            _print_bulk_banner([(n, _bulk_hold(st, n)) for n in held])
+        at = _now()
+        # 첫 틱이 곧바로 다시 돌릴 폴더(기동 스윕·이미 차례)는 여기서 묻지 않는다 — 그
+        # 실행이 끝나면 새 알림이 나오고, 그 알림이 앞서 눌린 키를 버린다. 여기서 물으면
+        # 사람이 그 사이에 누른 답이 소리 없이 사라진다(2026-11-11 검토 재현).
+        first = decide(st, auto, [n for n in start_names if n in start_sync],
+                       now=at, last_sync=start_sync) if held else None
+        show = [n for n in held if first is not None and n not in first.names]
+        if show:
+            _print_bulk_banner(
+                [(n, _bulk_hold(st, n)) for n in show],
+                recheck={n: _due_at(st, n, start_sync.get(n),
+                                    float(auto["min_interval_sec"]), at) for n in show},
+                now=at)
     except Exception as exc:   # noqa: BLE001 — 안내 실패가 루프를 막지 않는다
         print(f"    (삭제 보류 안내를 건너뜀 — {type(exc).__name__}: {exc})")
 

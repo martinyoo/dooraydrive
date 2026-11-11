@@ -615,7 +615,8 @@ def test_tick_announces_the_hold_and_how_to_open_it(monkeypatch, capsys):
     st = AutoState({})
     runner._tick(st, [], None)
     out = capsys.readouterr().out
-    assert "y 를 누르면" in out and "56건" in out
+    assert "처리할까요? [y/N]" in out and "56건" in out
+    assert "다시 확인합니다" in out
     assert "폴더에서 직접 실행해" not in out
     assert runner._bulk_holds(st, ["W"]) == ["W"]
     assert drained, "알리기 전에 눌린 키를 버리지 않았다"
@@ -645,6 +646,178 @@ def test_dry_run_loop_never_advertises_y(monkeypatch, capsys):
     assert "삭제 보류" not in capsys.readouterr().out
 
 
+def test_hold_banner_names_the_recheck_time_and_drops_the_streak_line(monkeypatch, capsys):
+    """주기를 먼저 고치고 그 주기로 '다시 확인' 시각을 적는다. '(연속 N회 … 늘립니다)'는
+    그 시각이 대신하므로 보류에는 찍지 않는다."""
+    _tick_env(monkeypatch, BULK)
+    st = AutoState({})
+    st.profile("W")["fail_streak"] = 2                          # 이번이 3회째 → x2
+    runner._tick(st, [], None)
+    out = capsys.readouterr().out
+    assert st.backoff_mult("W") == 2.0
+    assert "11:56 에 다시 확인합니다" in out                      # 10:56 + 30분 x2
+    assert "주기를" not in out
+
+
+def test_recheck_time_counts_from_when_the_child_finished(monkeypatch, capsys):
+    """보류 시각과 '다시 확인' 시각은 실행이 **끝난** 때부터다 — 틱 시작 시각으로 세면
+    보류 시각이 '미래'로 보여 버려지고, 시각이 닷새 전 기준으로 돌아간다."""
+    _tick_env(monkeypatch, BULK)
+    later = NOW + runner._dt.timedelta(minutes=10)
+    clock = iter([NOW, later])
+    monkeypatch.setattr(runner, "_now", lambda: next(clock, later))
+    monkeypatch.setattr(runner, "_last_sync_map", lambda names: {"W": STALE})
+    runner._tick(AutoState({}), [], None)
+    assert "11:36 에 다시 확인합니다" in capsys.readouterr().out   # 11:06 + 30분
+
+
+@pytest.mark.parametrize("when, want", [
+    (NOW - runner._dt.timedelta(minutes=1), "곧 다시 확인합니다"),
+    (NOW, "곧 다시 확인합니다"),
+    (None, "곧 다시 확인합니다"),
+    (NOW + runner._dt.timedelta(hours=1), "그대로 두면 11:56 에 다시 확인합니다"),
+    (NOW + runner._dt.timedelta(days=1), "그대로 두면 11-11 10:56 에 다시 확인합니다"),
+])
+def test_banner_never_promises_a_time_that_has_passed(capsys, monkeypatch, when, want):
+    monkeypatch.setattr(keys, "drain", lambda backend=None: "")
+    runner._print_bulk_banner([("W", {"why": "x"})], recheck={"W": when}, now=NOW)
+    assert want in capsys.readouterr().out
+
+
+def _run_loop_start(monkeypatch, capsys, *, now, last_tick, hold_at, mult=8.0):
+    """run_loop 를 첫 틱 직전까지만 돌린다(_tick 이 KeyboardInterrupt 로 루프를 끝낸다)."""
+    import signal
+
+    from dooray_sync.auto import launcher
+    st = AutoState({"last_tick": last_tick.isoformat(timespec="seconds"),
+                    "day_start": (last_tick - runner._dt.timedelta(hours=2)).isoformat(
+                        timespec="seconds")})
+    st.profile("W")["bulk_hold"] = {"why": "삭제 대상 56건 ≥ 임계 50건", "count": 56,
+                                   "at": hold_at.isoformat(timespec="seconds")}
+    st.set_backoff_mult("W", mult)
+    st.save()
+    monkeypatch.setattr(launcher, "disable_quickedit", lambda: True)
+    monkeypatch.setattr(runner, "load_auto", lambda: {
+        "tick_sec": 120, "min_interval_sec": 1800, "day_gap_hours": 4, "work_hours": 9,
+        "max_auto_deletes": 20, "max_auto_delete_mb": 200})
+    monkeypatch.setattr(runner, "auto_profiles", lambda only=None: ["W"])
+    monkeypatch.setattr(runner, "_last_sync_map", lambda names: {"W": STALE})
+    monkeypatch.setattr(runner, "_now", lambda: now)
+    monkeypatch.setattr(keys, "drain", lambda backend=None: "")
+
+    def _first_tick(*a, **k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(runner, "_tick", _first_tick)
+    old = signal.getsignal(signal.SIGINT)
+    try:
+        assert runner.run_loop() == 0
+    finally:
+        signal.signal(signal.SIGINT, old)
+    return capsys.readouterr().out
+
+
+def test_loop_start_banner_asks_with_the_real_recheck_time(monkeypatch, capsys):
+    out = _run_loop_start(monkeypatch, capsys, now=NOW + runner._dt.timedelta(minutes=10),
+                          last_tick=NOW + runner._dt.timedelta(minutes=8), hold_at=NOW)
+    assert "처리할까요? [y/N]" in out and "14:56 에 다시 확인합니다" in out
+
+
+@pytest.mark.parametrize("now, last_tick, hold_at", [
+    # 다음 날 아침 로그온 — 첫 틱이 기동 스윕으로 곧바로 다시 돌린다
+    (NOW + runner._dt.timedelta(hours=22), NOW + runner._dt.timedelta(hours=7), NOW),
+    # 같은 날 다시 띄움 — 보류 시각 + 주기가 이미 지나 첫 틱이 곧바로 돌린다
+    (NOW + runner._dt.timedelta(hours=5), NOW + runner._dt.timedelta(hours=4, minutes=58), NOW),
+])
+def test_loop_start_does_not_ask_about_a_folder_the_first_tick_reruns(
+        monkeypatch, capsys, now, last_tick, hold_at):
+    """그 실행이 끝나면 새 알림이 앞서 눌린 키를 버린다 — 여기서 물으면 답이 사라진다.
+    지난 시각('어제 21:30')을 오늘처럼 적는 일도 없다."""
+    out = _run_loop_start(monkeypatch, capsys, now=now, last_tick=last_tick, hold_at=hold_at)
+    assert "처리할까요?" not in out and "다시 확인합니다" not in out
+
+
+def test_streak_line_still_shows_for_other_failures(monkeypatch, capsys):
+    _tick_env(monkeypatch, {"outcome": "failed", "fault": "network_offline"})
+    st = AutoState({})
+    st.profile("W")["fail_streak"] = 2
+    runner._tick(st, [], None)
+    assert "연속 3회 같은 결과" in capsys.readouterr().out
+
+
+STALE = runner._dt.datetime(2026, 11, 6, 9, 12)             # 닷새 전의 마지막 동기화
+
+
+def _loop_env(monkeypatch):
+    """decide 를 갈아 끼우지 않는 틱 환경 — 판정과 보류가 **함께** 도는지 본다.
+    0.3.3 의 틱 테스트는 전부 decide 를 가짜로 바꿔, 보류된 폴더가 매 틱 다시 도는 것을
+    보지 못했다(2026-11-11 사용자 화면: WRITING 776회)."""
+    monkeypatch.setattr(runner, "load_auto", lambda: {
+        "tick_sec": 120, "min_interval_sec": 1800, "day_gap_hours": 4, "work_hours": 9,
+        "max_auto_deletes": 20, "max_auto_delete_mb": 200})
+    monkeypatch.setattr(runner, "auto_profiles", lambda only=None: ["A", "W"])
+    monkeypatch.setattr(runner, "_reconcile", lambda st, names: None)
+    monkeypatch.setattr(runner, "_write_status", lambda *a, **k: None)
+    monkeypatch.setattr(keys, "drain", lambda backend=None: "")
+    clock = {"t": NOW}
+    synced = {"A": NOW - runner._dt.timedelta(minutes=10), "W": STALE}
+    runs: list[tuple[str, runner._dt.datetime]] = []
+
+    def _child(name, auto, extra):
+        runs.append((name, clock["t"]))
+        if name == "A":
+            synced["A"] = clock["t"]             # 게이트를 지난 실행만 last_sync_at 을 남긴다
+            return 0
+        return 1
+
+    monkeypatch.setattr(runner, "_now", lambda: clock["t"])
+    monkeypatch.setattr(runner, "_last_sync_map", lambda names: {n: synced[n] for n in names})
+    monkeypatch.setattr(runner, "_run_child", _child)
+    monkeypatch.setattr(runner, "_read_report",
+                        lambda name: dict(BULK) if name == "W" else {"outcome": "ok", "fault": "ok"})
+    st = AutoState({"last_tick": (NOW - runner._dt.timedelta(minutes=2)).isoformat(),
+                    "day_start": (NOW - runner._dt.timedelta(hours=1)).isoformat()})
+    return st, clock, runs
+
+
+def test_held_profile_is_not_rerun_every_tick(monkeypatch):
+    """대량 삭제로 멈춘 실행은 last_sync_at 을 남기지 않는다. 마지막 동기화만 보고 차례를
+    정하면 그 폴더는 **매 틱** 다시 돈다 — 3시간이면 90번. 보류 시각부터 주기를 센다."""
+    st, clock, runs = _loop_env(monkeypatch)
+    for _ in range(90):                                      # 2분 틱 x 90 = 3시간
+        runner._tick(st, [], None)
+        runner._end_idle()
+        clock["t"] += runner._dt.timedelta(minutes=2)
+    held = [t for n, t in runs if n == "W"]
+    assert 1 <= len(held) <= 5, f"보류된 폴더가 {len(held)}번 돌았다"
+    gaps = [(b - a).total_seconds() for a, b in zip(held, held[1:])]
+    assert all(g >= 1800 for g in gaps), gaps                # 평시 주기보다 촘촘히 돌지 않는다
+    assert gaps == sorted(gaps), "연속 보류인데 주기가 늘지 않았다"
+    assert len([n for n, _ in runs if n == "A"]) >= 5        # 다른 폴더는 굶지 않는다
+
+
+def test_hold_released_elsewhere_resumes_the_normal_schedule(monkeypatch):
+    """그 폴더의 synchere.bat 에서 처리하면 다음 틱에 보류가 풀리고 주기도 x1 로 — 늦어도
+    평시 주기 안에 평소대로 돈다."""
+    st, clock, runs = _loop_env(monkeypatch)
+    runner._tick(st, [], None)                               # W 보류
+    assert runner._bulk_holds(st, ["W"]) == ["W"]
+    clock["t"] += runner._dt.timedelta(minutes=5)
+    monkeypatch.setattr(runner, "_last_sync_map",
+                        lambda names: {"A": clock["t"], "W": clock["t"]})
+    runner._tick(st, [], None)
+    assert runner._bulk_holds(st, ["W"]) == [] and st.backoff_mult("W") == 1.0
+
+
+def test_idle_line_names_the_held_profiles_recheck_time(monkeypatch):
+    st, clock, _ = _loop_env(monkeypatch)
+    runner._update_bulk_hold(st, "W", BULK, NOW, [])
+    st.set_backoff_mult("W", 8)
+    monkeypatch.setattr(runner, "_last_sync_at", lambda name: STALE)
+    nxt = runner._next_due(st, runner.load_auto(), ["W"], NOW + runner._dt.timedelta(minutes=2))
+    assert nxt == "14:56"                                    # 10:56 + 30분 x8 — 닷새 전 시각이 아니다
+
+
 def test_tick_regular_child_keeps_unattended_guards(monkeypatch):
     """평소 틱의 자식 명령은 그대로다 — 무인 인자가 빠지는 경로는 없다."""
     cmd = runner._child_cmd("W", {"max_auto_deletes": 20, "max_auto_delete_mb": 200}, [])
@@ -660,8 +833,8 @@ def test_idle_line_shows_the_pending_hold(monkeypatch, capsys):
     runner._tick(st, [], None)
     runner._end_idle()
     out = capsys.readouterr().out
-    assert "| 삭제 보류 1개: y" in out
-    worst = "[10:56:41] 대기 중  다음 동기화 11:20 · 퇴근 스윕 18:15 | 삭제 보류 9개: y"
+    assert "| 삭제 보류 1개: y/N" in out
+    worst = "[10:56:41] 대기 중  다음 동기화 11:20 · 퇴근 스윕 18:15 | 삭제 보류 19개: y/N"
     assert runner._display_width(worst) <= 78                 # 80칸 CP949 콘솔에서도 안 접힌다
 
 
@@ -707,6 +880,60 @@ def test_idle_wait_other_keys_do_nothing(monkeypatch):
     runner._update_bulk_hold(st, "W", BULK, NOW, [])
     handled, _ = _wait(monkeypatch, st, ["n", "\r", " "], seconds=3)
     assert handled == []
+
+
+@pytest.mark.parametrize("typed, want", [
+    ("", ""), ("abc ", ""), ("xY", "yes"), ("ㅛ\r", "yes"), ("\ry", "no"),
+    ("n", "no"), ("ㅜ", "no"), ("\x1b", "no"), ("N", "no"),
+    ("네\r", "yes"), ("예\r", "yes"), (" 네 \r", "yes"),      # 다음 질문(keys.ask)과 같은 낱말
+    ("아니오\r", "no"), ("abc\r", ""), ("abc\r\r", "no"),
+])
+def test_first_answer_takes_the_first_key_that_answers(typed, want):
+    assert runner._first_answer(typed)[0] == want
+
+
+def test_first_answer_keeps_a_half_typed_line_across_drains():
+    answer, line = runner._first_answer("네")
+    assert answer == "" and line == "네"
+    assert runner._first_answer("\r", line) == ("yes", "")
+
+
+def test_idle_wait_reads_ne_enter_as_yes_like_the_next_question(monkeypatch):
+    """'네' + Enter 가 이 질문에선 '아니오', 바로 다음 질문에선 '예'면 안 된다."""
+    st = AutoState({})
+    runner._update_bulk_hold(st, "W", BULK, NOW, [])
+    assert "네" in keys.YES_WORDS
+    handled, _ = _wait(monkeypatch, st, ["네", "", "\r"])
+    assert handled == [["W"]]
+
+
+def test_idle_wait_no_reply_starts_on_its_own_line(monkeypatch, capsys):
+    """대기 줄은 \r 로 제자리 갱신 중이다 — 대답을 그 줄 뒤에 붙이면 안 된다."""
+    st = AutoState({})
+    runner._update_bulk_hold(st, "W", BULK, NOW, [])
+    runner._print_idle("[10:58:41] 대기 중 | 삭제 보류 1개: y/N")
+    _wait(monkeypatch, st, ["n"], seconds=2)
+    runner._end_idle()
+    line = next(x for x in capsys.readouterr().out.split("\n") if "보류된 채로 둡니다" in x)
+    assert line.lstrip("\r").startswith("    보류된 채로 둡니다")
+
+
+def test_idle_wait_answers_n_once_and_keeps_waiting(monkeypatch, capsys):
+    """[y/N] 로 물었으니 N 에도 대답한다 — 그러나 보류를 지우지도, 대기를 끊지도 않는다."""
+    st = AutoState({})
+    runner._update_bulk_hold(st, "W", BULK, NOW, [])
+    handled, reads = _wait(monkeypatch, st, ["n", "\r", "n"], seconds=3)
+    out = capsys.readouterr().out
+    assert handled == [] and out.count("보류된 채로 둡니다") == 1
+    assert len(reads) > 3, "N 뒤에 대기를 끊었다"
+    assert runner._bulk_holds(st, ["W"]) == ["W"]
+
+
+def test_idle_wait_y_after_n_still_opens(monkeypatch):
+    st = AutoState({})
+    runner._update_bulk_hold(st, "W", BULK, NOW, [])
+    handled, _ = _wait(monkeypatch, st, ["\r", "", "y"])
+    assert handled == [["W"]]
 
 
 def test_idle_wait_honours_stop(monkeypatch):

@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import datetime as dt
 
+import pytest
+
 from dooray_sync.auto.runner import decide
 from dooray_sync.auto.state import AutoState
 
@@ -137,6 +139,71 @@ def test_missing_day_start_forces_start_sweep():
     d = decide(st, AUTO, ["a"], now=MON.replace(hour=10, minute=2),
                last_sync={"a": MON.replace(hour=10)})
     assert d.kind == "sweep_start"
+
+
+def _held(now: dt.datetime, at: dt.datetime | str, mult: float = 8.0) -> AutoState:
+    st = _st(last_tick=(now - dt.timedelta(minutes=2)).isoformat(),
+             day_start=now.replace(hour=7, minute=0).isoformat())
+    stamp = at if isinstance(at, str) else at.isoformat(timespec="seconds")
+    st.profile("w")["bulk_hold"] = {"why": "삭제 대상 56건", "count": 56, "at": stamp}
+    st.set_backoff_mult("w", mult)
+    return st
+
+
+def test_bulk_held_profile_counts_from_the_hold_not_the_last_sync():
+    """대량 삭제 보류는 last_sync_at 을 남기지 않는다 — 마지막 동기화가 닷새 전이어도
+    보류 직후에는 차례가 아니다. 2026-11-11 실측: 이 판정이 없어 WRITING 이 2분마다
+    776회 다시 돌았다."""
+    now = MON.replace(hour=10)
+    stale = now - dt.timedelta(days=5)
+    st = _held(now, now - dt.timedelta(minutes=2))
+    assert decide(st, AUTO, ["w"], now=now, last_sync={"w": stale}).kind == "idle"
+    just_before = now + dt.timedelta(hours=4, minutes=-3)
+    st.last_tick = (just_before - dt.timedelta(minutes=2)).isoformat()
+    assert decide(st, AUTO, ["w"], now=just_before, last_sync={"w": stale}).kind == "idle"
+    after = now + dt.timedelta(hours=4)                      # 보류 시각 + 30분 x8
+    st.last_tick = (after - dt.timedelta(minutes=2)).isoformat()
+    d = decide(st, AUTO, ["w"], now=after, last_sync={"w": stale})
+    assert d.kind == "due" and d.names == ["w"]
+
+
+def test_bulk_held_profile_that_never_synced_is_not_due_at_once():
+    now = MON.replace(hour=10)
+    st = _held(now, now - dt.timedelta(minutes=2), mult=1.0)
+    assert decide(st, AUTO, ["w"], now=now, last_sync={"w": None}).kind == "idle"
+
+
+def test_bulk_held_profile_does_not_take_other_profiles_turn():
+    now = MON.replace(hour=10)
+    st = _held(now, now - dt.timedelta(minutes=2))
+    d = decide(st, AUTO, ["a", "w"], now=now,
+               last_sync={"a": now - dt.timedelta(minutes=40), "w": now - dt.timedelta(days=5)})
+    assert d.kind == "due" and d.names == ["a"]
+
+
+@pytest.mark.parametrize("at", ["", "언젠가", "2026-08-17T99:00:00"])
+def test_unreadable_hold_time_falls_back_to_the_last_sync(at):
+    now = MON.replace(hour=10)
+    st = _held(now, at)
+    d = decide(st, AUTO, ["w"], now=now, last_sync={"w": now - dt.timedelta(days=5)})
+    assert d.kind == "due"
+
+
+def test_hold_time_in_the_future_is_ignored():
+    """시계가 뒤로 간 PC — 미래의 보류 시각에 묶이면 시계가 따라잡을 때까지 안 돈다."""
+    now = MON.replace(hour=10)
+    st = _held(now, now + dt.timedelta(days=2))
+    d = decide(st, AUTO, ["w"], now=now, last_sync={"w": now - dt.timedelta(days=5)})
+    assert d.kind == "due"
+
+
+def test_sweeps_still_include_a_held_profile():
+    """출근·퇴근 스윕은 전체 한 바퀴다 — 보류된 폴더도 그때는 다시 확인한다."""
+    now = MON.replace(hour=15, minute=45)
+    st = _held(now, now - dt.timedelta(minutes=2))
+    d = decide(st, AUTO, ["a", "w"], now=now,
+               last_sync={"a": now - dt.timedelta(minutes=5), "w": now - dt.timedelta(days=5)})
+    assert d.kind == "sweep_eod" and d.names == ["a", "w"]
 
 
 def test_no_auto_profiles_is_idle():
