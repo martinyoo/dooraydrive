@@ -37,7 +37,7 @@ from .differ import (
     Decision,
 )
 
-__all__ = ["Action", "Plan", "BulkDeleteAbort", "plan", "ACTION_LABEL"]
+__all__ = ["Action", "Plan", "BulkDeleteAbort", "BULK_DELETE_FLAG_HINT", "plan", "ACTION_LABEL"]
 
 # 계획 표에 쓰는 한국어 라벨
 ACTION_LABEL = {
@@ -82,8 +82,43 @@ _ORDER = {
 }
 
 
+# 대량 삭제로 멈췄을 때 마지막에 붙는 안내(두 줄). 사람이 직접 `dsync sync` 를 친 경우의
+# 문구다 — 무인 실행(자동 동기화 창)은 CLI 가 이 두 줄을 '창에서 y' 안내로 바꿔 찍는다
+# (BulkDeleteAbort.text). 그 창에는 명령을 칠 사람이 없으므로 명령이 한 줄도 남으면 안 된다.
+BULK_DELETE_FLAG_HINT = (
+    "  의도한 삭제가 맞다면 --allow-bulk-delete 를 붙여 다시 실행하세요.\n"
+    "  아니라면 원격/로컬 어느 쪽이 통째로 사라졌는지 먼저 확인하세요"
+    "('dsync sync --full --dry-run').")
+
+
 class BulkDeleteAbort(RuntimeError):
-    """대량 삭제 임계 초과. 실행 **전에** 전체를 중단시킨다(C5)."""
+    """대량 삭제 임계 초과. 실행 **전에** 전체를 중단시킨다(C5).
+
+    메시지 문자열뿐 아니라 판정 근거를 속성으로 들고 간다 — 무인 러너가 보고서(JSON)에
+    옮겨, 화면 문구를 다시 해석하지 않게 하려고(문구가 바뀌어도 안 깨지게).
+      why     : '삭제 대상 56건 ≥ 임계 50건' 같은 한 줄 판정
+      count   : 실제로 사라질 항목 수(폴더는 하위 전체)
+      actions : 삭제 동작 수
+    """
+
+    def __init__(self, message: str = "", *, why: str = "", count: int = 0,
+                 actions: int = 0, body: str = "") -> None:
+        super().__init__(message)
+        self.why = why
+        self.count = count
+        self.actions = actions
+        self._body = body          # 안내 줄 자리(_HINT_SLOT)를 남긴 본문 — text() 가 채운다
+
+    def text(self, hint: str = BULK_DELETE_FLAG_HINT) -> str:
+        """안내 줄만 바꾼 메시지. 본문이 없으면(직접 만든 예외) 원문 그대로."""
+        if not self._body:
+            return str(self)
+        return self._body.replace(_HINT_SLOT, hint)
+
+
+# 안내 줄 자리 표시. 경로에 들어갈 수 없는 NUL 로 감싼다 — 파일 이름이 우연히 같은
+# 글자를 담아도 그 자리가 바뀌지 않게.
+_HINT_SLOT = "\0HINT\0"
 
 
 @dataclass(frozen=True)
@@ -211,14 +246,15 @@ def plan(decisions: Sequence[Decision], *, base_count: int = 0, p: Profile | Non
             sample = "\n".join(
                 f"    - {d.rel_path}" + ("  (폴더 — 하위 전체)" if d.is_dir else "")
                 for d in deletes[:10])
-            raise BulkDeleteAbort(
+            body = (
                 f"대량 삭제로 판단해 **아무것도 실행하지 않고** 중단했습니다: {why}\n"
                 f"{sample}\n"
                 f"    ... 삭제 동작 {len(deletes)}건 / 실제로 사라질 항목 {effective}건\n"
-                "  의도한 삭제가 맞다면 --allow-bulk-delete 를 붙여 다시 실행하세요.\n"
-                "  아니라면 원격/로컬 어느 쪽이 통째로 사라졌는지 먼저 확인하세요"
-                "('dsync sync --full --dry-run')."
+                f"{_HINT_SLOT}"
             )
+            raise BulkDeleteAbort(
+                body.replace(_HINT_SLOT, BULK_DELETE_FLAG_HINT),
+                why=why, count=effective, actions=len(deletes), body=body)
 
     # 6) 정렬 + 집계
     for d in sorted(live, key=lambda x: (_ORDER.get(x.kind, 9), _depth(x.key), x.key)):

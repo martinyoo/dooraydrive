@@ -1873,6 +1873,51 @@ def test_prompt_baseline_reasks_on_typo_but_is_finite():
         builtins.input = orig
 
 
+def test_prompt_baseline_reasks_on_a_blocked_choice_instead_of_skipping():
+    """막아 둔 선택지를 고르면 사유를 말하고 **되묻는다** — 그 건을 건너뛰지 않는다.
+
+    2026-09-21 실측(실계정): 막아 둔 1을 화면 목록에서 **지웠더니** 화면이 2부터
+    시작했고, 사용자는 당연히 1을 눌렀으며, 도구는 사유만 말하고 그 파일을 건너뛰었다.
+    오입력 안내는 그때도 "1, 2, 3 중 하나"라고 말하고 있었다 — 화면·입력 검증·실제
+    동작 셋이 서로 다른 말을 했다. 계약은 오타와 같다: 되묻되 유한.
+    """
+    import builtins
+
+    from dooray_sync.cli import main as cli
+    typed = iter(["1", "2"])
+    orig = builtins.input
+    builtins.input = lambda _="": next(typed)
+    try:
+        got = cli._prompt_baseline(blocked=cli._BASELINE_BLOCKED)
+        assert got == "remote", f"막힌 1 뒤에 2를 눌렀는데 {got!r} — 되묻지 않았다"
+        exhausted = False
+        try:
+            next(typed)
+        except StopIteration:
+            exhausted = True
+        assert exhausted, "입력을 다 쓰지 않았다 — 되묻지 않고 빠져나갔다"
+    finally:
+        builtins.input = orig
+
+
+def test_decide_diffs_shows_the_blocked_choice_and_wires_it_to_the_prompt():
+    """결선을 소스로 고정한다 — 화면에서 1을 지우고 끝내면 그 자리로 되돌아간다.
+
+    `blocked=`를 빼먹으면 `_prompt_baseline`은 다시 'local'을 돌려주고, 되돌릴 수
+    없는 쪽이 조용히 실행된다(그래서 `_decide_diffs`에 방어선도 함께 둔다).
+    """
+    import inspect
+
+    from dooray_sync.cli import main as cli
+    src = inspect.getsource(cli._decide_diffs)
+    assert "blocked=_BASELINE_BLOCKED" in src, (
+        "_prompt_baseline 에 차단 표를 넘기지 않는다 — 막아 둔 번호가 그대로 통과한다")
+    assert "1) 로컬 것을 살린다" in src, (
+        "화면에서 1을 지웠다 — 목록이 2부터 시작하면 사람은 1을 누르고, "
+        "그 입력이 어디로 가는지 화면이 설명하지 못한다")
+    assert "local" in cli._BASELINE_BLOCKED, "차단 표가 비었다"
+
+
 def test_remote_move_without_baseline_protects_local():
     """기준선이 없으면 이동이 끼어도 로컬을 덮지 않는다 — 이동 없을 때와 같은 판단이어야."""
     old, new = path_key("a.txt"), path_key("sub/a.txt")
