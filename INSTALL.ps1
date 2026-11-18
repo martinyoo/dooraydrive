@@ -12,12 +12,17 @@
 #   .\INSTALL.ps1 -OfferUpdate
 #                           설치된 폴더 안에서 실행됐을 때, 설치를 시작하기 전에
 #                           갱신할지 먼저 묻는다. 설치.bat만 이 스위치를 붙인다.
+#   .\INSTALL.ps1 -ResetToken
+#                           토큰이 이미 있어도 묻지 않고 바로 새로 입력받는다.
+#                           (대화형으로는 4단계에서 번호로 고를 수 있다)
 param(
   [switch]$Check,
   # 설치.bat이 '프로그램 폴더 안의 사본'이라고 판단했을 때만 붙인다.
   [switch]$OfferUpdate,
   # 롤백 지정(`설치.bat v0.2.0`)이 있었으면 그 이름. 질문에 그대로 보여 준다.
-  [string]$UpdateVersion
+  [string]$UpdateVersion,
+  # 토큰 재발급·만료·계정 이전 시. 묻지 않고 곧장 다시 입력받는다.
+  [switch]$ResetToken
 )
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
@@ -267,17 +272,14 @@ $($verify.Err)
 
 # --------------------------------------------------------------------- 4) 토큰
 Head "4/5  Dooray API 토큰"
-$tokenState = 'N'
-if ($py -and (Invoke-Py '-c' 'import keyring').Code -eq 0) {
-  $tokenState = (Invoke-Py '-c' "import keyring;t=keyring.get_password('dooray-sync','api-token');print('Y' if t else 'N')").Out
-}
-if (-not $py) {
-  Warn "Python이 없어 확인을 건너뜁니다 — 설치할 때 입력받습니다"
-} elseif ($tokenState -eq 'Y') {
-  Ok "이미 등록되어 있습니다 (다시 입력하지 않아도 됩니다)"
-} elseif ($Check) {
-  Warn "토큰이 등록되지 않았습니다 — 설치 중에 입력받습니다"
-} else {
+
+# 토큰을 받아 자격 증명 관리자에 넣는다. 'Y'/'N'을 돌려준다.
+#
+# 없을 때와 **바꿀 때**가 같은 코드를 쓴다. 두 벌로 두면 한쪽만 손보다가
+# 갈라진다 — 이 저장소가 AGENTS.md 두 벌로 하루 만에 겪은 일이다.
+# 화면에 토큰을 찍지 않고, 명령줄 인자로도 넘기지 않는다(작업 관리자·프로세스
+# 목록에 노출된다). stdin 으로만 넘긴다.
+function Read-TokenAndStore {
   Write-Host ""
   Write-Host "  Dooray 웹에서 토큰을 발급받아 주세요:" -ForegroundColor Yellow
   Write-Host "    우측 상단 프로필 > 개인설정 > API > 개인 인증 토큰 > 생성 > 복사" -ForegroundColor DarkGray
@@ -299,9 +301,55 @@ if (-not $py) {
   $plain = $null
   if ($rc -ne 0) { Die "토큰 저장에 실패했습니다." "Windows 자격 증명 관리자에 접근하지 못했습니다." }
 
-  $tokenState = (Invoke-Py '-c' "import keyring;t=keyring.get_password('dooray-sync','api-token');print('Y' if t else 'N')").Out
-  if ($tokenState -ne 'Y') { Die "토큰이 저장되지 않았습니다." "다시 실행해 주세요." }
+  $state = (Invoke-Py '-c' "import keyring;t=keyring.get_password('dooray-sync','api-token');print('Y' if t else 'N')").Out
+  if ($state -ne 'Y') { Die "토큰이 저장되지 않았습니다." "다시 실행해 주세요." }
   Ok "등록 완료 (Windows 자격 증명 관리자에 저장 — 설정 파일에는 남지 않습니다)"
+  return $state
+}
+
+$tokenState = 'N'
+if ($py -and (Invoke-Py '-c' 'import keyring').Code -eq 0) {
+  $tokenState = (Invoke-Py '-c' "import keyring;t=keyring.get_password('dooray-sync','api-token');print('Y' if t else 'N')").Out
+}
+if (-not $py) {
+  Warn "Python이 없어 확인을 건너뜁니다 — 설치할 때 입력받습니다"
+} elseif ($tokenState -eq 'Y' -and $Check) {
+  Ok "이미 등록되어 있습니다"
+} elseif ($tokenState -eq 'Y' -and $ResetToken) {
+  Info "이미 등록된 토큰을 새 토큰으로 바꿉니다(-ResetToken)."
+  $tokenState = Read-TokenAndStore
+} elseif ($tokenState -eq 'Y') {
+  Ok "이미 등록되어 있습니다"
+  # 토큰은 **바뀐다** — 재발급·만료·계정 이전. 그런데 여기는 "이미 있습니다"로
+  # 끝나 있었고, 바꾸려면 자격 증명 관리자를 손으로 지우고 다시 실행하는 수밖에
+  # 없었다. 시키기만 하는 기능은 없는 기능이다(AGENTS.md §화면이 명령을 시키면).
+  # 기본값은 안전한 쪽(그대로 사용)이고, 엔터·EOF·죽은 스트림·오입력 3회가 전부
+  # 거기로 떨어진다 — 되돌릴 수 없는 쪽에 기본값을 두지 않는다.
+  Write-Host ""
+  Write-Host "    1  그대로 사용 (기본값)" -ForegroundColor White
+  Write-Host "    2  새 토큰으로 다시 등록 — 토큰을 재발급했거나 연결이 거부될 때" -ForegroundColor White
+  Write-Host ""
+  $pick = ''
+  for ($i = 0; $i -lt 3 -and -not $pick; $i++) {
+    $ans = $null
+    try { $ans = Read-Host "  번호 (그냥 엔터 = 1)" } catch { $ans = $null }
+    if ($null -eq $ans) { break }                             # EOF·죽은 스트림
+    $ans = $ans.Trim()
+    if (-not $ans) { break }                                  # 엔터 = 기본값
+    # -match 가 아니라 -contains 다. 한글이 깨진 사본(BOM 없이 저장된 .ps1 은
+    # CP949 로 읽힌다)에서 정규식 안의 한글은 **무효 패턴**이 되고, 그러면
+    # ArgumentException 이 이 파일 머리의 $ErrorActionPreference='Stop' 아래에서
+    # 설치를 죽인다. literal 비교는 못 맞히기만 할 뿐 던지지 않는다 — 안전한
+    # 쪽으로 떨어진다(실측 2026-11-18, 검증용 해네스에서 그대로 재현).
+    if     (@('1','유지','keep','k')              -contains $ans.ToLower()) { $pick = 'keep' }
+    elseif (@('2','재등록','new','reset','r','n') -contains $ans.ToLower()) { $pick = 'new' }
+    else   { Warn "1 또는 2를 입력해 주세요." }
+  }
+  if ($pick -eq 'new') { $tokenState = Read-TokenAndStore }
+} elseif ($Check) {
+  Warn "토큰이 등록되지 않았습니다 — 설치 중에 입력받습니다"
+} else {
+  $tokenState = Read-TokenAndStore
 }
 
 # --------------------------------------------------------------------- 5) 연결
