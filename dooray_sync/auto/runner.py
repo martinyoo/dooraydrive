@@ -8,7 +8,8 @@
 틱 판정(설계):
   1. 출근 스윕 — 직전 틱과 day_gap_hours 이상 벌어진 뒤의 첫 틱
      (부팅·절전 복귀를 함께 잡고, 밤샘 가동 PC의 자정 틱 오인을 막는다)
-  2. 퇴근 스윕 — 평일이고 지금 >= 기동 + work_hours - 15분, 하루 1회
+  2. 퇴근 스윕 — 근무일의 기동 + work_hours - 15분, 평일, 근무일마다 1회
+     (근무일은 자정이 아니라 기동 시각에서 24시간씩 넘어간다 — day.py)
   3. 평시     — 프로파일당 min_interval_sec 간격, 틱당 가장 오래 밀린 1개
 """
 from __future__ import annotations
@@ -28,11 +29,13 @@ from .. import __version__
 from ..config import config_path, db_path, load_auto
 from ..util.paths import ext_path
 from . import keys, notify
+from .day import current_day, starts_new_day
+from .day import parse_iso as _parse
+from .day import summary as day_summary
 from .state import AutoState, auto_dir
 
 __all__ = ["run_loop", "run_once", "decide", "Decision"]
 
-EOD_LEAD = _dt.timedelta(minutes=15)     # 퇴근 몇 분 전에 스윕할까
 _REPO = Path(__file__).resolve().parent.parent.parent
 
 
@@ -50,13 +53,6 @@ class Decision:
 
 def _now() -> _dt.datetime:
     return _dt.datetime.now()
-
-
-def _parse(iso: str) -> _dt.datetime | None:
-    try:
-        return _dt.datetime.fromisoformat(iso) if iso else None
-    except ValueError:
-        return None
 
 
 def auto_profiles(only: list[str] | None = None) -> list[str]:
@@ -142,22 +138,18 @@ def decide(st: AutoState, auto: dict, names: list[str], *, now: _dt.datetime,
     if not names:
         return Decision("idle", [], "자동 대상 프로파일이 없습니다")
 
-    prev = _parse(st.last_tick)
-    start = _parse(st.day_start)
-    gap = _dt.timedelta(hours=float(auto["day_gap_hours"]))
-    # day_start가 없으면 무조건 기동으로 친다. 없으면 퇴근 스윕의 기준점이 없어
-    # **그날 퇴근 스윕이 영영 안 뜬다** — 상태 파일이 지워졌거나 --auto now가
-    # last_tick만 남긴 경우가 실제로 그렇게 된다. 자기 치유 경로.
-    if prev is None or start is None or now - prev >= gap:
+    # 기동·근무일·퇴근 스윕의 정의는 day.py 한 곳이다 — 표시(머리글·status.txt·
+    # --auto status)가 같은 함수를 본다. 여기서 따로 계산하면 화면이 판정과 갈라진다.
+    if starts_new_day(st, auto, now):
         return Decision("sweep_start", list(names),
                         "기동(첫 틱 또는 간격이 벌어짐) — 전체 한 바퀴")
 
-    if (start is not None and now.weekday() < 5
-            and st.last_eod_date != now.date().isoformat()):
-        eod = start + _dt.timedelta(hours=float(auto["work_hours"])) - EOD_LEAD
-        if now >= eod:
-            return Decision("sweep_eod", list(names),
-                            f"퇴근 스윕({eod:%H:%M}) — 전체 한 바퀴")
+    # '오늘 했나'를 지금의 날짜로 보면 밤새 켜 둔 PC가 자정에 어제의 스윕을 다시
+    # 돌리고 오늘 것을 지운다(2026-11-11 실측) — 근무일의 스윕 날짜로 본다.
+    day = current_day(st, auto, now)
+    if day is not None and day.due(now):
+        return Decision("sweep_eod", list(names),
+                        f"퇴근 스윕({day.eod:%H:%M}) — 전체 한 바퀴")
 
     interval = float(auto["min_interval_sec"])
     due: list[tuple[float, str]] = []
@@ -173,6 +165,20 @@ def decide(st: AutoState, auto: dict, names: list[str], *, now: _dt.datetime,
         return Decision("idle", [], "")
     due.sort()
     return Decision("due", [due[0][1]], "가장 오래 밀린 프로파일")
+
+
+def advance_day(st: AutoState, d: Decision, auto: dict, now: _dt.datetime) -> None:
+    """판정이 남기는 하루 경계 상태 — decide와 짝이다(테스트가 둘을 함께 돌린다).
+
+    퇴근 스윕은 **그 근무일의 스윕 날짜**를 남긴다. 실행한 순간의 날짜를 남기면,
+    예정보다 늦게 돈 스윕(절전 복귀 등)이 자정을 넘긴 경우 다음 근무일의 스윕을
+    '마쳤다'로 막는다.
+    """
+    if d.kind == "sweep_start":
+        st.day_start = now.isoformat(timespec="seconds")
+    elif d.kind == "sweep_eod":
+        day = current_day(st, auto, now)
+        st.last_eod_date = day.key if day is not None else now.date().isoformat()
 
 
 def _child_cmd(name: str, auto: dict, extra: list[str]) -> list[str]:
@@ -413,12 +419,12 @@ def _write_status(st: AutoState, auto: dict, names: list[str],
         f"갱신     : {now:%Y-%m-%d %H:%M:%S}",
         f"프로그램 : {_REPO}",
     ]
-    start = _parse(st.day_start)
-    eod = _eod_time(st, auto)
-    if start is not None and eod is not None:
-        done = st.last_eod_date == now.date().isoformat()
-        lines.append(f"오늘 기동: {start:%H:%M}")
-        lines.append(f"퇴근 스윕: {eod:%H:%M} " + ("(완료)" if done else "(예정)"))
+    if st.day_start or st.last_tick:
+        # decide와 같은 함수(day.summary)로 만든다 — 밤새 켜 둔 PC에서 어제의 퇴근
+        # 스윕을 오늘 것처럼 '(완료)'로 보이던 자리다(2026-11-11 실측).
+        start_text, eod_text = day_summary(st, auto, now)
+        lines.append(f"기동     : {start_text}")
+        lines.append(f"퇴근 스윕: {eod_text}")
     lines.append("")
     lines.append("프로파일:")
     for name in names:
@@ -524,21 +530,13 @@ def _end_idle() -> None:
         _idle_open = False
 
 
-def _eod_time(st: AutoState, auto: dict) -> _dt.datetime | None:
-    """오늘의 퇴근 스윕 시각. 기동 시각 + 근무시간 - 15분."""
-    start = _parse(st.day_start)
-    if start is None:
-        return None
-    return start + _dt.timedelta(hours=float(auto["work_hours"])) - EOD_LEAD
-
-
 def _next_event(st: AutoState, auto: dict, names: list[str],
                 now: _dt.datetime) -> str:
     """대기 줄에 붙일 '다음에 무슨 일이 언제'. 기다리는 사람에게 필요한 정보다."""
-    eod = _eod_time(st, auto)
-    if (eod is not None and now < eod and now.weekday() < 5
-            and st.last_eod_date != now.date().isoformat()):
-        return f"  다음 동기화 {_next_due(st, auto, names, now)} · 퇴근 스윕 {eod:%H:%M}"
+    day = current_day(st, auto, now)
+    if day is not None and day.pending(now):
+        return (f"  다음 동기화 {_next_due(st, auto, names, now)}"
+                f" · 퇴근 스윕 {day.eod:%H:%M}")
     return f"  다음 동기화 {_next_due(st, auto, names, now)}"
 
 
@@ -849,10 +847,7 @@ def _tick(st: AutoState, extra: list[str], only: list[str] | None) -> None:
         _end_idle()
         print(f"[{stamp}] {d.why}")
 
-    if d.kind == "sweep_start":
-        st.day_start = now.isoformat(timespec="seconds")
-    if d.kind == "sweep_eod":
-        st.last_eod_date = now.date().isoformat()
+    advance_day(st, d, auto, now)
 
     for name in d.names:
         if _skipped_by_config_error(st, name):
@@ -948,18 +943,11 @@ def run_loop(*, only: list[str] | None = None, extra: list[str] | None = None) -
     print(f" 설정          : {config_path()}")
     print(f" 상태          : {auto_dir()}")
     # 퇴근 스윕은 기동 시각에 따라 매일 달라진다 — 공식이 아니라 **오늘 몇 시인지**를
-    # 보여 준다. 사람이 알고 싶은 것은 규칙이 아니라 시각이다.
-    st_preview = AutoState()
-    eod_today = _eod_time(st_preview, auto)
-    if eod_today is None:
-        # 아직 기동 판정 전(첫 틱에서 정해진다) — 지금 켠 것으로 가정해 미리 보인다.
-        eod_guess = (_now() + _dt.timedelta(hours=float(auto["work_hours"]))
-                     - EOD_LEAD)
-        eod_text = f"{eod_guess:%H:%M} 예정(첫 틱에 확정)"
-    else:
-        eod_text = f"{eod_today:%H:%M}"
-        if _now().weekday() >= 5:
-            eod_text += " (주말이라 건너뜀)"
+    # 보여 준다. 사람이 알고 싶은 것은 규칙이 아니라 시각이다. 첫 틱이 곧 돌므로
+    # (tick_now) 그 틱이 기동이면 지금 켠 것으로 놓고 미리 보인다 — 상태 파일의 어제
+    # 기동 시각을 그대로 보이면 아침마다 어제의 퇴근 시각이 오늘 것처럼 찍혔다.
+    start_text, eod_text = day_summary(AutoState(), auto, _now(), tick_now=True)
+    print(f" 기동          : {start_text}")
     print(f" 근무시간      : {auto['work_hours']:g}시간 → 퇴근 스윕 {eod_text}")
     print(f" 평시 주기     : {int(auto['min_interval_sec']) // 60}분 · 틱 {tick_sec}초")
     if not quickedit:
