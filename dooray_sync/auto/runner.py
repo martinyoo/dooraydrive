@@ -9,7 +9,9 @@
   1. 출근 스윕 — 직전 틱과 day_gap_hours 이상 벌어진 뒤의 첫 틱
      (부팅·절전 복귀를 함께 잡고, 밤샘 가동 PC의 자정 틱 오인을 막는다)
   2. 퇴근 스윕 — 평일이고 지금 >= 기동 + work_hours - 15분, 하루 1회
-  3. 평시     — 프로파일당 min_interval_sec 간격, 틱당 가장 오래 밀린 1개
+  3. 평시     — 프로파일당 min_interval_sec 간격, 틱당 가장 오래 밀린 1개.
+               연속 3회 실패부터는 간격이 2배씩(최대 x8) 늘고 **마지막 시도부터** 센다
+               (_due_at). 처음 두 번의 실패는 틱 간격으로 바로 다시 시도한다.
 """
 from __future__ import annotations
 
@@ -136,37 +138,65 @@ def _last_sync_map(names: list[str]) -> dict[str, _dt.datetime | None]:
     return out
 
 
+# 연속 몇 회 실패부터 주기를 늘리고, 마지막 동기화가 아니라 **마지막 시도**부터 셀 것인가.
+# _apply_backoff(늘리는 쪽)와 _due_at(세는 쪽)이 같은 값을 써야 한다 — 따로 두면
+# '주기를 늘립니다'라는 말과 실제 간격이 다시 갈라진다(2026-11-11 의 사고가 정확히 그것이다).
+BACKOFF_STREAK = 3
+
+
 def _due_at(st: AutoState, name: str, seen: _dt.datetime | None, interval: float,
             now: _dt.datetime) -> _dt.datetime | None:
     """그 프로파일이 다음에 평시 차례가 되는 시각. None 이면 지금 바로.
 
-    기준은 마지막 동기화 시각(상태 DB 의 last_sync_at)이다. **대량 삭제 보류는 예외다** —
-    그 실행은 계획 단계에서 멈춰 last_sync_at 을 남기지 않으므로, 마지막 동기화만 보면
-    보류된 폴더는 매 틱 차례가 된다. 2026-11-11 실측: WRITING 이 2분마다 같은 보류를
-    776회 반복했다. '주기 x8'은 숫자뿐이었고(기준점이 닷새 전이라 언제나 지나 있었다),
-    화면이 그 출력으로 계속 흘러 'y' 를 누를 대기 줄이 한 번도 나오지 않았다 — 사용자는
-    0.3.3 으로 올린 뒤에도 "같은 현상"을 보았다. 보류의 결과는 사람이 손대기 전까지
-    같으므로, 보류된 폴더는 **마지막 시도(보류 시각)부터** 주기를 센다.
+    기준은 마지막 동기화 시각(상태 DB 의 last_sync_at)이다. 그런데 **실패한 실행은 그 값을
+    남기지 않는다.** 마지막 동기화만 보면 실패가 이어지는 폴더의 '주기 x8'은 숫자뿐이다 —
+    마지막 성공이 x8 주기보다 오래되면 기준점이 언제나 지나 있어 매 틱 다시 돈다.
+    2026-11-11 실측: 대량 삭제 보류로 WRITING 이 2분마다 776회 다시 돌았고, 화면이 그 출력으로
+    흘러 'y' 를 누를 대기 줄이 한 번도 나오지 않았다. 인증 오류·Dooray 거부·장애·네트워크
+    끊김·로컬 붕괴 보류도 같은 구멍이었다(몇 시간 실패하면 그 뒤로는 틱마다). 그래서 둘을
+    기준에 더 넣는다.
 
-    보류 시각이 지금보다 뒤면(시계가 뒤로 간 PC) 그 기준은 버린다 — 미래 시각에 묶이면
-    시계가 따라잡을 때까지 그 폴더가 영영 안 돈다. 다음 실행이 지금 시계로 다시 찍는다.
+    - **대량 삭제 보류** — 첫 보류부터 보류 시각. 그 결과는 사람이 손대기 전까지 같다.
+    - **연속 실패 BACKOFF_STREAK 회 이상** — 마지막 시도 시각(state.json 의 last_attempt).
+      처음 두 번의 실패에는 넣지 않는다 — 잠깐의 네트워크 끊김은 틱 간격으로 다시 시도해
+      몇 분 안에 회복해야 한다. 승수가 붙는 것도 3회째부터라(_apply_backoff) 둘이 같이 간다.
+
+    기준은 그중 가장 늦은 것이다. 지금보다 뒤의 시각은 버린다(시계가 뒤로 간 PC) — 미래
+    시각에 묶이면 시계가 따라잡을 때까지 그 폴더가 영영 안 돈다. 다음 실행이 지금 시계로
+    다시 찍는다. 깨진 시각도 버린다(그러면 마지막 동기화로 떨어져 한 번 더 돌고, 그 실행이
+    다시 찍는다).
     """
-    marks: list[_dt.datetime] = []
-    if seen is not None:
-        marks.append(seen)
+    marks: list[_dt.datetime] = [] if seen is None else [seen]
     hold = _bulk_hold(st, name)
     if hold:
-        at = _parse(str(hold.get("at") or ""))
-        if at is not None and at <= now:
-            marks.append(at)
+        marks += _past_mark(str(hold.get("at") or ""), now)
+    if st.fail_streak(name) >= BACKOFF_STREAK:
+        marks += _past_mark(st.last_attempt(name), now)
     if not marks:
         return None
     return max(marks) + _dt.timedelta(seconds=interval * st.backoff_mult(name))
 
 
+def _past_mark(iso: str, now: _dt.datetime) -> list[_dt.datetime]:
+    """state.json 의 시각 하나를 기준점 후보로. 깨졌거나·미래거나·시간대가 붙은 값은 빈
+    목록이다(시간대가 붙으면 루프가 쓰는 시각과 비교 자체가 안 된다 — 손으로 고친 값)."""
+    at = _parse(iso)
+    if at is None or at.tzinfo is not None or at > now:
+        return []
+    return [at]
+
+
 def decide(st: AutoState, auto: dict, names: list[str], *, now: _dt.datetime,
-           last_sync: dict[str, _dt.datetime | None]) -> Decision:
-    """순수 판정 — 시계·상태·설정만 보고 무엇을 돌릴지 정한다(부작용 없음)."""
+           last_sync: dict[str, _dt.datetime | None],
+           resting: frozenset[str] = frozenset()) -> Decision:
+    """순수 판정 — 시계·상태·설정만 보고 무엇을 돌릴지 정한다(부작용 없음).
+
+    `resting`은 설정 오류로 쉬는 프로파일이다(_resting — config 파일을 읽으므로 호출측이
+    구해 넘긴다). **평시 차례에서는 뺀다.** 고를 수는 있어도 돌릴 수 없는 프로파일을 고르면
+    그 틱이 통째로 비는데, 실패한 실행은 last_sync_at 을 남기지 않아 그 프로파일이 '가장
+    오래 밀린' 자리를 영영 차지한다 — 다른 폴더는 스윕 때만 돈다. 2026-11-11 재현: 3시간
+    동안 다른 폴더 0회, '설정 문제로 쉬는 중' 89줄. 스윕은 그대로 전체다(쉬는 이유를 그때
+    한 줄 적는다)."""
     if not names:
         return Decision("idle", [], "자동 대상 프로파일이 없습니다")
 
@@ -190,6 +220,8 @@ def decide(st: AutoState, auto: dict, names: list[str], *, now: _dt.datetime,
     interval = float(auto["min_interval_sec"])
     due: list[tuple[float, str]] = []
     for name in names:
+        if name in resting:
+            continue
         seen = last_sync.get(name)
         when = _due_at(st, name, seen, interval, now)
         if when is None:
@@ -283,13 +315,20 @@ def _read_report(name: str) -> dict:
 
 
 def _apply_backoff(st: AutoState, name: str, kind: str, report: dict, *,
+                   at: _dt.datetime, interval: float, seen: _dt.datetime | None,
                    quiet: bool = False) -> None:
-    """주기 승수 조정. 두 가지 입력이 있다.
+    """실행 하나의 결과로 시도 시각·연속 실패·주기 승수를 고친다. 두 가지 입력이 있다.
 
     - rate limit 관측(429): 서버가 밀어내고 있다 → 즉시 2배.
     - 연속 실패: 원인이 무엇이든 같은 실패를 2분마다 반복하는 것은 서버에도
-      로그에도 해롭다 → 3회 연속부터 2배씩.
+      로그에도 해롭다 → BACKOFF_STREAK(3)회 연속부터 2배씩(최대 x8), 그리고 그때부터는
+      **마지막 시도부터** 센다(_due_at). 실패한 실행은 last_sync_at 을 남기지 않으므로
+      시도 시각을 따로 남기지 않으면 승수가 숫자뿐이 된다(2026-11-11 실측).
     깨끗한 실행은 서서히 되돌린다(x0.75, 하한 1.0).
+
+    `at`은 그 실행이 끝난 시각, `seen`은 실행 **뒤의** last_sync_at 이다(성공한 실행은 방금
+    새로 남겼다). 둘로 다음 시도 시각을 계산해 화면에 적는다 — 승수만 적으면 기준점을
+    모르는 사람에게 사실과 다른 말이 된다. 계산은 decide 와 같은 _due_at 하나다.
     """
     rate = report.get("rate") or {}
     try:
@@ -300,24 +339,50 @@ def _apply_backoff(st: AutoState, name: str, kind: str, report: dict, *,
     from ..api.faults import Fault
 
     entry = st.profile(name)
-    streak = int(entry.get("fail_streak") or 0)
     # OK가 아닌 모든 결과가 연속 회수를 올린다 — 원인이 무엇이든 같은 결과를
     # 2분마다 반복하는 것은 서버에도 로그에도 해롭다. locked는 정상 경합이라 뺀다.
-    streak = 0 if kind in (Fault.OK, "locked") else streak + 1
+    streak = 0 if kind in (Fault.OK, "locked") else st.fail_streak(name) + 1
     entry["fail_streak"] = streak
+    if kind != "locked":
+        # locked 는 시도조차 못 한 것이다 — '다음 틱에' 다시 해야 하므로 시도로 남기지 않는다.
+        st.set_last_attempt(name, at.isoformat(timespec="seconds"))
 
     cur = st.backoff_mult(name)
+    note = ""
     if limited > 0:
         st.set_backoff_mult(name, cur * 2)
-        print(f"    (rate limit {limited}회 관측 — 이 폴더 주기를 "
-              f"{st.backoff_mult(name):g}배로 늘립니다)")
-    elif streak >= 3:
+        note = f"rate limit {limited}회 관측 — 이 폴더 주기를 {st.backoff_mult(name):g}배로 늘립니다"
+    elif streak >= BACKOFF_STREAK:
         st.set_backoff_mult(name, cur * 2)
-        if not quiet:      # 대량 삭제 보류는 알림 블록이 '다시 확인' 시각을 따로 적는다
-            print(f"    (연속 {streak}회 같은 결과 — 주기를 "
-                  f"{st.backoff_mult(name):g}배로 늘립니다)")
+        new = st.backoff_mult(name)
+        grew = f"주기를 {new:g}배로 늘립니다" if new > cur else f"주기 {new:g}배(최대)"
+        # 대량 삭제 보류는 알림 블록이 '다시 확인' 시각을 따로 적는다
+        note = "" if quiet else f"연속 {streak}회 같은 결과 — {grew}"
     elif kind == "ok" and cur > 1.0:
         st.set_backoff_mult(name, max(1.0, cur * 0.75))
+    if note:
+        print(f"    ({note} · {_retry_text(_due_at(st, name, seen, interval, at), at)})")
+
+
+def _clock_text(when: _dt.datetime, ref: _dt.datetime) -> str:
+    """시각을 사람에게 — 같은 날이면 HH:MM, 아니면 MM-DD HH:MM."""
+    return f"{when:%H:%M}" if when.date() == ref.date() else f"{when:%m-%d %H:%M}"
+
+
+def _retry_text(when: _dt.datetime | None, ref: _dt.datetime) -> str:
+    """_due_at 의 답을 사람 말로. 이미 지났으면 곧(틱마다 가장 오래 밀린 하나씩 돈다)."""
+    if when is None or when <= ref:
+        return "곧 다시 시도"
+    return f"다음 시도 {_clock_text(when, ref)}"
+
+
+def _last_sync_or(name: str, fallback: _dt.datetime | None) -> _dt.datetime | None:
+    """실행 직후의 last_sync_at — 방금 끝난 실행이 새로 남겼을 수 있다. 못 읽으면 fallback.
+    표시용이다(다음 시도 시각). 판정은 다음 틱이 다시 읽는다."""
+    try:
+        return _last_sync_at(name)
+    except Exception:      # noqa: BLE001 — 표시가 실행 결과 처리를 막지 않는다
+        return fallback
 
 
 def _config_fingerprint() -> str:
@@ -429,6 +494,30 @@ def _skipped_by_config_error(st: AutoState, name: str) -> bool:
     return str(stamp) == fp
 
 
+def _resting(st: AutoState, names: list[str]) -> frozenset[str]:
+    """지금 설정 오류로 쉬는 프로파일들 — decide 의 평시 차례와 대기 줄의 '다음 동기화'에서
+    뺀다. config 가 바뀌면 다음 틱에 이 목록에서 빠져 바로 차례가 된다(마지막 동기화가 오래돼)."""
+    return frozenset(n for n in names if _skipped_by_config_error(st, n))
+
+
+def backoff_tag(st: AutoState, name: str, seen: _dt.datetime | None, interval: float,
+                now: _dt.datetime) -> str:
+    """'주기를 늘린 상태'를 한 줄 꼬리로 — status.txt 와 `--auto status`가 같이 쓴다.
+
+    승수만 적지 않는다. 다음 시도 시각을 decide 와 같은 _due_at 으로 계산해 적는다 —
+    2026-11-11 의 status.txt 는 '[주기 x8]'을 적어 둔 채 그 폴더를 매 틱 다시 돌렸다.
+    기준점(마지막 동기화냐 마지막 시도냐)을 모르면 승수는 사실을 말하지 못한다."""
+    mult = st.backoff_mult(name)
+    streak = st.fail_streak(name)
+    if mult <= 1.0 and streak < BACKOFF_STREAK:
+        return ""
+    parts = [f"연속 실패 {streak}회"] if streak >= BACKOFF_STREAK else []
+    if mult > 1.0:
+        parts.append(f"주기 x{mult:g}")
+    parts.append(_retry_text(_due_at(st, name, seen, interval, now), now))
+    return "  [" + " · ".join(parts) + "]"
+
+
 def _write_status(st: AutoState, auto: dict, names: list[str],
                   now: _dt.datetime) -> None:
     """status.txt — **창이 닫혀 있을 때의 유일한 근거.**
@@ -457,12 +546,10 @@ def _write_status(st: AutoState, auto: dict, names: list[str],
         except Exception:      # noqa: BLE001 — 상태 표시가 루프를 죽이지 않는다
             seen = None
         mark = str(rep.get("outcome") or "-")
-        extra = ""
         if _skipped_by_config_error(st, name):
             extra = "  [설정 오류로 쉬는 중]"
-        mult = st.backoff_mult(name)
-        if mult > 1.0:
-            extra += f"  [주기 x{mult:g}]"
+        else:
+            extra = backoff_tag(st, name, seen, float(auto["min_interval_sec"]), now)
         if _bulk_hold(st, name):
             extra += "  [대량 삭제 보류 — 동기화 멈춤]"
         when = f"{seen:%m-%d %H:%M}" if seen else "-"
@@ -573,7 +660,12 @@ def _next_event(st: AutoState, auto: dict, names: list[str],
 
 def _next_due(st: AutoState, auto: dict, names: list[str],
               now: _dt.datetime) -> str:
-    """가장 먼저 차례가 오는 시각(HH:MM). 못 구하면 '-'."""
+    """가장 먼저 차례가 오는 시각(HH:MM). 못 구하면 '-'.
+
+    decide 와 같은 _due_at 으로 계산한다 — 연속 실패·대량 삭제 보류로 마지막 시도부터 세는
+    폴더도 decide 가 실제로 돌릴 시각을 적는다(따로 계산하면 대기 줄이 거짓말을 한다).
+    날짜는 붙이지 않는다 — 대기 줄은 80칸 안에서 제자리 갱신해야 하고(날짜·퇴근 스윕·보류가
+    겹치면 84칸), 기본 주기의 최대 간격(30분 x8)은 하루를 넘지 않는다."""
     interval = float(auto["min_interval_sec"])
     soonest: _dt.datetime | None = None
     for name in names:
@@ -923,7 +1015,8 @@ def _tick(st: AutoState, extra: list[str], only: list[str] | None) -> None:
     # 조회에 실패한 프로파일은 이번 틱 대상에서 뺀다(fail-closed).
     names = [n for n in names if n in last_sync]
     _settle_bulk_holds(st, last_sync)
-    d = decide(st, auto, names, now=now, last_sync=last_sync)
+    resting = _resting(st, names)
+    d = decide(st, auto, names, now=now, last_sync=last_sync, resting=resting)
 
     stamp = f"{now:%H:%M:%S}"
     if d.kind == "idle":
@@ -931,7 +1024,9 @@ def _tick(st: AutoState, extra: list[str], only: list[str] | None) -> None:
         # 쌓으면 8시간에 240줄이 흐르고 그 속에서 진짜 사건을 놓친다.
         # 시각이 계속 변하는 것 자체가 '멈춘 창'과 '조용한 창'을 구분하는
         # 신호이므로(QuickEdit 정지가 정확히 이렇게 드러난다) 지우지는 않는다.
-        nxt = _next_event(st, auto, names, now)
+        # 쉬는 프로파일은 '다음 동기화'에 넣지 않는다 — 그 차례는 이미 지난 시각이거나
+        # '곧'이라, 넣으면 대기 줄이 오지 않을 동기화를 약속한다.
+        nxt = _next_event(st, auto, [n for n in names if n not in resting], now)
         held = _bulk_holds(st, names) if "--dry-run" not in extra else []
         if held:
             nxt += f" | 삭제 보류 {len(held)}개: y/N"
@@ -962,10 +1057,12 @@ def _tick(st: AutoState, extra: list[str], only: list[str] | None) -> None:
             msg = f"보류 — 대량 삭제({hold['why']}). 이 폴더는 처리할 때까지 동기화되지 않습니다"
         print(f"    {name}: {msg}")
         # 주기를 먼저 고친다 — 알림 블록이 적는 '다시 확인' 시각이 고친 주기로 계산돼야 한다.
-        _apply_backoff(st, name, kind, report, quiet=bool(hold))
+        interval = float(auto["min_interval_sec"])
+        seen = _last_sync_or(name, last_sync.get(name))
+        _apply_backoff(st, name, kind, report, at=ended, interval=interval, seen=seen,
+                       quiet=bool(hold))
         if hold:
-            when = _due_at(st, name, last_sync.get(name),
-                           float(auto["min_interval_sec"]), ended)
+            when = _due_at(st, name, seen, interval, ended)
             _print_bulk_banner([(name, hold)], recheck={name: when}, now=ended)
         _note_outcome(st, name, kind, msg, report, now)
 
@@ -1000,12 +1097,18 @@ def run_once(*, only: list[str] | None = None, extra: list[str] | None = None) -
         report = _read_report(name)
         _kind, msg = _classify(rc, report)
         print(f"    {name}: {msg}")
-        _apply_backoff(st, name, _kind, report)
+        ended = _now()
+        # 실패도 시도다 — 연속 실패 회수를 올리는 곳에서 시도 시각도 함께 남긴다. 둘이
+        # 갈라지면 '연속 3회'인데 기준점은 옛 시도라 주기가 덜 늘어난 것처럼 돈다.
+        _apply_backoff(st, name, _kind, report, at=ended,
+                       interval=float(auto["min_interval_sec"]),
+                       seen=_last_sync_or(name, None))
         _note_outcome(st, name, _kind, msg, report, now)
-        _update_bulk_hold(st, name, report, _now(), extra or [])
+        _update_bulk_hold(st, name, report, ended, extra or [])
     # last_tick은 쓰지 않는다 — 이건 틱이 아니라 진단용 1회 실행이다. 여기서
     # 시각을 남기면 루프가 '방금 틱이 있었다'고 보고 기동 스윕을 건너뛴다.
-    # 다음 실행 시각 판단은 상태 DB의 last_sync_at이 하므로 잃는 정보도 없다.
+    # 다음 실행 시각 판단은 상태 DB의 last_sync_at(과 연속 실패 중이면 위에서 남긴
+    # last_attempt)이 하므로 잃는 정보도 없다.
     st.save()
     _write_status(st, auto, names, now)
     # 손으로 띄운 1회 실행이라 사람이 화면 앞에 있다. 루프처럼 대기 중에 키를 볼 수
@@ -1077,8 +1180,9 @@ def run_loop(*, only: list[str] | None = None, extra: list[str] | None = None) -
         # 첫 틱이 곧바로 다시 돌릴 폴더(기동 스윕·이미 차례)는 여기서 묻지 않는다 — 그
         # 실행이 끝나면 새 알림이 나오고, 그 알림이 앞서 눌린 키를 버린다. 여기서 물으면
         # 사람이 그 사이에 누른 답이 소리 없이 사라진다(2026-11-11 검토 재현).
-        first = decide(st, auto, [n for n in start_names if n in start_sync],
-                       now=at, last_sync=start_sync) if held else None
+        listed = [n for n in start_names if n in start_sync]
+        first = decide(st, auto, listed, now=at, last_sync=start_sync,
+                       resting=_resting(st, listed)) if held else None
         show = [n for n in held if first is not None and n not in first.names]
         if show:
             _print_bulk_banner(

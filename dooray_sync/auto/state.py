@@ -113,6 +113,25 @@ class AutoState:
         entry["marker_absent"] = streak
         return streak
 
+    def fail_streak(self, name: str) -> int:
+        """연속 실패 횟수(OK 아닌 결과가 이어진 횟수). 깨진 값은 0 — 틱 판정이 이 값을
+        읽으므로, 손으로 고친 state.json 하나 때문에 틱이 매번 죽으면 안 된다."""
+        try:
+            return max(0, int(self.profile(name).get("fail_streak") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def last_attempt(self, name: str) -> str:
+        """자동 루프가 그 프로파일을 마지막으로 실행한 시각(ISO, 실행이 끝난 때).
+
+        실패한 실행은 상태 DB 에 last_sync_at 을 남기지 않는다. 그래서 연속 실패의 주기는
+        이 값부터 센다(runner._due_at). **기록자는 자동 루프(runner)뿐이다** — synchere.bat
+        이나 CLI 자식이 함께 쓰면 서로의 갱신을 덮어쓴다."""
+        return str(self.profile(name).get("last_attempt") or "")
+
+    def set_last_attempt(self, name: str, value: str) -> None:
+        self.profile(name)["last_attempt"] = value
+
     def backoff_mult(self, name: str) -> float:
         try:
             return max(1.0, min(8.0, float(self.profile(name).get("backoff_mult", 1.0))))
