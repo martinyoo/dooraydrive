@@ -75,7 +75,11 @@ class AutoState:
 
     @property
     def day_start(self) -> str:
-        """오늘 '출근'으로 판정된 시각(ISO). 퇴근 스윕 시각의 기준."""
+        """마지막으로 '출근'(기동)으로 판정된 시각(ISO). 퇴근 스윕 시각의 기준.
+
+        **오늘이 아닐 수 있다.** 밤새 켜 둔 PC에는 기동 틱이 없어 며칠 전 값이 남는다 —
+        근무일은 여기서 24시간씩 넘어간다(day.py). 이 값을 그대로 '오늘'로 읽지 말 것.
+        """
         return str(self.data.get("day_start") or "")
 
     @day_start.setter
@@ -84,7 +88,11 @@ class AutoState:
 
     @property
     def last_eod_date(self) -> str:
-        """퇴근 스윕을 마친 날짜(YYYY-MM-DD). 하루 1회 보장."""
+        """마지막으로 마친 퇴근 스윕의 **예정 시각이 속한 날짜**(YYYY-MM-DD).
+
+        근무일마다 1회를 보장한다. 실행한 순간의 날짜가 아니다 — 그렇게 판정하면
+        밤새 켜 둔 PC가 자정에 어제의 스윕을 다시 돌린다(2026-11-11 실측, day.py).
+        """
         return str(self.data.get("last_eod_date") or "")
 
     @last_eod_date.setter

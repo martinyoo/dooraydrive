@@ -38,6 +38,10 @@ def _out(msg: str = "") -> None:
     print(msg)
 
 
+def _now() -> _dt.datetime:
+    return _dt.datetime.now()
+
+
 def _profiles_from(profiles: dict[str, dict], targets: list[tuple[str, dict]] | None,
                    all_: bool) -> list[str]:
     """동사가 적용될 프로파일 이름 목록. --all이면 config 전체, 아니면 이 폴더."""
@@ -202,12 +206,14 @@ def _status(names: list[str], all_: bool) -> int:
         _out(f"  마지막 틱    : {st.last_tick}")
     else:
         _out("  마지막 틱    : (아직 없음 — 창을 한 번도 안 띄웠습니다)")
-    if st.day_start:
-        _out(f"  오늘 기동    : {st.day_start}")
-        eod = _eod_at(st.day_start, float(auto["work_hours"]))
-        if eod:
-            done = st.last_eod_date == _dt.date.today().isoformat()
-            _out(f"  퇴근 스윕    : {eod:%H:%M} " + ("(완료)" if done else "(예정)"))
+    if st.day_start or st.last_tick:
+        # 루프의 판정(decide)과 같은 함수로 만든다. 따로 계산하던 시절에는 밤새 켜 둔
+        # PC에서 어제의 퇴근 스윕을 오늘 것처럼 '(완료)'로 보였고, 창이 닫힌 뒤에도
+        # 옛 기동 시각을 '오늘'로 보였다(2026-11-11 실측).
+        from .day import summary
+        start_text, eod_text = summary(st, auto, _now())
+        _out(f"  기동         : {start_text}")
+        _out(f"  퇴근 스윕    : {eod_text}")
     _out("")
 
     rows: list[tuple[str, str]] = []
@@ -281,14 +287,6 @@ def _last_outcome(name: str) -> str:
     outcome = str(data.get("outcome") or "")
     when = str(data.get("finished_at") or "")[5:16].replace("T", " ")
     return f"{outcome}({when})" if outcome else ""
-
-
-def _eod_at(day_start_iso: str, work_hours: float) -> _dt.datetime | None:
-    try:
-        start = _dt.datetime.fromisoformat(day_start_iso)
-    except ValueError:
-        return None
-    return start + _dt.timedelta(hours=work_hours) - _dt.timedelta(minutes=15)
 
 
 def dispatch(verb: str, *, profiles: dict[str, dict],
