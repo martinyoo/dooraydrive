@@ -206,6 +206,89 @@ def test_sweeps_still_include_a_held_profile():
     assert d.kind == "sweep_eod" and d.names == ["a", "w"]
 
 
+def _failing(now: dt.datetime, streak, attempt, mult: float) -> AutoState:
+    st = _st(last_tick=(now - dt.timedelta(minutes=2)).isoformat(),
+             day_start=now.replace(hour=7, minute=0).isoformat())
+    stamp = attempt if isinstance(attempt, str) else attempt.isoformat(timespec="seconds")
+    st.profile("w").update(fail_streak=streak, last_attempt=stamp)
+    st.set_backoff_mult("w", mult)
+    return st
+
+
+def test_first_two_failures_retry_at_tick_pace():
+    """잠깐의 끊김은 몇 분 안에 회복해야 한다 — 두 번째 실패까지는 마지막 시도를 보지 않는다."""
+    now = MON.replace(hour=10)
+    st = _failing(now, 2, now - dt.timedelta(minutes=2), 1.0)
+    d = decide(st, AUTO, ["w"], now=now, last_sync={"w": now - dt.timedelta(minutes=34)})
+    assert d.kind == "due"
+
+
+def test_third_failure_counts_from_the_last_attempt():
+    """실패한 실행은 last_sync_at 을 남기지 않는다 — 마지막 성공이 닷새 전이어도 3회째
+    실패부터는 마지막 시도 + 30분 x2 까지 차례가 아니다(2026-11-11: 그 전에는 틱마다)."""
+    now = MON.replace(hour=10)
+    stale = now - dt.timedelta(days=5)
+    st = _failing(now, 3, now - dt.timedelta(minutes=2), 2.0)
+    assert decide(st, AUTO, ["w"], now=now, last_sync={"w": stale}).kind == "idle"
+    later = now + dt.timedelta(minutes=58)                   # 시도 + 60분
+    st.last_tick = (later - dt.timedelta(minutes=2)).isoformat()
+    assert decide(st, AUTO, ["w"], now=later, last_sync={"w": stale}).kind == "due"
+
+
+def test_failing_profile_that_never_synced_backs_off_too():
+    now = MON.replace(hour=10)
+    st = _failing(now, 4, now - dt.timedelta(minutes=2), 4.0)
+    assert decide(st, AUTO, ["w"], now=now, last_sync={"w": None}).kind == "idle"
+
+
+def test_a_newer_sync_elsewhere_wins_over_the_last_attempt():
+    """그 폴더의 synchere.bat 이 뒤에 성공했으면 기준은 그 성공이다(더 늦은 쪽)."""
+    now = MON.replace(hour=10)
+    st = _failing(now, 5, now - dt.timedelta(hours=3, minutes=50), 8.0)
+    synced = now - dt.timedelta(minutes=10)
+    assert decide(st, AUTO, ["w"], now=now, last_sync={"w": synced}).kind == "idle"
+    assert decide(st, AUTO, ["w"], now=now + dt.timedelta(minutes=12),
+                  last_sync={"w": now - dt.timedelta(days=1)}).kind == "due"
+
+
+@pytest.mark.parametrize("streak, attempt", [
+    ("셋", "2026-08-17T09:58:00"),           # 연속 회수가 깨짐 → 0 으로
+    (5, "언젠가"),                            # 시각이 깨짐
+    (5, "2026-08-19T10:00:00"),              # 미래(시계가 뒤로 간 PC)
+    (5, "2026-08-17T09:58:00+09:00"),        # 시간대가 붙은 손 편집 값 — 비교 자체가 안 된다
+])
+def test_unreadable_failure_state_falls_back_to_the_last_sync(streak, attempt):
+    """state.json 의 깨진 값 하나가 틱 판정을 죽이거나 폴더를 멈추게 하지 않는다 — 마지막
+    동기화로 떨어져 한 번 더 돌고, 그 실행이 지금 시계로 다시 찍는다."""
+    now = MON.replace(hour=10)
+    st = _failing(now, streak, attempt, 8.0)
+    d = decide(st, AUTO, ["w"], now=now, last_sync={"w": now - dt.timedelta(days=5)})
+    assert d.kind == "due"
+
+
+def test_resting_profile_is_left_out_of_the_regular_turn():
+    """설정 오류로 쉬는 폴더는 돌릴 수 없다 — 평시 차례에서 고르면 그 틱이 비고, 마지막
+    성공이 가장 오래된 그 폴더가 매 틱 그 자리를 차지해 다른 폴더가 굶는다."""
+    now = MON.replace(hour=10)
+    st = _st(last_tick=(now - dt.timedelta(minutes=2)).isoformat(),
+             day_start=now.replace(hour=7).isoformat())
+    seen = {"a": now - dt.timedelta(minutes=40), "w": now - dt.timedelta(days=5)}
+    d = decide(st, AUTO, ["a", "w"], now=now, last_sync=seen, resting=frozenset({"w"}))
+    assert d.kind == "due" and d.names == ["a"]
+    assert decide(st, AUTO, ["w"], now=now, last_sync=seen,
+                  resting=frozenset({"w"})).kind == "idle"
+
+
+def test_sweeps_still_list_a_resting_profile():
+    """스윕은 전체 한 바퀴다 — 쉬는 폴더도 그때는 넘겨, _tick 이 쉬는 이유를 한 줄 적는다."""
+    now = MON.replace(hour=15, minute=45)
+    st = _st(last_tick=(now - dt.timedelta(minutes=2)).isoformat(),
+             day_start=now.replace(hour=7, minute=0).isoformat())
+    d = decide(st, AUTO, ["a", "w"], now=now, resting=frozenset({"w"}),
+               last_sync={"a": now - dt.timedelta(minutes=5), "w": now - dt.timedelta(days=5)})
+    assert d.kind == "sweep_eod" and d.names == ["a", "w"]
+
+
 def test_no_auto_profiles_is_idle():
     d = decide(_st(), AUTO, [], now=MON, last_sync={})
     assert d.kind == "idle"

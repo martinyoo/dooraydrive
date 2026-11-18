@@ -222,9 +222,7 @@ def _status(names: list[str], all_: bool) -> int:
             extra = "" if r.ok else f" — {r.reasons[0]}"
             if p.sync_mode != "sync":
                 extra += f"  [sync_mode={p.sync_mode} — 실제로는 돌지 않습니다]"
-            mult = st.backoff_mult(name)
-            if mult > 1.0:
-                extra += f"  [주기 x{mult:g}]"
+            extra += _backoff_tag(st, name, float(auto["min_interval_sec"]))
             last = _last_outcome(name)
             if last:
                 extra += f"  마지막 {last}"
@@ -251,6 +249,21 @@ def _status(names: list[str], all_: bool) -> int:
         _out("")
         _out("  전체를 보려면: synchere.bat --auto status --all")
     return EXIT_OK
+
+
+def _backoff_tag(st: AutoState, name: str, interval: float) -> str:
+    """주기를 늘린 상태와 다음 시도 시각 — 창의 status.txt 와 같은 함수(runner.backoff_tag).
+    상태 DB 는 읽기 전용으로만 연다(네트워크 0건). 못 읽어도 상태 화면은 계속 나온다."""
+    from . import runner
+    try:
+        seen = runner._last_sync_at(name)     # noqa: SLF001 — 같은 패키지의 읽기 전용 조회
+    except Exception:      # noqa: BLE001
+        seen = None
+    try:
+        return runner.backoff_tag(st, name, seen, interval, _dt.datetime.now())
+    except Exception:      # noqa: BLE001 — 표시 하나가 상태 화면을 죽이지 않는다
+        mult = st.backoff_mult(name)
+        return f"  [주기 x{mult:g}]" if mult > 1.0 else ""
 
 
 def _last_outcome(name: str) -> str:
