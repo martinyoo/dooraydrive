@@ -1020,7 +1020,7 @@ def _offer_auto(targets: list[tuple[str, dict]], profiles: dict[str, dict],
             return
 
         roots = {n: str(info.get("root") or "") for n, info in targets}
-        print(f"자동 동기화: 꺼짐 — 이 PC가 켜져 있는 동안 알아서 동기화하지 않습니다.")
+        print("자동 동기화: 꺼짐 — 이 PC가 켜져 있는 동안 알아서 동기화하지 않습니다.")
         if len(ask) == 1:
             print(f"  [{ask[0]}] {roots.get(ask[0], '')}")
             question = "이 폴더를 자동 동기화에 넣을까요? [y/N]: "
