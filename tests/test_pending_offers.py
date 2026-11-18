@@ -461,3 +461,159 @@ def test_pending_lists_are_drained_so_second_call_is_silent(monkeypatch, capsys)
     capsys.readouterr()
     sh._offer_reconcile([])
     assert capsys.readouterr().out == ""
+
+
+# --------------------------------------------------------------------------
+# 5) 자동 동기화 켜기 — "켜려면 --auto on" 안내를 그 자리의 질문으로 (2026-11-19)
+#
+# 새 폴더(spri 2027)를 동기화 대상으로 만들고도 자동에 넣지 않아 데스크톱으로
+# 넘어가지 않았다. 화면은 명령을 알려 주고 끝났다 — 시키기만 하는 기능은 없는
+# 기능이다(AGENTS.md). 켜는 일은 `--auto on`과 같은 dispatch 로 한다.
+# --------------------------------------------------------------------------
+class _Cfg:
+    def __init__(self, auto_sync):
+        self.auto_sync = auto_sync
+
+
+def _auto_env(monkeypatch, autos: dict[str, bool]):
+    """sync_here 와 그것이 부르는 load_config·dispatch 를 가짜로. dispatch 호출을 기록한다."""
+    sh = _sync_here()
+    import dooray_sync.auto.cli as auto_cli
+    import dooray_sync.config as config_mod
+    monkeypatch.setattr(config_mod, "load_config", lambda n: _Cfg(autos[n]))
+    calls = []
+
+    def _dispatch(verb, *, profiles, targets, all_, extra):
+        calls.append((verb, [n for n, _ in targets], all_))
+        return 0
+
+    monkeypatch.setattr(auto_cli, "dispatch", _dispatch)
+    monkeypatch.setattr(sh, "_loop_running", lambda: False)
+    targets = [(n, {"root": f"C:/x/{n}"}) for n in autos]
+    return sh, calls, targets
+
+
+def test_auto_off_asks_and_yes_turns_it_on(monkeypatch, capsys):
+    sh, calls, targets = _auto_env(monkeypatch, {"spri2027": False})
+    asked = []
+    monkeypatch.setattr(sh, "_ask_yes_no", lambda q: asked.append(q) or True)
+
+    sh._offer_auto(targets, {}, [], [])
+
+    assert asked, "꺼져 있는데 묻지 않았다"
+    assert calls == [("on", ["spri2027"], False)], calls
+    # 화면이 명령을 알려 주고 끝나던 옛 문구가 대화형 경로에 남아 있으면 안 된다.
+    assert "켜려면 synchere.bat --auto on" not in capsys.readouterr().out
+
+
+def test_auto_off_default_no_changes_nothing(monkeypatch, capsys):
+    sh, calls, targets = _auto_env(monkeypatch, {"spri2027": False})
+    monkeypatch.setattr(sh, "_ask_yes_no", lambda q: False)
+
+    sh._offer_auto(targets, {}, [], [])
+
+    assert calls == []
+    assert "켜지 않았습니다" in capsys.readouterr().out
+
+
+def test_real_eof_answers_no(monkeypatch):
+    """_ask_yes_no 를 가짜로 바꾸지 않는다 — 실제 EOF 가 '아니오'인지 본다."""
+    sh, calls, targets = _auto_env(monkeypatch, {"spri2027": False})
+
+    def _eof(_p):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", _eof)
+    sh._offer_auto(targets, {}, [], [])
+    assert calls == []
+
+
+@pytest.mark.parametrize("flag", ["--dry-run", "--unattended"])
+def test_auto_offer_never_asks_in_unattended_paths(monkeypatch, capsys, flag):
+    sh, calls, targets = _auto_env(monkeypatch, {"spri2027": False})
+
+    def _never(_q):
+        raise AssertionError(f"{flag} 인데 물었다")
+
+    monkeypatch.setattr(sh, "_ask_yes_no", _never)
+    sh._offer_auto(targets, {}, [flag], [])
+    assert calls == []
+    assert "--auto on" in capsys.readouterr().out, "비대화 경로는 옛 안내로 대신해야 한다"
+
+
+def test_failed_profile_is_not_offered(monkeypatch):
+    """이번에 실패한 폴더를 켜면 2분마다 같은 실패를 반복한다."""
+    sh, calls, targets = _auto_env(monkeypatch, {"A": False, "B": False})
+    monkeypatch.setattr(sh, "_ask_yes_no", lambda q: True)
+
+    sh._offer_auto(targets, {}, [], ["A"])
+    assert calls == [("on", ["B"], False)], calls
+
+
+def test_already_on_is_not_asked(monkeypatch, capsys):
+    sh, calls, targets = _auto_env(monkeypatch, {"spri2026": True})
+
+    def _never(_q):
+        raise AssertionError("이미 켜져 있는데 물었다")
+
+    monkeypatch.setattr(sh, "_ask_yes_no", _never)
+    sh._offer_auto(targets, {}, [], [])
+    assert calls == []
+    assert "켜짐" in capsys.readouterr().out
+
+
+def test_multiple_folders_show_count_and_names(monkeypatch, capsys):
+    """상위 폴더에서 돌리면 여러 개가 걸린다 — 몇 개를 켜는지 보이지 않으면 동의가 아니다."""
+    sh, calls, targets = _auto_env(monkeypatch, {"A": False, "B": False, "C": True})
+    asked = []
+    monkeypatch.setattr(sh, "_ask_yes_no", lambda q: asked.append(q) or False)
+
+    sh._offer_auto(targets, {}, [], [])
+    out = capsys.readouterr().out
+    assert "2개" in asked[0], asked
+    assert "[A]" in out and "[B]" in out and "[C]" not in out
+
+
+@pytest.mark.parametrize("exc", [RuntimeError("boom"), KeyboardInterrupt()])
+def test_auto_offer_failure_never_raises(monkeypatch, capsys, exc):
+    """동기화는 이미 끝났다 — 여기서 무엇이 터져도 종료코드를 바꾸면 안 된다."""
+    sh, calls, targets = _auto_env(monkeypatch, {"spri2027": False})
+    import dooray_sync.auto.cli as auto_cli
+    monkeypatch.setattr(sh, "_ask_yes_no", lambda q: True)
+
+    def _boom(*a, **k):
+        raise exc
+
+    monkeypatch.setattr(auto_cli, "dispatch", _boom)
+    sh._offer_auto(targets, {}, [], [])     # 예외가 밖으로 나오면 실패
+    assert "마치지 못했습니다" in capsys.readouterr().out
+
+
+def test_running_loop_is_told_it_will_pick_up(monkeypatch, capsys):
+    """도는 루프는 틱마다 대상을 다시 읽는다 — 다시 띄우라고 하면 루프가 둘이 된다."""
+    sh, calls, targets = _auto_env(monkeypatch, {"spri2027": False})
+    monkeypatch.setattr(sh, "_ask_yes_no", lambda q: True)
+    monkeypatch.setattr(sh, "_loop_running", lambda: True)
+
+    sh._offer_auto(targets, {}, [], [])
+    assert "이어받습니다" in capsys.readouterr().out
+
+
+def test_loop_running_reads_last_tick_age(monkeypatch):
+    import datetime as _dt
+    import dooray_sync.auto.state as state_mod
+    sh = _sync_here()
+
+    class _St:
+        def __init__(self, ts):
+            self.last_tick = ts
+
+    now = _dt.datetime.now()
+    monkeypatch.setattr(state_mod, "AutoState",
+                        lambda: _St((now - _dt.timedelta(seconds=30)).isoformat()))
+    assert sh._loop_running() is True
+    monkeypatch.setattr(state_mod, "AutoState",
+                        lambda: _St((now - _dt.timedelta(hours=8)).isoformat()))
+    assert sh._loop_running() is False
+    monkeypatch.setattr(state_mod, "AutoState", lambda: _St(""))
+    assert sh._loop_running() is False

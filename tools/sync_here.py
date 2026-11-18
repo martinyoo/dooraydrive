@@ -960,22 +960,92 @@ def _clear_auto_notices(name: str) -> None:
         pass
 
 
-def _print_auto_footer(targets: list[tuple[str, dict]]) -> None:
-    """끝에 자동 동기화 상태 한 줄. 이 폴더가 자동 대상인지 사람이 알아야
-    "왜 안 올라가지"를 스스로 답할 수 있다."""
+# 자동 루프가 지금 돌고 있다고 볼 마지막 틱의 최대 나이. 틱은 기본 60초이고
+# 사람이 답하는 동안 몇 분 멈출 수 있어 넉넉히 잡는다.
+_LOOP_ALIVE_SEC = 600
+
+
+def _loop_running() -> bool:
+    """자동 동기화 창이 지금 돌고 있는가 — state.json 의 마지막 틱 시각으로 본다.
+
+    프로세스 목록을 뒤지지 않는다. 다른 실행 환경에서 띄운 루프는 같은 이름으로
+    보여도 **다른 설정을 읽는다**(2026-11-18 실측: 대상 0개로 2분마다 빈 틱만 돌았다).
+    틱이 실제로 기록되는지가 '돌고 있다'의 정의다.
+    """
+    try:
+        from dooray_sync.auto.state import AutoState
+        last = AutoState().last_tick
+        if not last:
+            return False
+        age = (datetime.datetime.now() - datetime.datetime.fromisoformat(last))
+        return 0 <= age.total_seconds() <= _LOOP_ALIVE_SEC
+    except Exception:  # noqa: BLE001 — 판정 실패는 '모름'이고, 모르면 안 돈다고 본다
+        return False
+
+
+def _offer_auto(targets: list[tuple[str, dict]], profiles: dict[str, dict],
+                extra: list[str], failed: list[str]) -> None:
+    """끝에 자동 동기화 상태를 알리고, 꺼져 있으면 **그 자리에서** 켤지 묻는다.
+
+    예전에는 "켜려면 synchere.bat --auto on"을 찍고 끝났다. 시키기만 하는 기능은
+    없는 기능이다(AGENTS.md §화면이 명령을 시키면) — 2026-11-19 사용자 요구로
+    다섯 번째 사례를 고친다. 새 폴더(spri 2027)를 만들어 두고 자동에 넣지 않아
+    데스크톱으로 넘어가지 않은 일이 계기였다.
+
+    켜는 일은 `--auto on`과 **같은 함수**(auto.cli.dispatch)로 한다. 편입 게이트·
+    근무시간 확인·시작프로그램 등록이 두 경로에서 갈라지면 안 된다.
+
+    지키는 것(AGENTS.md 규약):
+      - 기본값은 '아니오'. 빈 입력·EOF·Ctrl+C·죽은 스트림 전부 아무것도 하지 않는다.
+      - `--dry-run`·`--unattended`에서는 묻지 않는다 — 옛 한 줄 안내로 대신한다.
+      - 이번에 **실패한** 프로파일은 묻지 않는다. 켜 봐야 2분마다 같은 실패를 반복한다.
+      - 이 함수의 어떤 실패도 종료코드를 바꾸지 않는다. 동기화는 이미 끝났다.
+      - 되돌릴 수 있다 — 끄는 것은 `--auto off` 한 번이고 파일은 건드리지 않는다.
+    """
     try:
         from dooray_sync.config import load_config
         names = [n for n, _ in targets]
+        if not names:
+            return
         on = [n for n in names if getattr(load_config(n), "auto_sync", False)]
-    except Exception:  # noqa: BLE001
-        return
-    if not names:
-        return
-    print()
-    if on:
-        print(f"자동 동기화: 켜짐 ({', '.join(on)}) — 끄려면 synchere.bat --auto off")
-    else:
-        print("자동 동기화: 꺼짐 — 켜려면 synchere.bat --auto on")
+        off = [n for n in names if n not in on]
+        print()
+        if on:
+            print(f"자동 동기화: 켜짐 ({', '.join(on)}) — 끄려면 synchere.bat --auto off")
+        if not off:
+            return
+        ask = [n for n in off if n not in failed]
+        if not ask or "--dry-run" in extra or "--unattended" in extra:
+            print(f"자동 동기화: 꺼짐 ({', '.join(off)}) — 켜려면 synchere.bat --auto on")
+            return
+
+        roots = {n: str(info.get("root") or "") for n, info in targets}
+        print(f"자동 동기화: 꺼짐 — 이 PC가 켜져 있는 동안 알아서 동기화하지 않습니다.")
+        if len(ask) == 1:
+            print(f"  [{ask[0]}] {roots.get(ask[0], '')}")
+            question = "이 폴더를 자동 동기화에 넣을까요? [y/N]: "
+        else:
+            for n in ask:
+                print(f"  [{n}] {roots.get(n, '')}")
+            question = f"위 {len(ask)}개 폴더를 모두 자동 동기화에 넣을까요? [y/N]: "
+        print("  (켜도 파일은 건드리지 않습니다. 끄려면 이 폴더에서 synchere.bat --auto off)")
+        if not _ask_yes_no(question):
+            print("켜지 않았습니다. 다음에 이 폴더를 동기화할 때 다시 묻습니다.")
+            return
+
+        from dooray_sync.auto.cli import dispatch
+        print()
+        rc = dispatch("on", profiles=profiles,
+                      targets=[(n, i) for n, i in targets if n in ask],
+                      all_=False, extra=[])
+        if rc == 0 and _loop_running():
+            print()
+            print("지금 도는 자동 동기화 창이 다음 차례에 이 폴더를 이어받습니다 — "
+                  "따로 띄울 필요 없습니다.")
+    except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 — 종료코드 불변
+        print()
+        print(f"(자동 동기화 설정을 마치지 못했습니다 — 동기화 결과는 그대로입니다: "
+              f"{type(exc).__name__}: {exc})")
 
 
 # --------------------------------------------------------------------------
@@ -1292,7 +1362,7 @@ def main(argv: list[str]) -> int:
     _offer_resolve(extra)
     _offer_reconcile(extra)
 
-    _print_auto_footer(targets)
+    _offer_auto(targets, profiles, extra, failed)
 
     if failed:
         print(f"실패한 프로파일: {', '.join(failed)} — 다시 실행하면 실패분만 재시도됩니다.")
